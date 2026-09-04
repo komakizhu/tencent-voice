@@ -1,0 +1,5 @@
+#!/bin/zsh
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+exec swift run --package-path "$repo_dir" -c release RimeSync "$@"

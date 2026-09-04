@@ -1,0 +1,299 @@
+patch:
+  style:
+    color_scheme: blue_reverie
+    color_scheme_dark: blue_reverie_dark
+    status_message_type: mix
+    candidate_format: '[label]. [candidate] [comment]'
+    candidate_list_layout: stacked
+    text_orientation: horizontal
+    inline_preedit: true
+    inline_candidate: false
+    translucency: true
+    blur: true
+    mutual_exclusive: false
+    memorize_size: true
+    show_paging: false
+    alpha: 1e+0
+    corner_radius: 7e+0
+    hilited_corner_radius: 0e+0
+    border_height: -2e+0
+    border_width: -2e+0
+    line_spacing: 5e+0
+    spacing: 8e+0
+    shadow_size: 6e+0
+    font_face: PingFangSC-Regular
+    font_point: 1.6e+1
+
+  "preset_color_schemes/blue_reverie":
+    name: "Blue Reverie"
+    author: HunterJi
+    color_space: srgb
+    back_color: '0xFFFFFF'
+    hilited_back_color: '0x252320'
+    hilited_candidate_back_color: '0xFF7A00'
+    text_color: '0xD8000000'
+    hilited_text_color: '0xDEDDDD'
+    candidate_text_color: '0x5E5E5E'
+    hilited_candidate_text_color: '0xFFFFFF'
+    label_color: '0x888785'
+    hilited_candidate_label_color: '0xFFFFFF'
+    comment_text_color: '0xDEDDDD'
+    candidate_list_layout: linear
+    corner_radius: 1.2e+1
+    hilited_corner_radius: 1.2e+1
+    border_height: 0e+0
+    border_width: 6e+0
+
+  "preset_color_schemes/blue_reverie_dark":
+    name: "Blue Reverie Dark"
+    author: HunterJi
+    color_space: srgb
+    back_color: '0x3F000000'
+    hilited_back_color: '0x252320'
+    hilited_candidate_back_color: '0xFF7A00'
+    text_color: '0xD8000000'
+    hilited_text_color: '0xDEDDDD'
+    candidate_text_color: '0xFFFFFF'
+    hilited_candidate_text_color: '0xFFFFFF'
+    label_color: '0xEBEBEB'
+    hilited_candidate_label_color: '0xFFFFFF'
+    comment_text_color: '0xDEDDDD'
+    candidate_list_layout: linear
+    corner_radius: 1.2e+1
+    hilited_corner_radius: 1.2e+1
+    border_height: 0e+0
+    border_width: 6e+0
+
+  "preset_color_schemes/paper":
+    name: "纸张 / Paper"
+    author: local
+    color_space: srgb
+    candidate_list_layout: linear
+    text_orientation: horizontal
+    inline_preedit: true
+    inline_candidate: false
+    translucency: false
+    blur: false
+    mutual_exclusive: false
+    memorize_size: true
+    candidate_format: '[label]. [candidate] [comment]'
+    alpha: 1
+    corner_radius: 10
+    hilited_corner_radius: 8
+    border_height: 0
+    border_width: 4
+    line_spacing: 5
+    spacing: 8
+    shadow_size: 0
+    font_face: PingFangSC-Regular
+    font_point: 16
+    label_font_face: Helvetica
+    label_font_point: 12
+    comment_font_face: Helvetica
+    comment_font_point: 14
+    back_color: '0xEEF4F7'
+    border_color: '0xD2DEE4'
+    text_color: '0x5B5B5B'
+    hilited_text_color: '0x303030'
+    candidate_text_color: '0x303030'
+    hilited_candidate_text_color: '0xFFFFFF'
+    hilited_candidate_back_color: '0x3C6BC9'
+    label_color: '0x76818A'
+    hilited_candidate_label_color: '0xFFFFFF'
+    comment_text_color: '0x838A8F'
+    hilited_comment_text_color: '0xE8EEF2'
+
+  "preset_color_schemes/paper_dark":
+    name: "纸张深色 / Paper Dark"
+    author: local
+    color_space: srgb
+    candidate_list_layout: linear
+    text_orientation: horizontal
+    inline_preedit: true
+    inline_candidate: false
+    translucency: false
+    blur: false
+    mutual_exclusive: false
+    memorize_size: true
+    candidate_format: '[label]. [candidate] [comment]'
+    alpha: 1
+    corner_radius: 10
+    hilited_corner_radius: 8
+    border_height: 0
+    border_width: 4
+    line_spacing: 5
+    spacing: 8
+    shadow_size: 0
+    font_face: PingFangSC-Regular
+    font_point: 16
+    label_font_face: Helvetica
+    label_font_point: 12
+    comment_font_face: Helvetica
+    comment_font_point: 14
+    back_color: '0x242120'
+    border_color: '0x403C3A'
+    text_color: '0xB8B5B1'
+    hilited_text_color: '0xE8E5E3'
+    candidate_text_color: '0xE3E5E8'
+    hilited_candidate_text_color: '0xFFFFFF'
+    hilited_candidate_back_color: '0xEF8D5B'
+    label_color: '0xC0B4AE'
+    hilited_candidate_label_color: '0xFFFFFF'
+    comment_text_color: '0xAEB4C0'
+    hilited_comment_text_color: '0xF0E8E3'
+
+  "preset_color_schemes/mint":
+    name: "薄荷 / Mint"
+    author: local
+    color_space: srgb
+    candidate_list_layout: linear
+    text_orientation: horizontal
+    inline_preedit: true
+    inline_candidate: false
+    translucency: false
+    blur: false
+    mutual_exclusive: false
+    memorize_size: true
+    candidate_format: '[label]. [candidate] [comment]'
+    alpha: 1
+    corner_radius: 10
+    hilited_corner_radius: 8
+    border_height: 0
+    border_width: 4
+    line_spacing: 5
+    spacing: 8
+    shadow_size: 0
+    font_face: PingFangSC-Regular
+    font_point: 16
+    label_font_face: Helvetica
+    label_font_point: 12
+    comment_font_face: Helvetica
+    comment_font_point: 14
+    back_color: '0xF3F7F2'
+    border_color: '0xD9E8DC'
+    text_color: '0x59665B'
+    hilited_text_color: '0x314A38'
+    candidate_text_color: '0x314A38'
+    hilited_candidate_text_color: '0xFFFFFF'
+    hilited_candidate_back_color: '0x8BAE7B'
+    label_color: '0x718275'
+    hilited_candidate_label_color: '0xFFFFFF'
+    comment_text_color: '0x7C8C80'
+    hilited_comment_text_color: '0xE6F0E8'
+
+  "preset_color_schemes/mint_dark":
+    name: "薄荷深色 / Mint Dark"
+    author: local
+    color_space: srgb
+    candidate_list_layout: linear
+    text_orientation: horizontal
+    inline_preedit: true
+    inline_candidate: false
+    translucency: false
+    blur: false
+    mutual_exclusive: false
+    memorize_size: true
+    candidate_format: '[label]. [candidate] [comment]'
+    alpha: 1
+    corner_radius: 10
+    hilited_corner_radius: 8
+    border_height: 0
+    border_width: 4
+    line_spacing: 5
+    spacing: 8
+    shadow_size: 0
+    font_face: PingFangSC-Regular
+    font_point: 16
+    label_font_face: Helvetica
+    label_font_point: 12
+    comment_font_face: Helvetica
+    comment_font_point: 14
+    back_color: '0x1D2317'
+    border_color: '0x344B3A'
+    text_color: '0xB6C8B9'
+    hilited_text_color: '0xDDEBDF'
+    candidate_text_color: '0xDDEBDF'
+    hilited_candidate_text_color: '0xFFFFFF'
+    hilited_candidate_back_color: '0x8ABF6B'
+    label_color: '0x9EB5A3'
+    hilited_candidate_label_color: '0xFFFFFF'
+    comment_text_color: '0x9EB5A3'
+    hilited_comment_text_color: '0xE4F0E6'
+
+  "preset_color_schemes/midnight":
+    name: "午夜蓝 / Midnight"
+    author: local
+    color_space: srgb
+    candidate_list_layout: linear
+    text_orientation: horizontal
+    inline_preedit: true
+    inline_candidate: false
+    translucency: false
+    blur: false
+    mutual_exclusive: false
+    memorize_size: true
+    candidate_format: '[label]. [candidate] [comment]'
+    alpha: 1
+    corner_radius: 10
+    hilited_corner_radius: 8
+    border_height: 0
+    border_width: 4
+    line_spacing: 5
+    spacing: 8
+    shadow_size: 0
+    font_face: PingFangSC-Regular
+    font_point: 16
+    label_font_face: Helvetica
+    label_font_point: 12
+    comment_font_face: Helvetica
+    comment_font_point: 14
+    back_color: '0x30241B'
+    border_color: '0x554337'
+    text_color: '0xC3D3E7'
+    hilited_text_color: '0xF4F7FC'
+    candidate_text_color: '0xDCE7F5'
+    hilited_candidate_text_color: '0xFFFFFF'
+    hilited_candidate_back_color: '0xB36A3A'
+    label_color: '0xA9B8CC'
+    hilited_candidate_label_color: '0xFFFFFF'
+    comment_text_color: '0x9BAAC0'
+    hilited_comment_text_color: '0xE8EEF7'
+
+  "preset_color_schemes/midnight_dark":
+    name: "午夜蓝深色 / Midnight Dark"
+    author: local
+    color_space: srgb
+    candidate_list_layout: linear
+    text_orientation: horizontal
+    inline_preedit: true
+    inline_candidate: false
+    translucency: false
+    blur: false
+    mutual_exclusive: false
+    memorize_size: true
+    candidate_format: '[label]. [candidate] [comment]'
+    alpha: 1
+    corner_radius: 10
+    hilited_corner_radius: 8
+    border_height: 0
+    border_width: 4
+    line_spacing: 5
+    spacing: 8
+    shadow_size: 0
+    font_face: PingFangSC-Regular
+    font_point: 16
+    label_font_face: Helvetica
+    label_font_point: 12
+    comment_font_face: Helvetica
+    comment_font_point: 14
+    back_color: '0x1C1712'
+    border_color: '0x3B3027'
+    text_color: '0xBCCBE0'
+    hilited_text_color: '0xF0F5FC'
+    candidate_text_color: '0xD5E2F2'
+    hilited_candidate_text_color: '0xFFFFFF'
+    hilited_candidate_back_color: '0xC97842'
+    label_color: '0xA4B3C7'
+    hilited_candidate_label_color: '0xFFFFFF'
+    comment_text_color: '0x95A5BA'
+    hilited_comment_text_color: '0xE7EFFA'

@@ -1,0 +1,88 @@
+import Foundation
+
+enum TencentEnginePreset: String, CaseIterable, Sendable {
+    case standard = "16k_zh"
+    case largeV1 = "16k_zh_en"
+    case largeV2 = "16k_zh_en_2.0"
+
+    static let defaultPreset: Self = .standard
+
+    var displayName: String {
+        switch self {
+        case .standard:
+            return "普通话通用（16k_zh）"
+        case .largeV1:
+            return "中英大模型 1.0（16k_zh_en）"
+        case .largeV2:
+            return "中英大模型 2.0（16k_zh_en_2.0）"
+        }
+    }
+
+    init(persistedModelType: String) {
+        self = Self(rawValue: persistedModelType) ?? Self.defaultPreset
+    }
+}
+
+protocol SettingsStore: AnyObject {
+    func load() -> AppSettings
+    func save(_ settings: AppSettings)
+}
+
+struct AppSettings: Codable, Equatable, Sendable {
+    var shortcut: Shortcut
+    var engineModelType: String
+    var saveTextLogs: Bool
+    var prepaidQuotaHoursByModel: [String: Int]
+
+    private enum CodingKeys: String, CodingKey {
+        case shortcut
+        case engineModelType
+        case saveTextLogs
+        case prepaidQuotaHoursByModel
+    }
+
+    init(
+        shortcut: Shortcut = .defaultF5,
+        engineModelType: String = TencentEnginePreset.defaultPreset.rawValue,
+        saveTextLogs: Bool = false,
+        prepaidQuotaHoursByModel: [String: Int] = [:]
+    ) {
+        self.shortcut = shortcut
+        self.engineModelType = engineModelType
+        self.saveTextLogs = saveTextLogs
+        self.prepaidQuotaHoursByModel = prepaidQuotaHoursByModel
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        shortcut = try container.decode(Shortcut.self, forKey: .shortcut)
+        engineModelType = try container.decode(String.self, forKey: .engineModelType)
+        saveTextLogs = try container.decode(Bool.self, forKey: .saveTextLogs)
+        prepaidQuotaHoursByModel = try container.decodeIfPresent(
+            [String: Int].self,
+            forKey: .prepaidQuotaHoursByModel
+        ) ?? [:]
+    }
+}
+
+final class UserDefaultsSettingsStore: SettingsStore {
+    private let defaults: UserDefaults
+    private let key = "appSettings"
+
+    init(suiteName: String = "local.tencent.voice.mvp") {
+        defaults = UserDefaults(suiteName: suiteName) ?? .standard
+    }
+
+    func load() -> AppSettings {
+        guard let data = defaults.data(forKey: key),
+              let settings = try? JSONDecoder().decode(AppSettings.self, from: data) else {
+            return AppSettings()
+        }
+        return settings
+    }
+
+    func save(_ settings: AppSettings) {
+        guard let data = try? JSONEncoder().encode(settings) else { return }
+        defaults.set(data, forKey: key)
+    }
+}

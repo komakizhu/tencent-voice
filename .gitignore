@@ -1,0 +1,12 @@
+.build/
+dist/
+.DS_Store
+
+# Rime 运行时生成物、个人词频和同步快照不进入 Git。
+rime/build/
+rime/trash/
+rime/sync/
+installation.yaml
+*.userdb/
+*.userdb.txt
+*.userdb.*
