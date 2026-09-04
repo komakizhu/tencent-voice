@@ -12,7 +12,7 @@ public struct SyncConfiguration: Sendable {
         sharedRoot: URL,
         installationID: String,
         nodeID: String? = nil,
-        squirrelExecutable: URL = URL(fileURLWithPath: "/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel")
+        squirrelExecutable: URL = SquirrelPathResolver.executableURL
     ) {
         self.localRimeDirectory = localRimeDirectory.standardizedFileURL
         self.sharedRoot = sharedRoot.standardizedFileURL
@@ -79,13 +79,26 @@ public protocol CommandRunning {
     func run(executable: URL, arguments: [String], timeout: TimeInterval) throws -> CommandResult
 }
 
-public struct ProcessCommandRunner: CommandRunning {
+public protocol WorkingDirectoryCommandRunning {
+    func run(executable: URL, arguments: [String], workingDirectory: URL, timeout: TimeInterval) throws -> CommandResult
+}
+
+public struct ProcessCommandRunner: CommandRunning, WorkingDirectoryCommandRunning {
     public init() {}
 
     public func run(executable: URL, arguments: [String], timeout: TimeInterval = 30) throws -> CommandResult {
+        try execute(executable: executable, arguments: arguments, workingDirectory: nil, timeout: timeout)
+    }
+
+    public func run(executable: URL, arguments: [String], workingDirectory: URL, timeout: TimeInterval = 30) throws -> CommandResult {
+        try execute(executable: executable, arguments: arguments, workingDirectory: workingDirectory, timeout: timeout)
+    }
+
+    private func execute(executable: URL, arguments: [String], workingDirectory: URL?, timeout: TimeInterval) throws -> CommandResult {
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
+        process.currentDirectoryURL = workingDirectory
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
@@ -110,18 +123,27 @@ public protocol NativeRimeMaintaining {
     func reload() throws
 }
 
-public struct SquirrelMaintenance: NativeRimeMaintaining {
+public struct SquirrelMaintenance: NativeRimeMaintaining, RimeUserDictionaryMaintaining {
     public let executable: URL
+    public let dictionaryManagerExecutable: URL
     public let runner: any CommandRunning
+    public let workingDirectoryRunner: any WorkingDirectoryCommandRunning
+    public let launchRunner: any CommandRunning
     public let timeout: TimeInterval
 
     public init(
-        executable: URL = URL(fileURLWithPath: "/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel"),
+        executable: URL = SquirrelPathResolver.executableURL,
+        dictionaryManagerExecutable: URL = SquirrelPathResolver.dictionaryManagerURL,
         runner: any CommandRunning = ProcessCommandRunner(),
+        workingDirectoryRunner: (any WorkingDirectoryCommandRunning)? = nil,
+        launchRunner: (any CommandRunning)? = nil,
         timeout: TimeInterval = 30
     ) {
         self.executable = executable
+        self.dictionaryManagerExecutable = dictionaryManagerExecutable
         self.runner = runner
+        self.workingDirectoryRunner = workingDirectoryRunner ?? (runner as? any WorkingDirectoryCommandRunning) ?? ProcessCommandRunner()
+        self.launchRunner = launchRunner ?? runner
         self.timeout = timeout
     }
 
@@ -133,11 +155,85 @@ public struct SquirrelMaintenance: NativeRimeMaintaining {
         try run(arguments: ["--reload"])
     }
 
+    public func captureUserDictionarySnapshot(in rimeDirectory: URL) throws {
+        try backupUserDictionary(in: rimeDirectory)
+    }
+
+    /// Publish only the current dictionary.  Unlike `--sync`, `--backup`
+    /// never imports another installation's snapshot before publishing.
+    public func backupUserDictionary(in rimeDirectory: URL) throws {
+        try withSquirrelStopped {
+            try runDictionaryManager(arguments: ["--backup", "rime_ice"], rimeDirectory: rimeDirectory)
+        }
+    }
+
+    public func restoreUserDictionarySnapshot(from snapshot: URL, in rimeDirectory: URL) throws {
+        try withSquirrelStopped {
+            try runDictionaryManager(arguments: ["--restore", snapshot.path], rimeDirectory: rimeDirectory)
+        }
+    }
+
     private func run(arguments: [String]) throws {
         let result = try runner.run(executable: executable, arguments: arguments, timeout: timeout)
         guard result.status == 0 else {
             throw RimeSyncError.commandFailed("\(executable.path) \(arguments.joined(separator: " ")) 返回 \(result.status)：\(result.output)")
         }
+    }
+
+    private func runDictionaryManager(arguments: [String], rimeDirectory: URL) throws {
+        let frameworks = dictionaryManagerExecutable
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Frameworks", isDirectory: true)
+        let environment = "DYLD_LIBRARY_PATH=\(frameworks.path)"
+        let result = try workingDirectoryRunner.run(
+            executable: URL(fileURLWithPath: "/usr/bin/env"),
+            arguments: [environment, dictionaryManagerExecutable.path] + arguments,
+            workingDirectory: rimeDirectory,
+            timeout: timeout
+        )
+        guard result.status == 0 else {
+            throw RimeSyncError.commandFailed("Rime 用户库命令返回 \(result.status)：\(result.output)")
+        }
+    }
+
+    private func withSquirrelStopped<T>(_ body: () throws -> T) throws -> T {
+        try run(arguments: ["--quit"])
+        Thread.sleep(forTimeInterval: 0.2)
+        defer { try? launchSquirrel() }
+        return try body()
+    }
+
+    private func launchSquirrel() throws {
+        let result = try launchRunner.run(
+            executable: URL(fileURLWithPath: "/usr/bin/open"),
+            arguments: ["-a", SquirrelPathResolver.appURL.path],
+            timeout: timeout
+        )
+        guard result.status == 0 else {
+            throw RimeSyncError.commandFailed("无法重新启动 Squirrel：\(result.output)")
+        }
+    }
+}
+
+public enum SquirrelPathResolver {
+    private static let fileManager = FileManager.default
+
+    public static var appURL: URL {
+        let userURL = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Input Methods/Squirrel.app", isDirectory: true)
+        if fileManager.fileExists(atPath: userURL.path) {
+            return userURL
+        }
+        return URL(fileURLWithPath: "/Library/Input Methods/Squirrel.app", isDirectory: true)
+    }
+
+    public static var executableURL: URL {
+        appURL.appendingPathComponent("Contents/MacOS/Squirrel")
+    }
+
+    public static var dictionaryManagerURL: URL {
+        appURL.appendingPathComponent("Contents/MacOS/rime_dict_manager")
     }
 }
 
@@ -332,7 +428,6 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
         if dryRun { return try status() }
         let lock = DirectoryLock(lockURL: configuration.lockURL, fileManager: fileManager)
         return try lock.withLock {
-            try maintenance.syncUserData()
             try SharedDirectoryLayout.prepare(sharedRoot: configuration.sharedRoot, nodeIDs: [configuration.nodeID], fileManager: fileManager)
             let backupID = try backupManager.createBackup(configuration: configuration)
             let plan = try makePlan()
@@ -342,7 +437,7 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
             if plan.requiresReload {
                 try maintenance.reload()
             }
-            return report(for: plan, backupID: backupID, userDictionarySyncSucceeded: true)
+            return report(for: plan, backupID: backupID, userDictionarySyncSucceeded: false)
         }
     }
 
@@ -377,7 +472,20 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
         let localRecords = try Dictionary(uniqueKeysWithValues: RimeFileInventory(root: configuration.localRimeDirectory, fileManager: fileManager).scan(owner: configuration.nodeID).map { ($0.relativePath, $0) })
         var manifest = try RimeManifest.loading(from: configuration.manifestURL, fileManager: fileManager)
         var nodeRecords = manifest.nodes[configuration.nodeID] ?? [:]
-        let paths = Set(localRecords.keys).union(manifest.records.keys).union(nodeRecords.keys).sorted()
+        let paths = Set(localRecords.keys)
+            .union(manifest.records.keys)
+            .union(nodeRecords.keys)
+            .filter { RimeResourcePolicy.isAllowed(relativePath: $0) }
+            .sorted()
+        // Older prototypes may have put the generated managed dictionary in
+        // the ordinary manifest. Remove that stale bookkeeping so it cannot
+        // be pulled back into the account by a later LWW run.
+        manifest.records.removeValue(forKey: RimeManagedDictionary.fileName)
+        for node in manifest.nodes.keys {
+            manifest.nodes[node]?.removeValue(forKey: RimeManagedDictionary.fileName)
+        }
+        manifest.pausedPaths.remove(RimeManagedDictionary.fileName)
+        nodeRecords.removeValue(forKey: RimeManagedDictionary.fileName)
         var items: [PlanItem] = []
 
         for path in paths where !manifest.pausedPaths.contains(path) {

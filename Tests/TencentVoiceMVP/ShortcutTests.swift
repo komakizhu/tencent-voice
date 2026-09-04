@@ -4,7 +4,14 @@ import XCTest
 @testable import TencentVoiceMVP
 
 final class ShortcutTests: XCTestCase {
-    func testDefaultShortcutIsF5WithoutModifiers() {
+    func testDefaultShortcutIsCommand0() {
+        XCTAssertEqual(
+            Shortcut.defaultCommand0,
+            Shortcut(keyCode: UInt32(kVK_ANSI_0), modifiers: UInt32(cmdKey))
+        )
+    }
+
+    func testLegacyF5ShortcutRemainsAvailableForMigration() {
         XCTAssertEqual(Shortcut.defaultF5, Shortcut(keyCode: UInt32(kVK_F5), modifiers: 0))
     }
 

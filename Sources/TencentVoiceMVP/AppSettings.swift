@@ -42,7 +42,7 @@ struct AppSettings: Codable, Equatable, Sendable {
     }
 
     init(
-        shortcut: Shortcut = .defaultF5,
+        shortcut: Shortcut = .defaultCommand0,
         engineModelType: String = TencentEnginePreset.defaultPreset.rawValue,
         saveTextLogs: Bool = false,
         prepaidQuotaHoursByModel: [String: Int] = [:]
@@ -68,6 +68,7 @@ struct AppSettings: Codable, Equatable, Sendable {
 final class UserDefaultsSettingsStore: SettingsStore {
     private let defaults: UserDefaults
     private let key = "appSettings"
+    private let shortcutMigrationKey = "didMigrateDefaultShortcutToCommand0"
 
     init(suiteName: String = "local.tencent.voice.mvp") {
         defaults = UserDefaults(suiteName: suiteName) ?? .standard
@@ -78,10 +79,31 @@ final class UserDefaultsSettingsStore: SettingsStore {
               let settings = try? JSONDecoder().decode(AppSettings.self, from: data) else {
             return AppSettings()
         }
-        return settings
+
+        guard !defaults.bool(forKey: shortcutMigrationKey) else {
+            return settings
+        }
+
+        // Mark every existing configuration as migration-checked. This keeps
+        // custom shortcuts intact and prevents a user-selected F5 from being
+        // migrated again on later launches.
+        defaults.set(true, forKey: shortcutMigrationKey)
+        guard settings.shortcut == .defaultF5 else {
+            return settings
+        }
+
+        var migratedSettings = settings
+        migratedSettings.shortcut = .defaultCommand0
+        saveEncoded(migratedSettings)
+        return migratedSettings
     }
 
     func save(_ settings: AppSettings) {
+        defaults.set(true, forKey: shortcutMigrationKey)
+        saveEncoded(settings)
+    }
+
+    private func saveEncoded(_ settings: AppSettings) {
         guard let data = try? JSONEncoder().encode(settings) else { return }
         defaults.set(data, forKey: key)
     }
