@@ -94,7 +94,8 @@ final class TencentASRClient: RealtimeASRClient {
                         isFinal: response.isFinal == 1 || result.sliceType == 2,
                         isSegmentStart: result.sliceType == 0,
                         sliceType: result.sliceType,
-                        wireFinal: response.isFinal == 1
+                        wireFinal: response.isFinal == 1,
+                        stablePrefixText: result.stablePrefixText
                     ))
                     continuation?.yield(update)
                 }

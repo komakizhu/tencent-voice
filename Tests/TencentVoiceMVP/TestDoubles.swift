@@ -4,15 +4,23 @@ import Foundation
 @MainActor
 final class FakeTextTarget: TextTarget {
     var text: String
+    let supportsAXReplacement: Bool
     private(set) var copiedText: String?
     private(set) var replaceCallCount = 0
+    private(set) var pastedTexts: [String] = []
+    private(set) var trailingReplacementLengths: [Int] = []
 
-    init(text: String) {
+    init(text: String, supportsAXReplacement: Bool = true) {
         self.text = text
+        self.supportsAXReplacement = supportsAXReplacement
     }
 
     func capture() throws -> TextSnapshot {
-        TextSnapshot(text: text, selection: TencentVoiceMVP.TextRange(location: text.utf16.count, length: 0))
+        TextSnapshot(
+            text: text,
+            selection: TencentVoiceMVP.TextRange(location: text.utf16.count, length: 0),
+            supportsAXReplacement: supportsAXReplacement
+        )
     }
 
     func replace(snapshot: TextSnapshot, range: TencentVoiceMVP.TextRange, expectedText: String, with replacement: String) throws -> TencentVoiceMVP.TextRange {
@@ -24,19 +32,16 @@ final class FakeTextTarget: TextTarget {
         return TencentVoiceMVP.TextRange(location: range.location, length: replacement.utf16.count)
     }
 
-    func replacePastedText(previousText: String, with text: String) throws {
-        guard previousText.isEmpty || self.text.hasSuffix(previousText) else {
-            throw TextTargetError.targetChanged
-        }
-        let delta = PastedTextDelta(previousText: previousText, newText: text)
-        if delta.backspaceCount > 0 {
-            self.text.removeLast(delta.backspaceCount)
-        }
-        self.text.append(delta.insertion)
+    func paste(_ text: String) throws {
+        pastedTexts.append(text)
+        self.text.append(text)
     }
 
-    func paste(_ text: String) throws {
-        copiedText = text
+    func replaceTrailingText(_ previousText: String, with replacement: String) throws {
+        guard text.hasSuffix(previousText) else { throw TextTargetError.targetChanged }
+        trailingReplacementLengths.append(previousText.count)
+        text.removeLast(previousText.count)
+        text.append(replacement)
     }
 
     func copyToClipboard(_ text: String) throws {
@@ -47,18 +52,28 @@ final class FakeTextTarget: TextTarget {
 final class FakeRealtimeASRClient: RealtimeASRClient {
     private var continuation: AsyncThrowingStream<ASRUpdate, Error>.Continuation?
     private(set) var finishCallCount = 0
+    private(set) var startedConfiguration: TencentSessionConfiguration?
+    private(set) var eventOrder: [String] = []
     var finishCompletesStream = true
+    var sendAudioDelayNanoseconds: UInt64 = 0
 
     func start(configuration: TencentSessionConfiguration) async throws -> AsyncThrowingStream<ASRUpdate, Error> {
-        AsyncThrowingStream { continuation in
+        startedConfiguration = configuration
+        return AsyncThrowingStream { continuation in
             self.continuation = continuation
         }
     }
 
-    func sendAudio(_ data: Data) async throws {}
+    func sendAudio(_ data: Data) async throws {
+        if sendAudioDelayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: sendAudioDelayNanoseconds)
+        }
+        eventOrder.append("audio")
+    }
 
     func finish() async throws {
         finishCallCount += 1
+        eventOrder.append("finish")
         if finishCompletesStream {
             finishStream()
         }
@@ -85,13 +100,18 @@ final class FakeRealtimeASRClient: RealtimeASRClient {
 final class FakeAudioCapture: AudioCapture {
     private var handler: (@Sendable (Data) -> Void)?
     private(set) var startCallCount = 0
+    var dataToEmitOnStop: Data?
 
     func start(onChunk: @escaping @Sendable (Data) -> Void) async throws {
         handler = onChunk
         startCallCount += 1
     }
 
-    func stop() {}
+    func stop() {
+        if let dataToEmitOnStop {
+            handler?(dataToEmitOnStop)
+        }
+    }
 
     func emit(_ data: Data) {
         handler?(data)

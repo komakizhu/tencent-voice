@@ -50,6 +50,7 @@ final class SessionCoordinator: SessionCoordinating {
 
     private var injector: TextInjector?
     private var prebuffer: AudioPrebuffer?
+    private var audioForwarder: AudioChunkForwarder?
     private var eventTask: Task<Void, Never>?
     private var latestProjection: ASRProjection?
     private var finishSent = false
@@ -104,18 +105,24 @@ final class SessionCoordinator: SessionCoordinating {
             safeCopyWasLogged = false
 
             let settings = settingsStore.load()
+            let wordInfo = settings.engineModelType == TencentEnginePreset.largeV2.rawValue ? 0 : 1
             let configuration = TencentSessionConfiguration(
                 appID: credentials.appID,
                 secretID: credentials.secretID,
                 secretKey: credentials.secretKey,
                 engineModelType: settings.engineModelType,
-                voiceID: UUID().uuidString
+                voiceID: UUID().uuidString,
+                needVAD: 1,
+                wordInfo: wordInfo
             )
             let buffer = AudioPrebuffer()
+            let forwarder = AudioChunkForwarder()
             prebuffer = buffer
+            audioForwarder = forwarder
             try await audio.start { [weak self, weak buffer] chunk in
                 guard let buffer else { return }
-                Task {
+                forwarder.submit { [weak self, weak buffer] in
+                    guard let buffer else { return }
                     do {
                         try await buffer.append(chunk)
                     } catch {
@@ -175,7 +182,11 @@ final class SessionCoordinator: SessionCoordinating {
             return
         }
         setState(.stopping)
+        log(event: "stop_requested")
+        let currentAudioForwarder = audioForwarder
         audio.stop()
+        currentAudioForwarder?.stopAccepting()
+        await currentAudioForwarder?.drain()
         var finishTask: Task<Void, Never>?
         if !finishSent {
             finishSent = true
@@ -203,6 +214,7 @@ final class SessionCoordinator: SessionCoordinating {
             do {
                 try injector.finish(finalText: latestProjection?.text ?? "")
                 log(event: streamCompleted ? "finished" : "finished_timeout", projection: latestProjection)
+                injector.cancel()
             } catch {
                 log(event: "finish_error", error: error)
                 setState(.error(error.localizedDescription))
@@ -220,6 +232,7 @@ final class SessionCoordinator: SessionCoordinating {
     }
 
     func cancel() {
+        audioForwarder?.cancel()
         audio.stop()
         asr.cancel()
         eventTask?.cancel()
@@ -236,7 +249,9 @@ final class SessionCoordinator: SessionCoordinating {
         if update.isStreamEnded {
             if let projection = projectionAccumulator.apply(update) {
                 latestProjection = projection
+                injector?.apply(projection: projection)
                 log(event: "stream_ended", update: update, projection: projection)
+                logSafeCopyIfNeeded(update: update, projection: projection)
             }
             return
         }
@@ -248,13 +263,16 @@ final class SessionCoordinator: SessionCoordinating {
         latestProjection = projection
         injector?.apply(projection: projection)
         log(event: projection.isFinal ? "final" : "partial", update: update, projection: projection)
-        if injector?.modeDescription == "safe_copy", !safeCopyWasLogged {
-            safeCopyWasLogged = true
-            log(event: "safe_copy", update: update, projection: projection)
-        }
+        logSafeCopyIfNeeded(update: update, projection: projection)
     }
 
     private var projectionAccumulator = ASRProjectionAccumulator()
+
+    private func logSafeCopyIfNeeded(update: ASRUpdate, projection: ASRProjection) {
+        guard injector?.modeDescription == "safe_copy", !safeCopyWasLogged else { return }
+        safeCopyWasLogged = true
+        log(event: "safe_copy", update: update, projection: projection)
+    }
 
     private func handleASRError(_ error: Error, sessionID: UUID? = nil) {
         if let sessionID, self.sessionID != sessionID { return }
@@ -300,6 +318,7 @@ final class SessionCoordinator: SessionCoordinating {
     }
 
     private func cleanUpAfterFailedStart() async {
+        audioForwarder?.cancel()
         audio.stop()
         asr.cancel()
         await prebuffer?.clear()
@@ -312,6 +331,7 @@ final class SessionCoordinator: SessionCoordinating {
     private func resetSession() {
         injector = nil
         prebuffer = nil
+        audioForwarder = nil
         eventTask = nil
         latestProjection = nil
         finishSent = false
@@ -390,6 +410,8 @@ final class SessionCoordinator: SessionCoordinating {
             revision: projection?.revision,
             writeCount: injector?.writeCount,
             backspaceCount: injector?.backspaceCount,
+            deepReplacementCount: injector?.deepReplacementCount,
+            maximumTrailingReplacementLength: injector?.maximumTrailingReplacementLength,
             discardCount: discardCount,
             errorCount: errorCount + (injector?.errorCount ?? 0),
             errorCode: errorCode

@@ -20,6 +20,7 @@ public struct TencentSessionConfiguration: Equatable, Sendable {
     public let voiceID: String
     public let voiceFormat: Int
     public let needVAD: Int
+    public let wordInfo: Int
 
     public init(
         appID: String,
@@ -28,7 +29,8 @@ public struct TencentSessionConfiguration: Equatable, Sendable {
         engineModelType: String = "16k_zh",
         voiceID: String = UUID().uuidString,
         voiceFormat: Int = 1,
-        needVAD: Int = 0
+        needVAD: Int = 0,
+        wordInfo: Int = 0
     ) {
         self.appID = appID
         self.secretID = secretID
@@ -37,6 +39,7 @@ public struct TencentSessionConfiguration: Equatable, Sendable {
         self.voiceID = voiceID
         self.voiceFormat = voiceFormat
         self.needVAD = needVAD
+        self.wordInfo = wordInfo
     }
 }
 

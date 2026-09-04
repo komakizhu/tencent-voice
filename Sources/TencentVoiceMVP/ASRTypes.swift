@@ -12,6 +12,7 @@ struct ASRSlice: Equatable, Sendable {
     let phase: ASRSegmentPhase
     let sliceType: Int
     let wireFinal: Bool
+    let stablePrefixText: String?
 
     var isFinal: Bool { phase == .final }
     var isSegmentStart: Bool { phase == .started }
@@ -22,13 +23,15 @@ struct ASRSlice: Equatable, Sendable {
         isFinal: Bool,
         isSegmentStart: Bool = false,
         sliceType: Int? = nil,
-        wireFinal: Bool = false
+        wireFinal: Bool = false,
+        stablePrefixText: String? = nil
     ) {
         self.sequence = sequence
         self.text = text
         self.phase = isFinal ? .final : (isSegmentStart ? .started : .partial)
         self.sliceType = sliceType ?? (isFinal ? 2 : (isSegmentStart ? 0 : 1))
         self.wireFinal = wireFinal
+        self.stablePrefixText = stablePrefixText
     }
 }
 
@@ -41,6 +44,7 @@ struct ASRUpdate: Equatable, Sendable {
     let isNewSegment: Bool
     let sliceType: Int?
     let wireFinal: Bool
+    let stablePrefixText: String?
     let isStreamEnded: Bool
 
     var text: String { segmentText }
@@ -55,6 +59,7 @@ struct ASRUpdate: Equatable, Sendable {
         isNewSegment: Bool = false,
         sliceType: Int? = nil,
         wireFinal: Bool = false,
+        stablePrefixText: String? = nil,
         isStreamEnded: Bool = false
     ) {
         self.segmentID = segmentID
@@ -65,6 +70,7 @@ struct ASRUpdate: Equatable, Sendable {
         self.isNewSegment = isNewSegment
         self.sliceType = sliceType
         self.wireFinal = wireFinal
+        self.stablePrefixText = stablePrefixText
         self.isStreamEnded = isStreamEnded
     }
 
@@ -75,7 +81,8 @@ struct ASRUpdate: Equatable, Sendable {
         stablePrefixLength: Int = 0,
         segmentText: String? = nil,
         isNewSegment: Bool = false,
-        isStreamEnded: Bool = false
+        isStreamEnded: Bool = false,
+        stablePrefixText: String? = nil
     ) {
         self.segmentID = sequence
         self.segmentOrder = sequence
@@ -85,6 +92,7 @@ struct ASRUpdate: Equatable, Sendable {
         self.isNewSegment = isNewSegment
         self.sliceType = isFinal ? 2 : (isNewSegment ? 0 : 1)
         self.wireFinal = false
+        self.stablePrefixText = stablePrefixText
         self.isStreamEnded = isStreamEnded
     }
 
@@ -108,6 +116,7 @@ struct ASRProjection: Equatable, Sendable {
     let changed: Bool
     let isFinal: Bool
     let isStreamEnded: Bool
+    let activeStablePrefixText: String?
 
     var text: String { committedText + activeSegmentText }
     var segmentText: String? { activeSegmentID == nil ? nil : activeSegmentText }
@@ -121,7 +130,8 @@ struct ASRProjection: Equatable, Sendable {
         revision: UInt64,
         changed: Bool,
         isFinal: Bool,
-        isStreamEnded: Bool = false
+        isStreamEnded: Bool = false,
+        activeStablePrefixText: String? = nil
     ) {
         self.committedText = committedText
         self.activeSegmentText = activeSegmentText
@@ -131,5 +141,6 @@ struct ASRProjection: Equatable, Sendable {
         self.changed = changed
         self.isFinal = isFinal
         self.isStreamEnded = isStreamEnded
+        self.activeStablePrefixText = activeStablePrefixText
     }
 }

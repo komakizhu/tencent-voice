@@ -6,6 +6,7 @@ struct ASRProjectionAccumulator: Sendable {
     private var activeSegmentOrder = Int.min
     private var activeSegmentText = ""
     private var activeIsFinal = false
+    private var activeStablePrefixText: String?
     private var revision: UInt64 = 0
     private var latestVisibleText = ""
 
@@ -19,6 +20,7 @@ struct ASRProjectionAccumulator: Sendable {
             activeSegmentOrder = Int.min
             activeSegmentText = ""
             activeIsFinal = false
+            activeStablePrefixText = nil
             latestVisibleText = committedText
             revision += 1
             return ASRProjection(
@@ -41,6 +43,7 @@ struct ASRProjectionAccumulator: Sendable {
             if update.segmentID == activeSegmentID {
                 activeSegmentText = update.segmentText
                 activeIsFinal = update.isFinal
+                activeStablePrefixText = update.stablePrefixText
             } else {
                 guard update.segmentOrder >= activeSegmentOrder else { return nil }
                 committedText += activeSegmentText
@@ -48,6 +51,7 @@ struct ASRProjectionAccumulator: Sendable {
                 activeSegmentOrder = update.segmentOrder
                 activeSegmentText = update.segmentText
                 activeIsFinal = update.isFinal
+                activeStablePrefixText = update.stablePrefixText
             }
         } else {
             guard update.segmentOrder >= activeSegmentOrder else { return nil }
@@ -55,6 +59,7 @@ struct ASRProjectionAccumulator: Sendable {
             activeSegmentOrder = update.segmentOrder
             activeSegmentText = update.segmentText
             activeIsFinal = update.isFinal
+            activeStablePrefixText = update.stablePrefixText
         }
 
         let visibleText = committedText + activeSegmentText
@@ -70,7 +75,8 @@ struct ASRProjectionAccumulator: Sendable {
             revision: revision,
             changed: changed,
             isFinal: update.isFinal,
-            isStreamEnded: false
+            isStreamEnded: false,
+            activeStablePrefixText: activeStablePrefixText
         )
     }
 

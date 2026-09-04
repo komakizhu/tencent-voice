@@ -72,4 +72,17 @@ final class ASRResultNormalizerTests: XCTestCase {
         XCTAssertEqual(next.segmentID, boundary.segmentID)
         XCTAssertEqual(next.segmentText, "后文")
     }
+
+    func testCarriesStableWordPrefixWithTheActiveSegment() {
+        let normalizer = ASRResultNormalizer()
+
+        let update = normalizer.accept(ASRSlice(
+            sequence: 0,
+            text: "这是一个正在变化的句子",
+            isFinal: false,
+            stablePrefixText: "这是一个"
+        ))
+
+        XCTAssertEqual(update.stablePrefixText, "这是一个")
+    }
 }

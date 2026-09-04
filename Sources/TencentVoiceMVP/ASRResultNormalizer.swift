@@ -7,6 +7,7 @@ final class ASRResultNormalizer: @unchecked Sendable {
         let order: Int
         var text: String
         var phase: ASRSegmentPhase
+        var stablePrefixText: String?
     }
 
     private var segments: [Int: Segment] = [:]
@@ -32,7 +33,8 @@ final class ASRResultNormalizer: @unchecked Sendable {
             sequence: slice.sequence,
             order: segments[segmentID]?.order ?? nextSegmentID,
             text: slice.text,
-            phase: slice.phase
+            phase: slice.phase,
+            stablePrefixText: slice.stablePrefixText
         )
         activeSegmentBySequence[slice.sequence] = segmentID
 
@@ -44,7 +46,8 @@ final class ASRResultNormalizer: @unchecked Sendable {
             phase: segments[segmentID]?.phase ?? slice.phase,
             isNewSegment: isNewSegment,
             sliceType: slice.sliceType,
-            wireFinal: slice.wireFinal
+            wireFinal: slice.wireFinal,
+            stablePrefixText: segments[segmentID]?.stablePrefixText
         )
     }
 
@@ -72,7 +75,8 @@ final class ASRResultNormalizer: @unchecked Sendable {
             sequence: slice.sequence,
             order: order,
             text: slice.text,
-            phase: slice.phase
+            phase: slice.phase,
+            stablePrefixText: slice.stablePrefixText
         )
         return segmentID
     }
