@@ -742,14 +742,17 @@ public enum RimeAuditCSV {
         var rows: [[String]] = [[]]
         var field = Data()
         var quoted = false
+        var endedWithRow = false
         var index = 0
         func finishField() {
             rows[rows.count - 1].append(String(decoding: field, as: UTF8.self))
             field.removeAll(keepingCapacity: true)
+            endedWithRow = false
         }
         func finishRow() {
             finishField()
             rows.append([])
+            endedWithRow = true
         }
         while index < bytes.count {
             let byte = bytes[index]
@@ -782,12 +785,13 @@ public enum RimeAuditCSV {
                     index += 1
                 default:
                     field.append(byte)
+                    endedWithRow = false
                     index += 1
                 }
             }
         }
         guard !quoted else { throw RimeSyncError.unsupportedOperation("CSV 引号未闭合") }
-        if rows.last?.isEmpty == true {
+        if endedWithRow {
             rows.removeLast()
         } else if !rows[rows.count - 1].isEmpty || !field.isEmpty {
             finishField()
