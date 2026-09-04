@@ -56,6 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         )
         registerHotkey()
+        localUsageStore.migrateLegacyUnscopedUsage(to: TencentEnginePreset.standard.rawValue)
         localUsageStore.recoverAbandonedSession()
         updateLocalUsageDisplay()
         startLocalUsageMonitor()
@@ -157,10 +158,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func toggleRecording() async {
         switch coordinator.state {
         case .idle:
+            let engineModelType = settingsStore.load().engineModelType
             try? await coordinator.begin()
             if coordinator.state == .listening {
                 activeUsageSessionID = UUID()
-                localUsageStore.beginSession()
+                localUsageStore.beginSession(for: engineModelType)
                 updateLocalUsageDisplay()
             }
         case .connecting:
@@ -211,9 +213,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateLocalUsageDisplay(at date: Date = Date()) {
         let settings = settingsStore.load()
         localUsageStore.touchSession(at: date)
+        let prepaidHours = settings.prepaidQuotaHoursByModel[settings.engineModelType]
+        let hasPrepaidQuota = prepaidHours.map { $0 > 0 } ?? false
         let summary = TencentUsageSummary(
-            localUsedSeconds: localUsageStore.currentSeconds(at: date),
-            quotaSeconds: TencentUsageQuota.freeQuotaSeconds(for: settings.engineModelType)
+            localUsedSeconds: hasPrepaidQuota
+                ? localUsageStore.currentTotalSeconds(for: settings.engineModelType, at: date)
+                : localUsageStore.currentSeconds(for: settings.engineModelType, at: date),
+            quotaSeconds: TencentUsageQuota.seconds(
+                for: settings.engineModelType,
+                prepaidHours: prepaidHours
+            ),
+            engineModelType: settings.engineModelType,
+            isPrepaid: hasPrepaidQuota
         )
         menu.update(usage: summary.displayText)
     }

@@ -113,14 +113,13 @@ final class SessionCoordinator: SessionCoordinating {
             )
             let buffer = AudioPrebuffer()
             prebuffer = buffer
-            let coordinator = self
-            try await audio.start { [weak coordinator, weak buffer] chunk in
+            try await audio.start { [weak self, weak buffer] chunk in
                 guard let buffer else { return }
-                Task { @MainActor [weak coordinator, buffer] in
+                Task {
                     do {
                         try await buffer.append(chunk)
                     } catch {
-                        coordinator?.handleAudioError(error, sessionID: id)
+                        await self?.handleAudioError(error, sessionID: id)
                     }
                 }
             }
@@ -128,11 +127,11 @@ final class SessionCoordinator: SessionCoordinating {
 
             let stream = try await asr.start(configuration: configuration)
             guard sessionID == id, state == .connecting else { throw SessionError.cancelled }
-            try await buffer.attach { [weak coordinator, asr] chunk in
+            try await buffer.attach { [weak self, asr] chunk in
                 do {
                     try await asr.sendAudio(chunk)
                 } catch {
-                    await coordinator?.handleAudioError(error, sessionID: id)
+                    await self?.handleAudioError(error, sessionID: id)
                     throw error
                 }
             }

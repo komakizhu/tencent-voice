@@ -6,13 +6,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let appIDField = NSTextField()
     private let secretIDField = NSTextField()
     private let secretKeyField = NSSecureTextField()
-    private let engineField = NSTextField()
+    private let enginePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let prepaidHoursPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let logCheckbox = NSButton(checkboxWithTitle: "保存文本日志", target: nil, action: nil)
     private let shortcutLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "凭证优先保存在本机 YAML")
     private let onSave: (AppSettings, TencentCredentials) throws -> Void
     private let onClose: () -> Void
     private var currentShortcut: Shortcut
+    private var displayedEngineModelType: String
+    private var prepaidQuotaHoursByModel: [String: Int]
     private var storedCredentials: TencentCredentials?
     private var localMonitor: Any?
 
@@ -32,6 +35,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         self.onSave = onSave
         self.onClose = onClose
         currentShortcut = settings.shortcut
+        let selectedPreset = TencentEnginePreset(persistedModelType: settings.engineModelType)
+        displayedEngineModelType = selectedPreset.rawValue
+        prepaidQuotaHoursByModel = settings.prepaidQuotaHoursByModel
         storedCredentials = credentials
         window.hidesOnDeactivate = false
         window.isReleasedWhenClosed = false
@@ -44,7 +50,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         statusLabel.stringValue = credentials == nil
             ? "凭证优先保存在本机 YAML（明文）"
             : "已读取凭证；日常使用仅读本机 YAML"
-        engineField.stringValue = settings.engineModelType
+        for preset in TencentEnginePreset.allCases {
+            enginePopup.addItem(withTitle: preset.displayName)
+            enginePopup.lastItem?.representedObject = preset.rawValue
+        }
+        enginePopup.selectItem(at: TencentEnginePreset.allCases.firstIndex(of: selectedPreset) ?? 0)
+        enginePopup.target = self
+        enginePopup.action = #selector(engineSelectionChanged)
+        prepaidHoursPopup.target = self
+        prepaidHoursPopup.action = #selector(prepaidHoursChanged)
+        rebuildPrepaidHoursPopup()
         logCheckbox.state = settings.saveTextLogs ? .on : .off
         shortcutLabel.stringValue = ShortcutFormatter.string(for: currentShortcut)
         buildView()
@@ -61,10 +76,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private func buildView() {
         guard let contentView = window?.contentView else { return }
         let fields = NSStackView(views: [
-            labeled("AppID", field: appIDField),
-            labeled("SecretId", field: secretIDField),
-            labeled("SecretKey", field: secretKeyField),
-            labeled("识别引擎", field: engineField)
+            labeled("AppID", view: appIDField),
+            labeled("SecretId", view: secretIDField),
+            labeled("SecretKey", view: secretKeyField),
+            labeled("识别引擎", view: enginePopup),
+            labeled("已充值时长（当前模型）", view: prepaidHoursPopup)
         ])
         fields.orientation = .vertical
         fields.spacing = 10
@@ -102,15 +118,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         statusLabel.textColor = .secondaryLabelColor
     }
 
-    private func labeled(_ title: String, field: NSTextField) -> NSView {
-        field.translatesAutoresizingMaskIntoConstraints = false
-        field.placeholderString = title
+    private func labeled(_ title: String, view: NSView) -> NSView {
+        view.translatesAutoresizingMaskIntoConstraints = false
+        if let field = view as? NSTextField {
+            field.placeholderString = title
+        }
         let label = NSTextField(labelWithString: title)
         label.setContentHuggingPriority(.required, for: .horizontal)
-        let row = NSStackView(views: [label, field])
+        let row = NSStackView(views: [label, view])
         row.spacing = 10
         row.alignment = .centerY
-        field.widthAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
+        view.widthAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
         return row
     }
 
@@ -134,6 +152,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc private func saveButtonPressed() {
+        persistSelectedPrepaidHours()
         let appID = appIDField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let secretID = secretIDField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let secretKey = secretKeyField.stringValue.isEmpty
@@ -146,8 +165,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         let settings = AppSettings(
             shortcut: currentShortcut,
-            engineModelType: engineField.stringValue.isEmpty ? "16k_zh" : engineField.stringValue,
-            saveTextLogs: logCheckbox.state == .on
+            engineModelType: enginePopup.selectedItem?.representedObject as? String
+                ?? TencentEnginePreset.defaultPreset.rawValue,
+            saveTextLogs: logCheckbox.state == .on,
+            prepaidQuotaHoursByModel: prepaidQuotaHoursByModel
         )
         do {
             let credentials = TencentCredentials(appID: appID, secretID: secretID, secretKey: secretKey)
@@ -164,6 +185,51 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             NSEvent.removeMonitor(localMonitor)
         }
         localMonitor = nil
+    }
+
+    @objc private func engineSelectionChanged() {
+        persistSelectedPrepaidHours(for: displayedEngineModelType)
+        displayedEngineModelType = selectedEngineModelType
+        rebuildPrepaidHoursPopup()
+    }
+
+    @objc private func prepaidHoursChanged() {
+        persistSelectedPrepaidHours()
+    }
+
+    private func rebuildPrepaidHoursPopup() {
+        prepaidHoursPopup.removeAllItems()
+        prepaidHoursPopup.addItem(withTitle: "未设置（按当前模型默认额度）")
+        prepaidHoursPopup.lastItem?.tag = 0
+
+        var options = TencentUsageQuota.prepaidHourOptions
+        let model = selectedEngineModelType
+        if let savedHours = prepaidQuotaHoursByModel[model], savedHours > 0, !options.contains(savedHours) {
+            options.append(savedHours)
+            options.sort()
+        }
+        for hours in options {
+            prepaidHoursPopup.addItem(withTitle: "\(hours) 小时")
+            prepaidHoursPopup.lastItem?.tag = hours
+        }
+
+        let selectedHours = prepaidQuotaHoursByModel[model] ?? 0
+        prepaidHoursPopup.selectItem(withTag: selectedHours)
+    }
+
+    private func persistSelectedPrepaidHours(for model: String? = nil) {
+        let model = model ?? selectedEngineModelType
+        let hours = prepaidHoursPopup.selectedItem?.tag ?? 0
+        if hours > 0 {
+            prepaidQuotaHoursByModel[model] = hours
+        } else {
+            prepaidQuotaHoursByModel.removeValue(forKey: model)
+        }
+    }
+
+    private var selectedEngineModelType: String {
+        enginePopup.selectedItem?.representedObject as? String
+            ?? TencentEnginePreset.defaultPreset.rawValue
     }
 }
 

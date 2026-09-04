@@ -8,6 +8,7 @@ dist/
 rime/build/
 rime/trash/
 rime/sync/
+installation.yaml
 *.userdb/
 *.userdb.txt
 *.userdb.*
