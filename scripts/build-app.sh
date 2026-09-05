@@ -67,7 +67,11 @@ DIST_ROOT="$(cd -P "$PROJECT_DIR/dist" && pwd)"
 APP_PARENT="$(dirname "$APP_DIR")"
 MISSING_PARENTS=()
 while [[ ! -d "$APP_PARENT" ]]; do
-    MISSING_PARENTS=("$(basename "$APP_PARENT")" "${MISSING_PARENTS[@]}")
+    if (( ${#MISSING_PARENTS[@]} == 0 )); then
+        MISSING_PARENTS=("$(basename "$APP_PARENT")")
+    else
+        MISSING_PARENTS=("$(basename "$APP_PARENT")" "${MISSING_PARENTS[@]}")
+    fi
     NEXT_PARENT="$(dirname "$APP_PARENT")"
     if [[ "$NEXT_PARENT" == "$APP_PARENT" ]]; then
         echo "output app parent cannot be resolved: $APP_DIR" >&2
@@ -84,9 +88,11 @@ fi
 case "$APP_PARENT" in
     "$DIST_ROOT"|"$DIST_ROOT"/*)
         APP_DIR="$APP_PARENT"
-        for missing_parent in "${MISSING_PARENTS[@]}"; do
-            APP_DIR="$APP_DIR/$missing_parent"
-        done
+        if (( ${#MISSING_PARENTS[@]} > 0 )); then
+            for missing_parent in "${MISSING_PARENTS[@]}"; do
+                APP_DIR="$APP_DIR/$missing_parent"
+            done
+        fi
         APP_DIR="$APP_DIR/$APP_NAME"
         ;;
     *)
