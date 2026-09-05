@@ -132,8 +132,8 @@ patch:
     label_font_point: 12
     comment_font_face: Helvetica
     comment_font_point: 14
-    back_color: '0x181311'
-    border_color: '0x312D2B'
+    back_color: '0x080605'
+    border_color: '0x1B1714'
     text_color: '0xD8E1E6'
     hilited_text_color: '0xECF8FF'
     candidate_text_color: '0xD0D9DE'
@@ -210,17 +210,17 @@ patch:
     label_font_point: 12
     comment_font_face: Helvetica
     comment_font_point: 14
-    back_color: '0x141710'
-    border_color: '0x31382A'
-    text_color: '0xD9E3D5'
-    hilited_text_color: '0xECF5E8'
-    candidate_text_color: '0xD9E3D5'
+    back_color: '0x13110E'
+    border_color: '0x302319'
+    text_color: '0xE1E5DD'
+    hilited_text_color: '0xE1E5DD'
+    candidate_text_color: '0xE1E5DD'
     hilited_candidate_text_color: '0xFFFFFF'
-    hilited_candidate_back_color: '0x6C805D'
-    label_color: '0xA4B59A'
+    hilited_candidate_back_color: '0x629F4E'
+    label_color: '0x9BA294'
     hilited_candidate_label_color: '0xFFFFFF'
-    comment_text_color: '0xA5B29E'
-    hilited_comment_text_color: '0xE7F1E1'
+    comment_text_color: '0x969C8F'
+    hilited_comment_text_color: '0xE1E9DD'
 
   "preset_color_schemes/solarized":
     name: "日光 / Solarized"
@@ -288,8 +288,8 @@ patch:
     label_font_point: 12
     comment_font_face: Helvetica
     comment_font_point: 14
-    back_color: '0x15110F'
-    border_color: '0x312D2B'
+    back_color: '0x080605'
+    border_color: '0x1B1714'
     text_color: '0xC8C8B8'
     hilited_text_color: '0xE6E6D5'
     candidate_text_color: '0xC8C8B8'
@@ -366,8 +366,8 @@ patch:
     label_font_point: 12
     comment_font_face: Helvetica
     comment_font_point: 14
-    back_color: '0x15110F'
-    border_color: '0x312D2B'
+    back_color: '0x080605'
+    border_color: '0x1B1714'
     text_color: '0xE9DED8'
     hilited_text_color: '0xF3EDE9'
     candidate_text_color: '0xE9DED8'
@@ -444,8 +444,8 @@ patch:
     label_font_point: 12
     comment_font_face: Helvetica
     comment_font_point: 14
-    back_color: '0x15110F'
-    border_color: '0x312D2B'
+    back_color: '0x080605'
+    border_color: '0x1B1714'
     text_color: '0xF2F8F8'
     hilited_text_color: '0xFFFFFF'
     candidate_text_color: '0xF2F8F8'
