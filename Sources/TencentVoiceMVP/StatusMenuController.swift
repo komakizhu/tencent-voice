@@ -3,8 +3,7 @@ import AppKit
 @MainActor
 final class StatusMenuController: NSObject {
     private var statusItem: NSStatusItem?
-    private var stateMenuItem: NSMenuItem?
-    private var usageMenuItem: NSMenuItem?
+    private var usageMenuItemView: UsageMenuItemView?
     private var settingsMenuItem: NSMenuItem?
     private var recordMenuItem: NSMenuItem?
     private var rimeThemeMenuItem: NSMenuItem?
@@ -22,10 +21,9 @@ final class StatusMenuController: NSObject {
         item.button?.title = "语"
 
         let menu = NSMenu()
-        let state = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
-        state.isEnabled = false
-        menu.addItem(state)
-        let usage = NSMenuItem(title: "共享本机本月用量：计算中…", action: nil, keyEquivalent: "")
+        let usageView = UsageMenuItemView(text: "模型：计算中…\n用量：计算中…")
+        let usage = NSMenuItem()
+        usage.view = usageView
         usage.isEnabled = false
         menu.addItem(usage)
         menu.addItem(.separator())
@@ -34,9 +32,11 @@ final class StatusMenuController: NSObject {
         menu.addItem(rimeTheme)
         let dictionary = NSMenuItem(title: "Rime 词库管理…", action: #selector(rimeDictionaryPressed), keyEquivalent: "")
         dictionary.target = self
+        Self.applyLocalShortcut(to: dictionary, keyEquivalent: "m")
         menu.addItem(dictionary)
         let syncDictionary = NSMenuItem(title: "同步 Rime 词库", action: #selector(syncRimeDictionaryPressed), keyEquivalent: "")
         syncDictionary.target = self
+        Self.applyLocalShortcut(to: syncDictionary, keyEquivalent: "s")
         menu.addItem(syncDictionary)
         let settings = NSMenuItem(title: "设置…", action: #selector(settingsPressed), keyEquivalent: ",")
         settings.target = self
@@ -48,16 +48,19 @@ final class StatusMenuController: NSObject {
         item.menu = menu
 
         statusItem = item
-        stateMenuItem = state
-        usageMenuItem = usage
+        usageMenuItemView = usageView
         settingsMenuItem = settings
         recordMenuItem = record
         rimeThemeMenuItem = rimeTheme
     }
 
+    static func applyLocalShortcut(to item: NSMenuItem, keyEquivalent: String) {
+        item.keyEquivalent = keyEquivalent
+        item.keyEquivalentModifierMask = [.command]
+    }
+
     func update(status: String) {
         statusText = status
-        stateMenuItem?.title = status
         let isIdle = status.contains("就绪")
         let isStopping = status.contains("收尾中")
         recordMenuItem?.title = isStopping
@@ -66,8 +69,13 @@ final class StatusMenuController: NSObject {
         recordMenuItem?.isEnabled = !isStopping
     }
 
+    func update(shortcut: Shortcut) {
+        recordMenuItem?.keyEquivalent = ShortcutFormatter.menuKeyEquivalent(for: shortcut)
+        recordMenuItem?.keyEquivalentModifierMask = ShortcutFormatter.menuModifierFlags(for: shortcut)
+    }
+
     func update(usage: String) {
-        usageMenuItem?.title = usage
+        usageMenuItemView?.text = usage
     }
 
     func configure(
@@ -134,8 +142,7 @@ final class StatusMenuController: NSObject {
         guard let statusItem else { return }
         NSStatusBar.system.removeStatusItem(statusItem)
         self.statusItem = nil
-        stateMenuItem = nil
-        usageMenuItem = nil
+        usageMenuItemView = nil
         settingsMenuItem = nil
         recordMenuItem = nil
         rimeThemeMenuItem = nil

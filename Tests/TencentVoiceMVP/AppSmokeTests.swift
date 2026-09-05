@@ -9,6 +9,39 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertEqual(controller.statusText, "就绪")
     }
 
+    func testRimeDictionaryMenuItemsUseLocalCommandShortcuts() {
+        let dictionary = NSMenuItem()
+        let syncDictionary = NSMenuItem()
+        StatusMenuController.applyLocalShortcut(to: dictionary, keyEquivalent: "m")
+        StatusMenuController.applyLocalShortcut(to: syncDictionary, keyEquivalent: "s")
+
+        XCTAssertEqual(dictionary.keyEquivalent, "m")
+        XCTAssertEqual(dictionary.keyEquivalentModifierMask, NSEvent.ModifierFlags.command)
+        XCTAssertEqual(syncDictionary.keyEquivalent, "s")
+        XCTAssertEqual(syncDictionary.keyEquivalentModifierMask, NSEvent.ModifierFlags.command)
+    }
+
+    func testUsageMenuItemViewRendersUsageAcrossTwoLines() {
+        let text = "模型：16k_zh_en_2.0\n用量：38min 58s / 60h（1%）"
+        let view = UsageMenuItemView(text: text)
+
+        XCTAssertEqual(view.text, text)
+        XCTAssertEqual(view.frame.width, UsageMenuItemView.width(for: text), accuracy: 0.5)
+        XCTAssertLessThan(view.frame.width, 260)
+        XCTAssertEqual(view.frame.height, UsageMenuItemView.preferredHeight)
+        XCTAssertEqual(view.modelTextField.maximumNumberOfLines, 1)
+        XCTAssertEqual(view.usageTextField.maximumNumberOfLines, 1)
+        XCTAssertTrue(view.modelTextField.usesSingleLineMode)
+        XCTAssertTrue(view.usageTextField.usesSingleLineMode)
+        view.layoutSubtreeIfNeeded()
+        let modelAlignmentRect = view.modelTextField.alignmentRect(forFrame: view.modelTextField.frame)
+        let usageAlignmentRect = view.usageTextField.alignmentRect(forFrame: view.usageTextField.frame)
+        XCTAssertEqual(modelAlignmentRect.minX, UsageMenuItemView.horizontalInset, accuracy: 0.5)
+        XCTAssertEqual(usageAlignmentRect.minX, UsageMenuItemView.horizontalInset, accuracy: 0.5)
+        XCTAssertEqual(view.modelTextField.frame.height, UsageMenuItemView.lineHeight, accuracy: 0.5)
+        XCTAssertEqual(view.usageTextField.frame.height, UsageMenuItemView.lineHeight, accuracy: 0.5)
+    }
+
     func testSettingsWindowAlignsFormLabelsAndOmitsPermissionDescriptions() {
         let checker = SystemPrivacyPermissionChecker(
             microphoneStatus: { .authorized },
