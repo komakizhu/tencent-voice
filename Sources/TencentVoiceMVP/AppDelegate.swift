@@ -164,6 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func registerHotkey() {
         let settings = settingsStore.load()
+        menu.update(shortcut: settings.shortcut)
         do {
             try hotkeyManager.register(
                 settings.shortcut,
@@ -218,6 +219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     },
                     onRelease: {}
                 )
+                menu.update(shortcut: newSettings.shortcut)
                 settingsStore.save(newSettings)
                 migrateLocalUsageIfNeeded()
                 menu.update(status: "就绪 · \(ShortcutFormatter.string(for: newSettings.shortcut))")

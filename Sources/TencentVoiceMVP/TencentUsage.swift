@@ -32,16 +32,16 @@ struct TencentUsageSummary: Equatable, Sendable {
     }
 
     var displayText: String {
-        let scope = sharedAcrossUsers ? "共享本机本月用量" : "本地本月用量"
+        let scope = sharedAcrossUsers ? "用量" : "本地本月用量"
         let model = "模型：\(engineModelType)"
         guard let quotaSeconds, quotaSeconds > 0 else {
-            return "\(model)\n\(scope)：\(Self.format(seconds: usedSeconds))（当前引擎无免费额度）"
+            return "\(model)\n\(scope)：\(Self.formatCompact(seconds: usedSeconds))（当前引擎无免费额度）"
         }
         if isPrepaid {
-            let packageScope = sharedAcrossUsers ? "共享本机套餐用量" : "本地套餐用量"
-            return "\(model)\n\(packageScope)：\(Self.format(seconds: usedSeconds)) / \(Self.formatQuota(seconds: quotaSeconds))（已用 \(percentage ?? 0)%）"
+            let packageScope = sharedAcrossUsers ? "用量" : "本地套餐用量"
+            return "\(model)\n\(packageScope)：\(Self.formatCompact(seconds: usedSeconds)) / \(Self.formatCompactQuota(seconds: quotaSeconds))（\(percentage ?? 0)%）"
         }
-        return "\(model)\n\(scope)：\(Self.format(seconds: usedSeconds)) / \(Self.format(seconds: quotaSeconds))（已用 \(percentage ?? 0)%）"
+        return "\(model)\n\(scope)：\(Self.formatCompact(seconds: usedSeconds)) / \(Self.formatCompact(seconds: quotaSeconds))（\(percentage ?? 0)%）"
     }
 
     static func format(seconds: Int) -> String {
@@ -53,11 +53,22 @@ struct TencentUsageSummary: Equatable, Sendable {
         return "\(remainingSeconds)秒"
     }
 
-    private static func formatQuota(seconds: Int) -> String {
-        guard seconds >= 3_600, seconds.isMultiple(of: 3_600) else {
-            return format(seconds: seconds)
+    private static func formatCompact(seconds: Int) -> String {
+        let hours = seconds / 3_600
+        let minutes = (seconds % 3_600) / 60
+        let remainingSeconds = seconds % 60
+        if hours > 0 {
+            return minutes > 0 ? "\(hours)h \(minutes)min" : "\(hours)h"
         }
-        return "\(seconds / 3_600)小时"
+        if minutes > 0 { return "\(minutes)min \(remainingSeconds)s" }
+        return "\(remainingSeconds)s"
+    }
+
+    private static func formatCompactQuota(seconds: Int) -> String {
+        guard seconds >= 3_600, seconds.isMultiple(of: 3_600) else {
+            return formatCompact(seconds: seconds)
+        }
+        return "\(seconds / 3_600)h"
     }
 }
 
