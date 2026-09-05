@@ -22,14 +22,55 @@ final class SettingsStoreTests: XCTestCase {
         )
     }
 
-    func testDefaultsUseF5AndDisableTextLogs() {
+    func testDefaultsUseCommand0AndDisableTextLogs() {
         let suiteName = "TencentVoiceMVPTests.\(UUID().uuidString)"
         let store = UserDefaultsSettingsStore(suiteName: suiteName)
         let settings = store.load()
-        XCTAssertEqual(settings.shortcut, .defaultF5)
+        XCTAssertEqual(settings.shortcut, .defaultCommand0)
         XCTAssertEqual(settings.engineModelType, "16k_zh")
         XCTAssertFalse(settings.saveTextLogs)
         XCTAssertTrue(settings.prepaidQuotaHoursByModel.isEmpty)
+    }
+
+    func testLegacyF5MigratesToCommand0OnlyOnce() {
+        let suiteName = "TencentVoiceMVPTests.\(UUID().uuidString)"
+        let store = UserDefaultsSettingsStore(suiteName: suiteName)
+        let legacyData = try! JSONEncoder().encode(AppSettings(shortcut: .defaultF5))
+        UserDefaults(suiteName: suiteName)?.set(legacyData, forKey: "appSettings")
+
+        XCTAssertEqual(store.load().shortcut, .defaultCommand0)
+
+        store.save(AppSettings(shortcut: .defaultF5))
+        XCTAssertEqual(store.load().shortcut, .defaultF5)
+    }
+
+    func testCustomShortcutsAreNotMigrated() throws {
+        let modifierSets = [
+            UInt32(optionKey),
+            UInt32(controlKey),
+            UInt32(shiftKey),
+            UInt32(cmdKey)
+        ]
+
+        for modifiers in modifierSets {
+            let suiteName = "TencentVoiceMVPTests.\(UUID().uuidString)"
+            let store = UserDefaultsSettingsStore(suiteName: suiteName)
+            let customShortcut = Shortcut(keyCode: UInt32(kVK_ANSI_A), modifiers: modifiers)
+            let data = try JSONEncoder().encode(AppSettings(shortcut: customShortcut))
+            UserDefaults(suiteName: suiteName)?.set(data, forKey: "appSettings")
+
+            XCTAssertEqual(store.load().shortcut, customShortcut)
+        }
+    }
+
+    func testManuallySavingF5AfterMigrationKeepsF5() {
+        let suiteName = "TencentVoiceMVPTests.\(UUID().uuidString)"
+        let store = UserDefaultsSettingsStore(suiteName: suiteName)
+        _ = store.load()
+
+        store.save(AppSettings(shortcut: .defaultF5))
+
+        XCTAssertEqual(store.load().shortcut, .defaultF5)
     }
 
     func testSettingsRoundTrip() {

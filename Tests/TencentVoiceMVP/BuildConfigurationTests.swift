@@ -4,7 +4,7 @@ import XCTest
 final class BuildConfigurationTests: XCTestCase {
     func testDefaultModelAndShortcutAreTheMVPDefaults() {
         XCTAssertEqual(AppSettings().engineModelType, "16k_zh")
-        XCTAssertEqual(AppSettings().shortcut, .defaultF5)
+        XCTAssertEqual(AppSettings().shortcut, .defaultCommand0)
         XCTAssertFalse(AppSettings().saveTextLogs)
     }
 

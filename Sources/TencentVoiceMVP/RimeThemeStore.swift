@@ -52,7 +52,7 @@ final class RimeThemeStore {
 
     init(
         configURL: URL,
-        squirrelURL: URL = URL(fileURLWithPath: "/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel"),
+        squirrelURL: URL = RimeThemeStore.defaultSquirrelURL,
         fileManager: FileManager = .default,
         reload: (() async throws -> Void)? = nil
     ) {
@@ -309,6 +309,16 @@ final class RimeThemeStore {
             }
         }
         try result.get()
+    }
+
+    private static var defaultSquirrelURL: URL {
+        let fileManager = FileManager.default
+        let userURL = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel")
+        if fileManager.isExecutableFile(atPath: userURL.path) {
+            return userURL
+        }
+        return URL(fileURLWithPath: "/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel")
     }
 
     private final class ProcessCompletion: @unchecked Sendable {

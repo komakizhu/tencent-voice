@@ -12,6 +12,7 @@ final class RimeSyncCoreTests: XCTestCase {
         XCTAssertFalse(RimeResourcePolicy.isAllowed(relativePath: "build/rime_ice.table.bin"))
         XCTAssertFalse(RimeResourcePolicy.isAllowed(relativePath: "rime_ice.userdb/00000000"))
         XCTAssertFalse(RimeResourcePolicy.isAllowed(relativePath: "sync/node/rime_ice.userdb.txt"))
+        XCTAssertFalse(RimeResourcePolicy.isAllowed(relativePath: "rime_managed.dict.yaml"))
         XCTAssertFalse(RimeResourcePolicy.isAllowed(relativePath: "weasel.yaml"))
         XCTAssertFalse(RimeResourcePolicy.isAllowed(relativePath: "installation.yaml"))
     }
@@ -69,8 +70,8 @@ final class RimeSyncCoreTests: XCTestCase {
         let report = try engine.sync()
 
         XCTAssertEqual(report.changedFiles, ["rime_ice.custom.yaml"])
-        XCTAssertTrue(report.userDictionarySyncSucceeded)
-        XCTAssertEqual(maintenance.calls, ["sync", "reload"])
+        XCTAssertFalse(report.userDictionarySyncSucceeded)
+        XCTAssertEqual(maintenance.calls, ["reload"])
         XCTAssertTrue(FileManager.default.fileExists(atPath: shared.appendingPathComponent("config/nodes/mac2/rime_ice.custom.yaml").path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: shared.appendingPathComponent("backups/\(report.backupID)/mac2/Rime/rime_ice.custom.yaml").path))
         let manifestPermissions = try FileManager.default.attributesOfItem(atPath: shared.appendingPathComponent("config/manifest.json").path)[.posixPermissions] as? NSNumber
@@ -111,6 +112,37 @@ final class RimeSyncCoreTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: local.appendingPathComponent("rime_ice.custom.yaml")), "new")
     }
 
+    func testOrdinarySyncRemovesLegacyManagedDictionaryFromManifest() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let local = root.appendingPathComponent("local/Rime", isDirectory: true)
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        try write("managed", to: local.appendingPathComponent("rime_managed.dict.yaml"))
+        let managedRecord = FileRecord.present(
+            path: "rime_managed.dict.yaml",
+            modifiedNanoseconds: 100,
+            byteCount: 7,
+            sha256: digest("managed"),
+            owner: "mac2"
+        )
+        try RimeManifest(
+            records: [managedRecord.relativePath: managedRecord],
+            nodes: ["mac2": [managedRecord.relativePath: managedRecord]]
+        ).saving(to: shared.appendingPathComponent("config/manifest.json"))
+
+        let maintenance = FakeMaintenance()
+        let engine = DefaultRimeSyncEngine(
+            configuration: SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac2-main", nodeID: "mac2"),
+            maintenance: maintenance
+        )
+        _ = try engine.sync()
+
+        let manifest = try RimeManifest.loading(from: shared.appendingPathComponent("config/manifest.json"))
+        XCTAssertNil(manifest.records["rime_managed.dict.yaml"])
+        XCTAssertNil(manifest.nodes["mac2"]?["rime_managed.dict.yaml"])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: local.appendingPathComponent("rime_managed.dict.yaml").path))
+    }
+
     func testEqualTimestampConflictIsPausedAndPreservesLocalFile() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -145,7 +177,7 @@ final class RimeSyncCoreTests: XCTestCase {
         XCTAssertTrue(saved.pausedPaths.contains("rime_ice.custom.yaml"))
     }
 
-    func testBackupManagerKeepsOnlyThreeBackups() throws {
+    func testBackupManagerKeepsDefaultTenBackups() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let local = root.appendingPathComponent("local/Rime", isDirectory: true)
@@ -153,10 +185,40 @@ final class RimeSyncCoreTests: XCTestCase {
         try write("config", to: local.appendingPathComponent("rime_ice.schema.yaml"))
         let manager = RimeBackupManager()
         let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac2-main")
-        for _ in 0..<5 { _ = try manager.createBackup(configuration: configuration) }
+        for _ in 0..<12 { _ = try manager.createBackup(configuration: configuration) }
         let backups = try FileManager.default.contentsOfDirectory(at: configuration.backupRoot, includingPropertiesForKeys: [.isDirectoryKey])
             .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
-        XCTAssertEqual(backups.count, 3)
+        XCTAssertEqual(backups.count, 10)
+    }
+
+    func testBackupManagerAcceptsCustomRetentionAndListsNewestFirst() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let local = root.appendingPathComponent("local/Rime", isDirectory: true)
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        try write("config", to: local.appendingPathComponent("rime_ice.schema.yaml"))
+        let manager = RimeBackupManager()
+        let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac2-main")
+        let retention = try RimeBackupRetentionPolicy(limit: 12)
+        for _ in 0..<12 { _ = try manager.createBackup(configuration: configuration, retention: retention) }
+
+        let backups = try manager.listBackups(configuration: configuration)
+
+        XCTAssertEqual(backups.count, 12)
+        XCTAssertEqual(Set(backups.map(\.nodeID)), ["mac2"])
+        XCTAssertEqual(backups.map(\.id), backups.map(\.id).sorted(by: >))
+        XCTAssertTrue(backups.allSatisfy { $0.createdAt != nil })
+    }
+
+    func testBackupRetentionRequiresAtLeastOneAndHasDefaultTen() throws {
+        XCTAssertEqual(RimeBackupRetentionPolicy.defaultValue.limit, 10)
+        XCTAssertEqual(try RimeBackupRetentionPolicy(limit: 1).limit, 1)
+        XCTAssertEqual(try RimeBackupRetentionPolicy(limit: 100_000).limit, 100_000)
+        XCTAssertThrowsError(try RimeBackupRetentionPolicy(limit: 0))
+        XCTAssertThrowsError(try RimeBackupRetentionPolicy(limit: -1))
+        let encoded = try JSONEncoder().encode(RimeBackupRetentionPolicy(limit: 25))
+        XCTAssertEqual(try JSONDecoder().decode(RimeBackupRetentionPolicy.self, from: encoded).limit, 25)
+        XCTAssertThrowsError(try JSONDecoder().decode(RimeBackupRetentionPolicy.self, from: Data("{\"limit\":0}".utf8)))
     }
 
     func testDeletingLocalFilePublishesTombstoneAndRemovesSharedCopy() throws {
@@ -222,6 +284,48 @@ final class RimeSyncCoreTests: XCTestCase {
         try manager.restore(backupID: backupID, configuration: configuration)
 
         XCTAssertEqual(try String(contentsOf: local.appendingPathComponent("rime_ice.custom.yaml")), "before")
+    }
+
+    func testRestoreProtectsTargetWhileCreatingRollbackWithRetentionOne() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let local = root.appendingPathComponent("local/Rime", isDirectory: true)
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        try write("before", to: local.appendingPathComponent("rime_ice.custom.yaml"))
+        let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac2-main")
+        let manager = RimeBackupManager()
+        let targetBackupID = try manager.createBackup(
+            configuration: configuration,
+            retention: try RimeBackupRetentionPolicy(limit: 1)
+        )
+        try write("after", to: local.appendingPathComponent("rime_ice.custom.yaml"))
+
+        let maintenance = FakeMaintenance()
+        let retentionStore = RimeBackupRetentionStore(policy: try RimeBackupRetentionPolicy(limit: 1))
+        let engine = DefaultRimeSyncEngine(
+            configuration: configuration,
+            maintenance: maintenance,
+            retentionStore: retentionStore
+        )
+
+        try engine.restore(backupID: targetBackupID)
+
+        XCTAssertEqual(try String(contentsOf: local.appendingPathComponent("rime_ice.custom.yaml")), "before")
+        XCTAssertEqual(maintenance.calls, ["reload"])
+    }
+
+    func testRestoreRejectsBackupPathTraversalWithoutTouchingCurrentRime() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let local = root.appendingPathComponent("local/Rime", isDirectory: true)
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        try write("keep", to: local.appendingPathComponent("rime_ice.custom.yaml"))
+
+        let manager = RimeBackupManager()
+        let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac2-main")
+
+        XCTAssertThrowsError(try manager.restore(backupID: "../outside", configuration: configuration))
+        XCTAssertEqual(try String(contentsOf: local.appendingPathComponent("rime_ice.custom.yaml")), "keep")
     }
 
     func testDirectoryLockReleasesAfterFailureAndRejectsNestedLock() throws {
@@ -312,6 +416,16 @@ final class RimeSyncCoreTests: XCTestCase {
         XCTAssertEqual(runner.arguments, [["--sync"]])
     }
 
+    func testSquirrelMaintenanceBacksUpOnlyCurrentDictionary() throws {
+        let runner = FakeCommandRunner(result: CommandResult(status: 0))
+        let maintenance = SquirrelMaintenance(runner: runner, workingDirectoryRunner: runner, launchRunner: runner)
+
+        try maintenance.backupUserDictionary(in: URL(fileURLWithPath: "/tmp/rime-test"))
+
+        XCTAssertEqual(runner.arguments, [["--quit"], ["--backup", "rime_ice"]])
+        XCTAssertEqual(runner.launchArguments, [["-a", SquirrelPathResolver.appURL.path]])
+    }
+
     func testVerifierDetectsSharedNodeHashDrift() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -342,6 +456,184 @@ final class RimeSyncCoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("config/nodes/mac2").path))
     }
 
+    func testRimeSnapshotParserReadsRowsAndSkipsInvalidData() throws {
+        let data = Data("""
+        #@/db_name\trime_ice.userdb
+        #@/rime_version\t1.13.0
+        #@/tick\t42
+        ni\t你\tc=12 d=0.5 t=7
+        hao\t好\tc=3 d=0 t=8
+        bad\t行\tc=not-a-number d=0 t=9
+        missing\t字段
+        extra\t字段\tc=1 d=0 t=10\tunexpected
+        """.utf8)
+
+        let report = try RimeSnapshotParser().parse(data: data, sourceInstallationID: "mac")
+
+        XCTAssertEqual(report.snapshot.entries.map(\.text), ["你", "好"])
+        XCTAssertEqual(report.snapshot.entries.first?.commitCount, 12)
+        XCTAssertEqual(report.snapshot.rimeVersion, "1.13.0")
+        XCTAssertEqual(report.snapshot.tick, 42)
+        XCTAssertEqual(report.ignoredRowCount, 3)
+    }
+
+    func testRimeSnapshotParserRetainsNegativeCommitTombstones() throws {
+        let data = Data("#@/db_name\trime_ice.userdb\nni\t你\tc=-1000001 d=0 t=8\n".utf8)
+
+        let report = try RimeSnapshotParser().parse(data: data, sourceInstallationID: "mac")
+
+        XCTAssertEqual(report.snapshot.entries.count, 1)
+        XCTAssertEqual(report.snapshot.entries.first?.commitCount, -1_000_001)
+        XCTAssertTrue(report.snapshot.entries.first?.isTombstone == true)
+    }
+
+    func testRimeSnapshotParserAcceptsNativeSnapshotHeaderWhenAvailable() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("rime_ice.userdb.txt")
+        try write("# Rime user dictionary\n#@/db_name\trime_ice\n#@/db_type\tuserdb\n#@/rime_version\t1.13.0\n#@/tick\t42\nni\t示例\tc=2 d=0 t=7\n", to: url)
+
+        let report = try RimeSnapshotParser().parse(data: Data(contentsOf: url), sourceInstallationID: "mac")
+
+        XCTAssertEqual(report.snapshot.dictionaryName, "rime_ice")
+        XCTAssertGreaterThan(report.snapshot.entries.count, 0)
+        XCTAssertGreaterThanOrEqual(report.ignoredRowCount, 0)
+    }
+
+    func testManagedDictionaryAddsSourcesAndCapsFrequencyWithoutMergingDifferentCodes() {
+        let first = RimeManagedEntryState(text: "项目", code: "xiangmu", sourceFrequencies: ["mac": 7])
+        let second = RimeManagedEntryState(text: "项目", code: "xm", sourceFrequencies: ["mac2": 9])
+        let capped = RimeManagedEntryState(text: "上限", code: "shangxian", sourceFrequencies: ["mac": 9_000, "mac2": 9_000])
+        let state = RimeReviewState(entries: [first.identity: first, second.identity: second, capped.identity: capped])
+
+        let entries = RimeManagedDictionary.entries(from: state)
+
+        XCTAssertEqual(entries.first(where: { $0.text == "项目" && $0.code == "xiangmu" })?.frequency, 1)
+        XCTAssertEqual(entries.first(where: { $0.text == "项目" && $0.code == "xm" })?.frequency, 1)
+        XCTAssertEqual(entries.first(where: { $0.text == "上限" })?.frequency, 1)
+    }
+
+    func testReviewCoordinatorDefaultsToAllSelectedAndSkippedEntryReturnsNextTime() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let local = root.appendingPathComponent("local/Rime", isDirectory: true)
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        let snapshot = """
+        #@/db_name\trime_ice.userdb
+        #@/rime_version\t1.13.0
+        ni\t你\tc=12 d=0 t=1
+        hao\t好\tc=3 d=0 t=2
+        """
+        try write(snapshot, to: shared.appendingPathComponent("rime-userdata/mac/rime_ice.userdb.txt"))
+        try write("existing", to: local.appendingPathComponent("rime_ice.schema.yaml"))
+        try write("old", to: local.appendingPathComponent("rime_ice.userdb/00000000"))
+        let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac2-main", nodeID: "mac2")
+        let maintenance = FakeUserDictionaryMaintenance()
+        let ordinary = DefaultRimeSyncEngine(configuration: configuration, maintenance: maintenance)
+        let coordinator = RimeReviewSyncCoordinator(
+            configuration: configuration,
+            maintenance: maintenance,
+            reloader: maintenance,
+            ordinarySync: ordinary
+        )
+
+        let first = try coordinator.prepareAudit()
+        XCTAssertTrue(first.isInitialBaseline)
+        XCTAssertEqual(first.entries.count, 2)
+        XCTAssertEqual(Set(first.entries.map(\.text)), ["你", "好"])
+
+        let selected = try XCTUnwrap(first.entries.first(where: { $0.text == "你" })).id
+        let applied = try coordinator.apply(batch: first, actions: [selected: .promotePermanent])
+        XCTAssertEqual(applied.importedCount, 1)
+        XCTAssertEqual(applied.skippedCount, 0)
+        XCTAssertFalse(applied.initialRuntimeRebuilt)
+        XCTAssertTrue(try String(contentsOf: local.appendingPathComponent("rime_managed.dict.yaml")).contains("你\tni\t1"))
+        XCTAssertFalse(try String(contentsOf: local.appendingPathComponent("rime_managed.dict.yaml")).contains("好\thao"))
+        XCTAssertNil(maintenance.restoredSnapshot)
+
+        let second = try coordinator.prepareAudit()
+        XCTAssertFalse(second.isInitialBaseline)
+        XCTAssertEqual(second.entries.first(where: { $0.text == "你" })?.currentStatus, .permanent)
+        XCTAssertTrue(second.entries.allSatisfy { $0.currentStatus != .newRecord && $0.currentStatus != .changed })
+    }
+
+    func testReviewCoordinatorAccumulatesEachSourceOnceAndKeepsDifferentCodes() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let local = root.appendingPathComponent("local/Rime", isDirectory: true)
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        let macSnapshot = "#@/db_name\trime_ice\nni\t你\tc=7 d=0 t=1\nxiangmu\t项目\tc=3 d=0 t=1\n"
+        let mac2Snapshot = "#@/db_name\trime_ice\nni\t你\tc=9 d=0 t=1\nxm\t项目\tc=5 d=0 t=1\n"
+        try write(macSnapshot, to: shared.appendingPathComponent("rime-userdata/mac/rime_ice.userdb.txt"))
+        try write(mac2Snapshot, to: shared.appendingPathComponent("rime-userdata/mac2-main/rime_ice.userdb.txt"))
+        try write("stable", to: local.appendingPathComponent("rime_ice.schema.yaml"))
+        let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac2-main", nodeID: "mac2")
+        let maintenance = FakeUserDictionaryMaintenance()
+        let coordinator = RimeReviewSyncCoordinator(
+            configuration: configuration,
+            maintenance: maintenance,
+            reloader: maintenance,
+            ordinarySync: DefaultRimeSyncEngine(configuration: configuration, maintenance: maintenance)
+        )
+
+        let session = try coordinator.prepareAudit()
+        _ = try coordinator.apply(batch: session, actions: Dictionary(uniqueKeysWithValues: session.entries.map { ($0.id, RimeAuditAction.promotePermanent) }))
+
+        let managed = try String(contentsOf: local.appendingPathComponent("rime_managed.dict.yaml"))
+        XCTAssertTrue(managed.contains("你\tni\t1"))
+        XCTAssertTrue(managed.contains("项目\txiangmu\t1"))
+        XCTAssertTrue(managed.contains("项目\txm\t1"))
+
+        let second = try coordinator.prepareAudit()
+        XCTAssertTrue(second.entries.allSatisfy { $0.currentStatus == .permanent })
+    }
+
+    func testReviewCoordinatorRejectsSnapshotChangedDuringReview() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let local = root.appendingPathComponent("local/Rime", isDirectory: true)
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        let snapshotURL = shared.appendingPathComponent("rime-userdata/mac/rime_ice.userdb.txt")
+        try write("#@/db_name\trime_ice.userdb\nni\t你\tc=1 d=0 t=1\n", to: snapshotURL)
+        try write("stable", to: local.appendingPathComponent("rime_ice.schema.yaml"))
+        let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac2-main", nodeID: "mac2")
+        let maintenance = FakeUserDictionaryMaintenance()
+        let coordinator = RimeReviewSyncCoordinator(
+            configuration: configuration,
+            maintenance: maintenance,
+            reloader: maintenance,
+            ordinarySync: DefaultRimeSyncEngine(configuration: configuration, maintenance: maintenance)
+        )
+        let session = try coordinator.prepareAudit()
+        try write("#@/db_name\trime_ice.userdb\nni\t你\tc=2 d=0 t=1\n", to: snapshotURL)
+
+        XCTAssertThrowsError(try coordinator.apply(batch: session, actions: Dictionary(uniqueKeysWithValues: session.entries.map { ($0.id, RimeAuditAction.promotePermanent) }))) { error in
+            XCTAssertTrue(error.localizedDescription.contains("快照已变化"))
+        }
+    }
+
+    func testManualEntryUsesDefaultFrequencyAndIndependentManagedFile() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let local = root.appendingPathComponent("local/Rime", isDirectory: true)
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac2-main", nodeID: "mac2")
+        let maintenance = FakeUserDictionaryMaintenance()
+        let coordinator = RimeReviewSyncCoordinator(
+            configuration: configuration,
+            maintenance: maintenance,
+            reloader: maintenance,
+            ordinarySync: DefaultRimeSyncEngine(configuration: configuration, maintenance: maintenance)
+        )
+
+        let report = try coordinator.addManualEntry(text: "我的词", code: "wodeci")
+
+        XCTAssertEqual(report.importedCount, 1)
+        let managed = try String(contentsOf: local.appendingPathComponent("rime_managed.dict.yaml"))
+        XCTAssertTrue(managed.contains("我的词\twodeci\t1"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: local.appendingPathComponent("custom_phrase.txt").path))
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("RimeSyncCoreTests-\(UUID().uuidString)")
@@ -367,16 +659,43 @@ private final class FakeMaintenance: NativeRimeMaintaining {
     func reload() throws { calls.append("reload") }
 }
 
-private final class FakeCommandRunner: CommandRunning {
+private final class FakeUserDictionaryMaintenance: NativeRimeMaintaining, RimeUserDictionaryMaintaining {
+    var calls: [String] = []
+    var restoredSnapshot: Data?
+
+    func syncUserData() throws { calls.append("sync") }
+    func reload() throws { calls.append("reload") }
+    func captureUserDictionarySnapshot(in rimeDirectory: URL) throws { calls.append("capture") }
+    func restoreUserDictionarySnapshot(from snapshot: URL, in rimeDirectory: URL) throws {
+        calls.append("restore")
+        restoredSnapshot = try Data(contentsOf: snapshot)
+    }
+}
+
+private final class FakeCommandRunner: CommandRunning, WorkingDirectoryCommandRunning {
     let result: CommandResult
     var arguments: [[String]] = []
+    var launchArguments: [[String]] = []
 
     init(result: CommandResult) {
         self.result = result
     }
 
     func run(executable: URL, arguments: [String], timeout: TimeInterval) throws -> CommandResult {
-        self.arguments.append(arguments)
+        if executable.path == "/usr/bin/open" {
+            launchArguments.append(arguments)
+        } else {
+            self.arguments.append(arguments)
+        }
+        return result
+    }
+
+    func run(executable: URL, arguments: [String], workingDirectory: URL, timeout: TimeInterval) throws -> CommandResult {
+        if executable.path == "/usr/bin/env" {
+            self.arguments.append(Array(arguments.dropFirst(2)))
+        } else {
+            launchArguments.append(arguments)
+        }
         return result
     }
 }

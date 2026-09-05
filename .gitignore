@@ -10,3 +10,10 @@ installation.yaml
 *.userdb/
 *.userdb.txt
 *.userdb.*
+rime/rime_managed.dict.yaml
+
+# Shared audit state and backup exports contain personal vocabulary.
+rime-review-state.json
+rime-audit-batch.json
+rime-audit-*.csv
+backups/

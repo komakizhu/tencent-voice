@@ -4,11 +4,11 @@
 <dict>
 	<key>CFBundleDisplayName</key>
 	<string>腾讯语音输入 MVP</string>
+	<key>CFBundleExecutable</key>
+	<string>TencentVoiceMVP</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.tencent-voice-mvp</string>
 	<key>CFBundleName</key>
-	<string>TencentVoiceMVP</string>
-	<key>CFBundleExecutable</key>
 	<string>TencentVoiceMVP</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>

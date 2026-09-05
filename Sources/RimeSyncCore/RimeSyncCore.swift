@@ -82,6 +82,10 @@ public enum RimeResourcePolicy {
         }
         guard !path.hasSuffix(".userdb.txt") else { return false }
         guard !path.hasSuffix(".log") else { return false }
+        // This file is generated from the shared audit state.  Letting the
+        // ordinary last-writer-wins sync manage it would race with the audit
+        // coordinator and could silently resurrect a rejected entry.
+        guard path != "rime_managed.dict.yaml" else { return false }
 
         if ["cn_dicts", "en_dicts", "wanxiang_dicts", "lua", "opencc", "rime-mate-config"].contains(topLevel) {
             return true

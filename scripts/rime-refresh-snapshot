@@ -53,7 +53,7 @@ fi
 
 restart_squirrel() {
     if [ "$was_running" -eq 1 ]; then
-        /usr/bin/open "$SQUIRREL_APP" >/dev/null 2>&1 || true
+        /usr/bin/open "$SQUIRREL_APP" >/dev/null 2>&1
     fi
 }
 
@@ -78,21 +78,21 @@ if [ "$was_running" -eq 1 ]; then
         sleep 0.25
         attempt=$((attempt + 1))
     done
-    [ "$stopped" -eq 1 ] || { restart_squirrel; fail "Squirrel did not stop; userdb was not touched"; }
+    [ "$stopped" -eq 1 ] || { restart_squirrel || true; fail "Squirrel did not stop; userdb was not touched"; }
 fi
 
 echo "SNAPSHOT: generating"
 (
     cd "$RIME_ROOT" || exit 1
     if [ -n "${DYLD_LIBRARY_PATH:-}" ]; then
-        DYLD_LIBRARY_PATH="$FRAMEWORKS:$DYLD_LIBRARY_PATH" "$DICT_MANAGER" -s
+        DYLD_LIBRARY_PATH="$FRAMEWORKS:$DYLD_LIBRARY_PATH" "$DICT_MANAGER" --backup rime_ice
     else
-        DYLD_LIBRARY_PATH="$FRAMEWORKS" "$DICT_MANAGER" -s
+        DYLD_LIBRARY_PATH="$FRAMEWORKS" "$DICT_MANAGER" --backup rime_ice
     fi
 )
 manager_status=$?
 
-restart_squirrel
+restart_squirrel || fail "snapshot generated, but Squirrel could not be restarted"
 
 [ "$manager_status" -eq 0 ] || fail "rime_dict_manager failed with status $manager_status"
 

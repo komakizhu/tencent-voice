@@ -148,7 +148,7 @@ public final class RimeBootstrapper {
         let rawDate = newestModificationDate(in: raw)
         let snapshotDate = try fileManager.attributesOfItem(atPath: snapshot.path)[.modificationDate] as? Date
         if let rawDate, let snapshotDate, rawDate > snapshotDate {
-            throw RimeSyncError.unsupportedOperation("rime_ice.userdb 比同步快照更新，请先以源账户执行 Squirrel --sync")
+            throw RimeSyncError.unsupportedOperation("rime_ice.userdb 比同步快照更新，请先以当前账户发布 rime_dict_manager --backup rime_ice")
         }
     }
 

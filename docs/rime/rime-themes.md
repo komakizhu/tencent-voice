@@ -1,8 +1,9 @@
 # Rime 皮肤切换
 
 雾凇负责输入方案，鼠须管的皮肤配置位于 `rime/squirrel.custom.yaml` 的
-`preset_color_schemes`。当前配置包含 `blue_reverie`、`paper`、`mint` 和
-`midnight` 四组皮肤，每组都有一个亮色主题和一个同名的 `_dark` 深色主题。
+`preset_color_schemes`。当前实验板保留 6 组皮肤，每组都有一个亮色主题和一个
+同名的 `_dark` 深色主题：`paper`、`sage`、`solarized`、`nord`、`dracula`、
+`glass`。
 
 ## 切换
 
@@ -53,3 +54,22 @@ patch:
 顺序，而不是网页 CSS 的 RGB 顺序。网页中的
 `#D06A40` 应写成 `0x406AD0`；带透明度时使用 `0xAABBGGRR`。增加或修改
 主题后，执行 `scripts/rime-theme use sunset`，或从鼠须管菜单重新部署。
+
+当前 6 套方案：
+
+- `paper`：纸张白灰；深色为近黑中性底配暖橙选中项。
+- `sage`：低饱和舒缓绿；深色使用近黑底和护眼的柔和绿。
+- `solarized`：经典 Solarized；深色使用青绿色高亮。
+- `nord`：经典极地蓝灰；深色使用冰蓝与金色文字体系。
+- `dracula`：经典紫粉配色；深色使用粉紫高亮。
+- `glass`：Apple Glass 实验方案；浅深色都使用实时背景、半透明面板和面板级模糊。
+
+`glass` 不包含预览图中的固定圆形或装饰背景，运行时背景由窗口后面的真实内容决定。
+鼠须管的 YAML 能力只覆盖候选面板级 `translucency: true` 和 `blur: true`，不能对单独
+的高亮行调用原生 Liquid Glass 或执行逐行高斯模糊，所以高亮行使用深色中性磨砂叠层
+作为兼容表现。若要做到系统级逐行实时毛玻璃，需要修改输入法候选窗渲染器，而不是
+继续增加 YAML 颜色值。
+
+这里的 `_dark` 是对应主题在 macOS 深色模式下的配套版本，不是额外的独立
+皮肤名称；例如选择 `Mint` 后，系统会在浅色模式使用 `mint`，深色模式使用
+`mint_dark`。

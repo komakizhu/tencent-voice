@@ -5,6 +5,7 @@ struct Shortcut: Codable, Equatable, Sendable {
     let keyCode: UInt32
     let modifiers: UInt32
 
+    static let defaultCommand0 = Shortcut(keyCode: UInt32(kVK_ANSI_0), modifiers: UInt32(cmdKey))
     static let defaultF5 = Shortcut(keyCode: UInt32(kVK_F5), modifiers: 0)
 }
 

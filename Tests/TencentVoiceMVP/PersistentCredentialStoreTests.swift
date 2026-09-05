@@ -26,6 +26,28 @@ final class PersistentCredentialStoreTests: XCTestCase {
         XCTAssertEqual(legacy.loadCallCount, 1)
     }
 
+    func testPerUserYAMLCredentialsMigrateToSharedPrimary() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let primary = LocalYAMLCredentialStore(
+            fileURL: directory.appendingPathComponent("shared/credentials.yaml"),
+            filePermissions: 0o660,
+            directoryPermissions: 0o2770
+        )
+        let perUser = LocalYAMLCredentialStore(fileURL: directory.appendingPathComponent("user/credentials.yaml"))
+        try perUser.save(sampleCredentials)
+        let legacy = CountingCredentialStore(credentials: nil)
+        let store = PersistentCredentialStore(
+            primary: primary,
+            legacy: legacy,
+            perUserFallback: perUser
+        )
+
+        XCTAssertEqual(try store.load(), sampleCredentials)
+        XCTAssertEqual(try primary.load(), sampleCredentials)
+        XCTAssertEqual(legacy.loadCallCount, 0)
+    }
+
     private var sampleCredentials: TencentCredentials {
         TencentCredentials(appID: "123", secretID: "sid", secretKey: "key")
     }

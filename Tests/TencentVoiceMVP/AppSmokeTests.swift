@@ -1,4 +1,5 @@
 import XCTest
+import RimeSyncCore
 @testable import TencentVoiceMVP
 
 @MainActor
@@ -7,4 +8,133 @@ final class AppSmokeTests: XCTestCase {
         let controller = StatusMenuController()
         XCTAssertEqual(controller.statusText, "就绪")
     }
+
+    func testManualRimeEntryFormShowsAllEditableFields() {
+        let form = ManualRimeEntryForm()
+
+        XCTAssertEqual(form.wordField.placeholderString, "词条（必填）")
+        XCTAssertEqual(form.codeField.placeholderString, "全拼编码（必填）")
+        XCTAssertEqual(form.frequencyField.placeholderString, "频率（可选，默认 1）")
+        XCTAssertTrue(form.wordField.superview === form)
+        XCTAssertTrue(form.codeField.superview === form)
+        XCTAssertTrue(form.frequencyField.superview === form)
+        XCTAssertFalse(form.wordField.isHidden)
+        XCTAssertFalse(form.codeField.isHidden)
+        XCTAssertFalse(form.frequencyField.isHidden)
+        XCTAssertGreaterThan(form.frame.width, 0)
+        XCTAssertGreaterThan(form.frame.height, 0)
+        XCTAssertGreaterThan(form.wordField.frame.height, 0)
+        XCTAssertGreaterThan(form.codeField.frame.height, 0)
+        XCTAssertGreaterThan(form.frequencyField.frame.height, 0)
+    }
+
+    func testRimeFilterSliderShowsFiveSmallTickLabels() {
+        let slider = NSSlider()
+        let control = RimeFilterSliderView(
+            title: "累计次数",
+            tickTitles: ["不限", "≥3", "≥10", "≥30", "≥100"],
+            slider: slider
+        )
+
+        XCTAssertEqual(control.tickTitles, ["不限", "≥3", "≥10", "≥30", "≥100"])
+        XCTAssertTrue(control.tickLabels.allSatisfy { $0.font?.pointSize == 9 })
+        control.frame = NSRect(x: 0, y: 0, width: 260, height: 42)
+        control.layoutSubtreeIfNeeded()
+        // AppKit may expand the slider slightly to satisfy the stack view's
+        // intrinsic sizing.  The user-facing requirement is a longer track,
+        // not an exact pixel width.
+        XCTAssertGreaterThanOrEqual(slider.frame.width, 190)
+        XCTAssertGreaterThan(slider.frame.height, 0)
+    }
+
+    func testRimeAuditCheckboxesSupportMixedHeaderState() {
+        let selectAll = NSButton(checkboxWithTitle: "全选", target: nil, action: nil)
+        selectAll.allowsMixedState = true
+        XCTAssertTrue(selectAll.allowsMixedState)
+        XCTAssertEqual(selectAll.state, .off)
+        XCTAssertEqual(selectAll.title, "全选")
+
+        let cell = RimeAuditCheckboxCell(frame: NSRect(x: 0, y: 0, width: 36, height: 28))
+        cell.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(cell.checkbox.frame.width, 0)
+        XCTAssertGreaterThan(cell.checkbox.frame.height, 0)
+    }
+
+    func testBackupPickerShowsConfiguredRetentionAndSelectableBackups() {
+        let backups = [
+            RimeBackupDescriptor(id: "20260905-120000000-mac2-AAAA1111", nodeID: "mac2", createdAt: Date(timeIntervalSince1970: 100)),
+            RimeBackupDescriptor(id: "20260905-110000000-mac2-BBBB2222", nodeID: "mac2", createdAt: Date(timeIntervalSince1970: 50))
+        ]
+        let picker = RimeBackupPickerView(backups: backups, retentionLimit: 10)
+
+        XCTAssertEqual(picker.numberOfRows(in: picker.tableView), 2)
+        XCTAssertEqual(picker.retentionField.stringValue, "10")
+        XCTAssertEqual(picker.selectedBackup?.id, backups[0].id)
+        XCTAssertEqual(try picker.validatedRetentionPolicy().limit, 10)
+
+        picker.retentionField.stringValue = "0"
+        XCTAssertThrowsError(try picker.validatedRetentionPolicy())
+        picker.retentionField.stringValue = "unlimited"
+        XCTAssertThrowsError(try picker.validatedRetentionPolicy())
+    }
+
+    func testBackupSettingsDefaultToTenAndIgnoreInvalidPersistedValues() {
+        let suiteName = "RimeBackupSettingsTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertEqual(RimeBackupSettings.loadPolicy(from: defaults).limit, 10)
+        defaults.set(25, forKey: RimeBackupSettings.retentionLimitKey)
+        XCTAssertEqual(RimeBackupSettings.loadPolicy(from: defaults).limit, 25)
+        defaults.set(0, forKey: RimeBackupSettings.retentionLimitKey)
+        XCTAssertEqual(RimeBackupSettings.loadPolicy(from: defaults).limit, 10)
+    }
+
+    func testRimeDictionaryWindowUsesUpdatedActionLayout() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RimeDictionaryWindowTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let maintenance = AppSmokeRimeMaintenance()
+        let coordinator = RimeReviewSyncCoordinator(
+            configuration: SyncConfiguration(
+                localRimeDirectory: root.appendingPathComponent("Rime", isDirectory: true),
+                sharedRoot: root.appendingPathComponent("shared", isDirectory: true),
+                installationID: "mac2-main"
+            ),
+            maintenance: maintenance,
+            reloader: maintenance,
+            ordinarySync: AppSmokeRimeSync()
+        )
+        let controller = RimeDictionaryWindowController(reviewCoordinator: coordinator)
+        let views = flatten(controller.window?.contentView)
+        let buttons = views.compactMap { $0 as? NSButton }
+
+        XCTAssertTrue(buttons.contains { $0.title == "重新读取" })
+        XCTAssertTrue(buttons.contains { $0.title == "导出" })
+        XCTAssertTrue(buttons.contains { $0.title == "导入 AI 提案…" })
+        XCTAssertTrue(buttons.contains { $0.title == "应用 AI 提案" })
+        XCTAssertFalse(buttons.contains { $0.title == "关闭" })
+        let export = try XCTUnwrap(views.compactMap { $0 as? NSPopUpButton }.first { $0.title == "导出" })
+        XCTAssertEqual(export.menu?.items.map(\.title), ["导出", "CSV", "TXT", "Markdown", "JSON"])
+    }
+
+    private func flatten(_ view: NSView?) -> [NSView] {
+        guard let view else { return [] }
+        return [view] + view.subviews.flatMap(flatten)
+    }
+}
+
+private final class AppSmokeRimeMaintenance: NativeRimeMaintaining, RimeUserDictionaryMaintaining {
+    func syncUserData() throws {}
+    func reload() throws {}
+    func captureUserDictionarySnapshot(in rimeDirectory: URL) throws {}
+    func restoreUserDictionarySnapshot(from snapshot: URL, in rimeDirectory: URL) throws {}
+}
+
+private final class AppSmokeRimeSync: RimeSyncEngine {
+    func status() throws -> SyncReport { SyncReport() }
+    func sync(dryRun: Bool) throws -> SyncReport { SyncReport() }
+    func restore(backupID: String) throws {}
 }

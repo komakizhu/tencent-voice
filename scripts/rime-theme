@@ -32,7 +32,13 @@ rime_dir="${rime_dir:A}"
 live_rime_dir="${user_home}/Library/Rime"
 live_rime_dir="${live_rime_dir:A}"
 config_file="${rime_dir}/squirrel.custom.yaml"
-squirrel_bin="${SQUIRREL_BIN:-/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel}"
+if [[ -n "${SQUIRREL_BIN:-}" ]]; then
+  squirrel_bin="$SQUIRREL_BIN"
+elif [[ -x "${user_home}/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel" ]]; then
+  squirrel_bin="${user_home}/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel"
+else
+  squirrel_bin="/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel"
+fi
 
 if [[ ! -f "$config_file" ]]; then
   print -u2 "找不到配置文件：$config_file"

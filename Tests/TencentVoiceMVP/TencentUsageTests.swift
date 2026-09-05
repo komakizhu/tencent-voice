@@ -137,4 +137,168 @@ final class TencentUsageTests: XCTestCase {
         XCTAssertEqual(store.seconds(for: "16k_zh", at: start.addingTimeInterval(12)), 12)
         XCTAssertFalse(store.hasActiveSession)
     }
+
+    func testSharedUsageIsVisibleToAnotherMacOSAccountForTheSameCredentials() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVPSharedUsage-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("usage.json")
+        let credentials = TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+        let alice = SharedUsageStore(fileURL: fileURL, ownerID: "alice", processID: 1)
+        let bob = SharedUsageStore(fileURL: fileURL, ownerID: "bob", processID: 2)
+        let start = Date(timeIntervalSince1970: 1_000_000)
+
+        let sessionID = try alice.beginSession(
+            for: credentials,
+            engineModelType: "16k_zh",
+            at: start
+        )
+        XCTAssertEqual(
+            try bob.currentSeconds(
+                for: credentials,
+                engineModelType: "16k_zh",
+                at: start.addingTimeInterval(37)
+            ),
+            37
+        )
+        XCTAssertEqual(try alice.endSession(sessionID, at: start.addingTimeInterval(37)), 37)
+        XCTAssertEqual(
+            try bob.currentSeconds(
+                for: credentials,
+                engineModelType: "16k_zh",
+                at: start.addingTimeInterval(37)
+            ),
+            37
+        )
+    }
+
+    func testSharedUsageSeparatesDifferentCredentialIdentities() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVPSharedUsage-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("usage.json")
+        let firstCredentials = TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+        let secondCredentials = TencentCredentials(appID: "app", secretID: "id", secretKey: "other-key")
+        let store = SharedUsageStore(fileURL: fileURL, ownerID: "alice", processID: 1)
+        let start = Date(timeIntervalSince1970: 1_000_000)
+
+        let sessionID = try store.beginSession(
+            for: firstCredentials,
+            engineModelType: "16k_zh",
+            at: start
+        )
+        _ = try store.endSession(sessionID, at: start.addingTimeInterval(12))
+
+        XCTAssertEqual(
+            try store.currentSeconds(
+                for: firstCredentials,
+                engineModelType: "16k_zh",
+                at: start.addingTimeInterval(12)
+            ),
+            12
+        )
+        XCTAssertEqual(
+            try store.currentSeconds(
+                for: secondCredentials,
+                engineModelType: "16k_zh",
+                at: start.addingTimeInterval(12)
+            ),
+            0
+        )
+    }
+
+    func testExistingPerUserUsageMigratesToSharedCredentialBucketOnce() throws {
+        let suiteName = "TencentVoiceMVPTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let localStore = LocalUsageStore(defaults: defaults)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVPSharedUsage-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sharedStore = SharedUsageStore(
+            fileURL: directory.appendingPathComponent("usage.json"),
+            ownerID: "alice",
+            processID: 1
+        )
+        let credentials = TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+        let date = Date(timeIntervalSince1970: 1_000_000)
+        localStore.add(seconds: 19, for: "16k_zh", at: date)
+
+        try sharedStore.migrateLocalUsageIfNeeded(from: localStore, for: credentials)
+        try sharedStore.migrateLocalUsageIfNeeded(from: localStore, for: credentials)
+
+        XCTAssertEqual(
+            try sharedStore.currentSeconds(
+                for: credentials,
+                engineModelType: "16k_zh",
+                at: date
+            ),
+            19
+        )
+        let content = try String(contentsOf: directory.appendingPathComponent("usage.json"))
+        XCTAssertFalse(content.contains(credentials.secretKey))
+    }
+
+    func testPrepaidQuotaIsSharedForTheSameCredentials() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVPSharedUsage-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let credentials = TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+        let alice = SharedUsageStore(
+            fileURL: directory.appendingPathComponent("usage.json"),
+            ownerID: "alice",
+            processID: 1
+        )
+        let bob = SharedUsageStore(
+            fileURL: directory.appendingPathComponent("usage.json"),
+            ownerID: "bob",
+            processID: 2
+        )
+
+        try alice.setPrepaidQuotaHours(60, for: credentials, engineModelType: "16k_zh_en_2.0")
+
+        XCTAssertEqual(
+            try bob.prepaidQuotaHours(for: credentials, engineModelType: "16k_zh_en_2.0"),
+            60
+        )
+    }
+
+    func testLegacyLocalUsageIsNotCopiedAgainWhenTheUserChangesCredentials() throws {
+        let suiteName = "TencentVoiceMVPTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let localStore = LocalUsageStore(defaults: defaults)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVPSharedUsage-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sharedStore = SharedUsageStore(
+            fileURL: directory.appendingPathComponent("usage.json"),
+            ownerID: "alice",
+            processID: 1
+        )
+        let firstCredentials = TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+        let secondCredentials = TencentCredentials(appID: "app", secretID: "id", secretKey: "other-key")
+        let date = Date(timeIntervalSince1970: 1_000_000)
+        localStore.add(seconds: 19, for: "16k_zh", at: date)
+
+        try sharedStore.migrateLocalUsageIfNeeded(from: localStore, for: firstCredentials)
+        try sharedStore.migrateLocalUsageIfNeeded(from: localStore, for: secondCredentials)
+
+        XCTAssertEqual(
+            try sharedStore.currentSeconds(
+                for: firstCredentials,
+                engineModelType: "16k_zh",
+                at: date
+            ),
+            19
+        )
+        XCTAssertEqual(
+            try sharedStore.currentSeconds(
+                for: secondCredentials,
+                engineModelType: "16k_zh",
+                at: date
+            ),
+            0
+        )
+    }
 }

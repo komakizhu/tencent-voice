@@ -11,6 +11,8 @@ final class StatusMenuController: NSObject {
     private var onSettings: (() -> Void)?
     private var onToggleRecording: (() -> Void)?
     private var onSelectRimeTheme: ((String) -> Void)?
+    private var onManageRimeDictionary: (() -> Void)?
+    private var onSyncRimeDictionary: (() -> Void)?
     private(set) var statusText = "就绪"
 
     func install() {
@@ -23,13 +25,19 @@ final class StatusMenuController: NSObject {
         let state = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
         state.isEnabled = false
         menu.addItem(state)
-        let usage = NSMenuItem(title: "本地本月用量：计算中…", action: nil, keyEquivalent: "")
+        let usage = NSMenuItem(title: "共享本机本月用量：计算中…", action: nil, keyEquivalent: "")
         usage.isEnabled = false
         menu.addItem(usage)
         menu.addItem(.separator())
         let rimeTheme = NSMenuItem(title: "Rime 皮肤", action: nil, keyEquivalent: "")
         rimeTheme.submenu = NSMenu(title: "Rime 皮肤")
         menu.addItem(rimeTheme)
+        let dictionary = NSMenuItem(title: "Rime 词库管理…", action: #selector(rimeDictionaryPressed), keyEquivalent: "")
+        dictionary.target = self
+        menu.addItem(dictionary)
+        let syncDictionary = NSMenuItem(title: "同步 Rime 词库", action: #selector(syncRimeDictionaryPressed), keyEquivalent: "")
+        syncDictionary.target = self
+        menu.addItem(syncDictionary)
         let settings = NSMenuItem(title: "设置…", action: #selector(settingsPressed), keyEquivalent: ",")
         settings.target = self
         let record = NSMenuItem(title: "开始录音", action: #selector(toggleRecordingPressed), keyEquivalent: "")
@@ -65,11 +73,15 @@ final class StatusMenuController: NSObject {
     func configure(
         onSettings: @escaping () -> Void,
         onToggleRecording: @escaping () -> Void,
-        onSelectRimeTheme: @escaping (String) -> Void
+        onSelectRimeTheme: @escaping (String) -> Void,
+        onManageRimeDictionary: @escaping () -> Void,
+        onSyncRimeDictionary: @escaping () -> Void
     ) {
         self.onSettings = onSettings
         self.onToggleRecording = onToggleRecording
         self.onSelectRimeTheme = onSelectRimeTheme
+        self.onManageRimeDictionary = onManageRimeDictionary
+        self.onSyncRimeDictionary = onSyncRimeDictionary
     }
 
     func update(rimeThemes snapshot: RimeThemeSnapshot) {
@@ -110,6 +122,14 @@ final class StatusMenuController: NSObject {
         onSelectRimeTheme?(themeID)
     }
 
+    @objc private func rimeDictionaryPressed() {
+        onManageRimeDictionary?()
+    }
+
+    @objc private func syncRimeDictionaryPressed() {
+        onSyncRimeDictionary?()
+    }
+
     func uninstall() {
         guard let statusItem else { return }
         NSStatusBar.system.removeStatusItem(statusItem)
@@ -122,5 +142,7 @@ final class StatusMenuController: NSObject {
         onSettings = nil
         onToggleRecording = nil
         onSelectRimeTheme = nil
+        onManageRimeDictionary = nil
+        onSyncRimeDictionary = nil
     }
 }
