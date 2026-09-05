@@ -1,7 +1,7 @@
 patch:
   style:
-    color_scheme: paper
-    color_scheme_dark: paper_dark
+    color_scheme: blue_reverie
+    color_scheme_dark: blue_reverie_dark
     status_message_type: mix
     candidate_format: '[label]. [candidate] [comment]'
     candidate_list_layout: stacked
@@ -26,6 +26,46 @@ patch:
 
   # 颜色值沿用 Rime 的 BGR 顺序；8 位值为 AABBGGRR。
   # 这些配色不使用主题色描边，避免候选框外围出现彩色细框。
+  "preset_color_schemes/blue_reverie":
+    name: "Blue Reverie"
+    author: HunterJi
+    color_space: srgb
+    back_color: '0xFFFFFF'
+    hilited_back_color: '0x252320'
+    hilited_candidate_back_color: '0xFF7A00'
+    text_color: '0xD8000000'
+    hilited_text_color: '0xDEDDDD'
+    candidate_text_color: '0x5E5E5E'
+    hilited_candidate_text_color: '0xFFFFFF'
+    label_color: '0x888785'
+    hilited_candidate_label_color: '0xFFFFFF'
+    comment_text_color: '0xDEDDDD'
+    candidate_list_layout: linear
+    corner_radius: 1.2e+1
+    hilited_corner_radius: 1.2e+1
+    border_height: 0e+0
+    border_width: 6e+0
+
+  "preset_color_schemes/blue_reverie_dark":
+    name: "Blue Reverie Dark"
+    author: HunterJi
+    color_space: srgb
+    back_color: '0x3F000000'
+    hilited_back_color: '0x252320'
+    hilited_candidate_back_color: '0xFF7A00'
+    text_color: '0xD8000000'
+    hilited_text_color: '0xDEDDDD'
+    candidate_text_color: '0xFFFFFF'
+    hilited_candidate_text_color: '0xFFFFFF'
+    label_color: '0xEBEBEB'
+    hilited_candidate_label_color: '0xFFFFFF'
+    comment_text_color: '0xDEDDDD'
+    candidate_list_layout: linear
+    corner_radius: 1.2e+1
+    hilited_corner_radius: 1.2e+1
+    border_height: 0e+0
+    border_width: 6e+0
+
   "preset_color_schemes/paper":
     name: "纸张 / Paper"
     author: local
@@ -53,16 +93,16 @@ patch:
     label_font_point: 12
     comment_font_face: Helvetica
     comment_font_point: 14
-    back_color: '0xF7F4EE'
-    border_color: '0xE5DED9'
+    back_color: '0xEEF4F7'
+    border_color: '0xD2DEE4'
     text_color: '0x5B5B5B'
     hilited_text_color: '0x303030'
     candidate_text_color: '0x303030'
     hilited_candidate_text_color: '0xFFFFFF'
     hilited_candidate_back_color: '0x3C6BC9'
-    label_color: '0x8A8176'
+    label_color: '0x76818A'
     hilited_candidate_label_color: '0xFFFFFF'
-    comment_text_color: '0x8F8A83'
+    comment_text_color: '0x838A8F'
     hilited_comment_text_color: '0xE8EEF2'
 
   "preset_color_schemes/paper_dark":
@@ -183,7 +223,7 @@ patch:
     hilited_comment_text_color: '0xE3F8D8'
 
   "preset_color_schemes/solarized":
-    name: "Solarized"
+    name: "日光 / Solarized"
     author: local
     color_space: srgb
     candidate_list_layout: linear
@@ -222,7 +262,7 @@ patch:
     hilited_comment_text_color: '0xF8F1D9'
 
   "preset_color_schemes/solarized_dark":
-    name: "Solarized 深色 / Solarized Dark"
+    name: "日光深色 / Solarized Dark"
     author: local
     color_space: srgb
     candidate_list_layout: linear
@@ -287,7 +327,7 @@ patch:
     label_font_point: 12
     comment_font_face: Helvetica
     comment_font_point: 14
-    back_color: '0xF4FFEC'
+    back_color: '0xF4EFEC'
     border_color: '0xE5DED9'
     text_color: '0x40342E'
     hilited_text_color: '0x2E3440'
@@ -370,12 +410,12 @@ patch:
     text_color: '0x362A28'
     hilited_text_color: '0x282A36'
     candidate_text_color: '0x362A28'
-    hilited_candidate_text_color: '0x282A36'
+    hilited_candidate_text_color: '0xFFFFFF'
     hilited_candidate_back_color: '0xF993BD'
     label_color: '0xA47262'
-    hilited_candidate_label_color: '0x282A36'
+    hilited_candidate_label_color: '0xFFFFFF'
     comment_text_color: '0xA47262'
-    hilited_comment_text_color: '0xF8E8FF'
+    hilited_comment_text_color: '0xFFFFFF'
 
   "preset_color_schemes/dracula_dark":
     name: "德古拉深色 / Dracula Dark"
