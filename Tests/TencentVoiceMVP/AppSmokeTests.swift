@@ -9,6 +9,60 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertEqual(controller.statusText, "就绪")
     }
 
+    func testSettingsWindowAlignsFormLabelsAndOmitsPermissionDescriptions() {
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .authorized },
+            accessibilityStatus: { true },
+            postEventStatus: { true },
+            inputMonitoringStatus: { true }
+        )
+        let controller = SettingsWindowController(
+            settings: AppSettings(),
+            credentials: nil,
+            onSave: { _, _ in },
+            permissionChecker: checker
+        )
+        let contentView = try! XCTUnwrap(controller.window?.contentView)
+        contentView.layoutSubtreeIfNeeded()
+        let labels = flatten(contentView).compactMap { $0 as? NSTextField }
+        let formLabelTitles = [
+            "AppID",
+            "SecretId",
+            "SecretKey",
+            "识别引擎",
+            "已充值时长（当前模型）"
+        ]
+        let formLabels = formLabelTitles.compactMap { title in
+            labels.first { $0.stringValue == title }
+        }
+        XCTAssertEqual(formLabels.count, formLabelTitles.count)
+        let labelPositions = formLabels.map { $0.convert($0.bounds, to: contentView).minX }
+        XCTAssertEqual(Set(labelPositions).count, 1)
+
+        let removedTexts = [
+            "操作：点击“打开设置”→打开对应项目中的本应用开关→回到这里点击“检查权限”。",
+            "系统权限完整，可以录音并把识别结果输入到当前应用。"
+        ] + PrivacyPermission.allCases.map(\.purpose)
+        XCTAssertTrue(removedTexts.allSatisfy { text in
+            !labels.contains { $0.stringValue == text }
+        })
+        XCTAssertTrue(labels.contains { $0.stringValue == "保存崩溃日志" })
+        XCTAssertFalse(labels.contains { $0.stringValue == "保存文本日志" })
+
+        let permissionTitle = labels.first { $0.stringValue == "系统权限（当前 macOS 账户）" }
+        let permissionCheckButton = flatten(contentView)
+            .compactMap { $0 as? NSButton }
+            .first { $0.title == "检查权限" }
+        guard let permissionTitle, let permissionCheckButton else {
+            XCTFail("系统权限标题或检查权限按钮不存在")
+            return
+        }
+        let titleFrame = permissionTitle.convert(permissionTitle.bounds, to: contentView)
+        let buttonFrame = permissionCheckButton.convert(permissionCheckButton.bounds, to: contentView)
+        XCTAssertEqual(titleFrame.midY, buttonFrame.midY, accuracy: 1)
+        XCTAssertGreaterThan(buttonFrame.minX, titleFrame.maxX)
+    }
+
     func testManualRimeEntryFormShowsAllEditableFields() {
         let form = ManualRimeEntryForm()
 

@@ -8,18 +8,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let secretKeyField = NSSecureTextField()
     private let enginePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let prepaidHoursPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let logCheckbox = NSButton(checkboxWithTitle: "保存文本日志", target: nil, action: nil)
+    private let logCheckbox = NSButton(checkboxWithTitle: "保存崩溃日志", target: nil, action: nil)
     private let shortcutLabel = NSTextField(labelWithString: "")
     private let versionLabel = NSTextField(labelWithString: AppVersion.displayText)
     private let statusLabel = NSTextField(labelWithString: "凭证优先保存在本机 YAML")
     private let testButton = NSButton(title: "测试连接", target: nil, action: nil)
     private let permissionCheckButton = NSButton(title: "检查权限", target: nil, action: nil)
-    private let permissionSummaryLabel = NSTextField(
-        wrappingLabelWithString: "正在读取系统权限…"
-    )
-    private let permissionInstructionLabel = NSTextField(
-        wrappingLabelWithString: "操作：点击“打开设置”→打开对应项目中的本应用开关→回到这里点击“检查权限”。"
-    )
     private let permissionRowsStack = NSStackView()
     private let onSave: (AppSettings, TencentCredentials) throws -> Void
     private let onTestConnection: ((TencentCredentials, String) async throws -> Void)?
@@ -104,6 +98,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             labeled("已充值时长（当前模型）", view: prepaidHoursPopup)
         ])
         fields.orientation = .vertical
+        fields.alignment = .leading
         fields.spacing = 10
         fields.translatesAutoresizingMaskIntoConstraints = false
 
@@ -121,7 +116,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         testButton.isEnabled = onTestConnection != nil
         permissionCheckButton.target = self
         permissionCheckButton.action = #selector(checkPermissionsPressed)
-        let buttons = NSStackView(views: [statusLabel, NSView(), permissionCheckButton, testButton, saveButton])
+        let buttons = NSStackView(views: [statusLabel, NSView(), testButton, saveButton])
         buttons.alignment = .centerY
         buttons.spacing = 8
 
@@ -149,18 +144,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private func buildPermissionView() -> NSView {
         let title = NSTextField(labelWithString: "系统权限（当前 macOS 账户）")
         title.font = .boldSystemFont(ofSize: NSFont.systemFontSize)
-
-        permissionSummaryLabel.maximumNumberOfLines = 0
-        permissionSummaryLabel.lineBreakMode = .byWordWrapping
-        permissionSummaryLabel.textColor = .secondaryLabelColor
-        permissionSummaryLabel.translatesAutoresizingMaskIntoConstraints = false
-        permissionSummaryLabel.widthAnchor.constraint(equalToConstant: 452).isActive = true
-
-        permissionInstructionLabel.maximumNumberOfLines = 0
-        permissionInstructionLabel.lineBreakMode = .byWordWrapping
-        permissionInstructionLabel.textColor = .secondaryLabelColor
-        permissionInstructionLabel.translatesAutoresizingMaskIntoConstraints = false
-        permissionInstructionLabel.widthAnchor.constraint(equalToConstant: 452).isActive = true
+        let titleRow = NSStackView(views: [title, NSView(), permissionCheckButton])
+        titleRow.alignment = .centerY
+        titleRow.spacing = 8
+        titleRow.translatesAutoresizingMaskIntoConstraints = false
+        titleRow.widthAnchor.constraint(equalToConstant: 452).isActive = true
 
         permissionRowsStack.orientation = .vertical
         permissionRowsStack.alignment = .leading
@@ -177,11 +165,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             state.widthAnchor.constraint(equalToConstant: 82).isActive = true
             permissionStateLabels[permission] = state
 
-            let purpose = NSTextField(labelWithString: permission.purpose)
-            purpose.textColor = .secondaryLabelColor
-            purpose.lineBreakMode = .byTruncatingTail
-            purpose.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
             let openButton = NSButton(
                 title: "打开设置",
                 target: self,
@@ -189,7 +172,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             )
             openButton.tag = permission.rawValue
 
-            let row = NSStackView(views: [name, state, purpose, NSView(), openButton])
+            let row = NSStackView(views: [name, state, NSView(), openButton])
             row.alignment = .centerY
             row.spacing = 6
             row.translatesAutoresizingMaskIntoConstraints = false
@@ -197,7 +180,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             permissionRowsStack.addArrangedSubview(row)
         }
 
-        let view = NSStackView(views: [title, permissionInstructionLabel, permissionSummaryLabel, permissionRowsStack])
+        let view = NSStackView(views: [titleRow, permissionRowsStack])
         view.orientation = .vertical
         view.alignment = .leading
         view.spacing = 8
@@ -221,7 +204,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func refreshPermissionReport() {
         let report = permissionChecker.report()
-        permissionSummaryLabel.stringValue = report.summary
         for status in report.statuses {
             permissionStateLabels[status.permission]?.stringValue = status.detail
             permissionStateLabels[status.permission]?.textColor = status.isGranted

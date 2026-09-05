@@ -33,14 +33,15 @@ struct TencentUsageSummary: Equatable, Sendable {
 
     var displayText: String {
         let scope = sharedAcrossUsers ? "共享本机本月用量" : "本地本月用量"
+        let model = "模型：\(engineModelType)"
         guard let quotaSeconds, quotaSeconds > 0 else {
-            return "\(scope)（\(engineModelType)）：\(Self.format(seconds: usedSeconds))（当前引擎无免费额度）"
+            return "\(model)\n\(scope)：\(Self.format(seconds: usedSeconds))（当前引擎无免费额度）"
         }
         if isPrepaid {
             let packageScope = sharedAcrossUsers ? "共享本机套餐用量" : "本地套餐用量"
-            return "\(packageScope)（\(engineModelType)）：\(Self.format(seconds: usedSeconds)) / \(Self.formatQuota(seconds: quotaSeconds))（已用 \(percentage ?? 0)%）"
+            return "\(model)\n\(packageScope)：\(Self.format(seconds: usedSeconds)) / \(Self.formatQuota(seconds: quotaSeconds))（已用 \(percentage ?? 0)%）"
         }
-        return "\(scope)（\(engineModelType)）：\(Self.format(seconds: usedSeconds)) / \(Self.format(seconds: quotaSeconds))（已用 \(percentage ?? 0)%）"
+        return "\(model)\n\(scope)：\(Self.format(seconds: usedSeconds)) / \(Self.format(seconds: quotaSeconds))（已用 \(percentage ?? 0)%）"
     }
 
     static func format(seconds: Int) -> String {

@@ -33,7 +33,7 @@ final class TencentUsageTests: XCTestCase {
         XCTAssertEqual(summary.percentage, 8)
         XCTAssertEqual(
             summary.displayText,
-            "本地套餐用量（16k_zh_en_2.0）：5小时0分 / 60小时（已用 8%）"
+            "模型：16k_zh_en_2.0\n本地套餐用量：5小时0分 / 60小时（已用 8%）"
         )
     }
 
@@ -46,7 +46,7 @@ final class TencentUsageTests: XCTestCase {
 
         XCTAssertEqual(summary.usedSeconds, 120)
         XCTAssertEqual(summary.percentage, 40)
-        XCTAssertEqual(summary.displayText, "本地本月用量（16k_zh）：2分0秒 / 5分0秒（已用 40%）")
+        XCTAssertEqual(summary.displayText, "模型：16k_zh\n本地本月用量：2分0秒 / 5分0秒（已用 40%）")
     }
 
     func testLocalUsageSessionIsLiveAndCommittedWhenItEnds() {
