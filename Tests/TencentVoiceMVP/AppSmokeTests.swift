@@ -61,6 +61,28 @@ final class AppSmokeTests: XCTestCase {
         let buttonFrame = permissionCheckButton.convert(permissionCheckButton.bounds, to: contentView)
         XCTAssertEqual(titleFrame.midY, buttonFrame.midY, accuracy: 1)
         XCTAssertGreaterThan(buttonFrame.minX, titleFrame.maxX)
+
+        let testConnectionButton = flatten(contentView)
+            .compactMap { $0 as? NSButton }
+            .first { $0.title == "测试连接" }
+        let shortcutLabel = labels.first { $0.stringValue == "快捷键" }
+        let logCheckbox = flatten(contentView)
+            .compactMap { $0 as? NSButton }
+            .first { $0.title == "保存崩溃日志" }
+        let saveButton = flatten(contentView)
+            .compactMap { $0 as? NSButton }
+            .first { $0.title == "保存" }
+        guard let testConnectionButton, let shortcutLabel, let logCheckbox, let saveButton else {
+            XCTFail("设置页操作控件不存在")
+            return
+        }
+        let testFrame = testConnectionButton.convert(testConnectionButton.bounds, to: contentView)
+        let shortcutFrame = shortcutLabel.convert(shortcutLabel.bounds, to: contentView)
+        let logFrame = logCheckbox.convert(logCheckbox.bounds, to: contentView)
+        let saveFrame = saveButton.convert(saveButton.bounds, to: contentView)
+        XCTAssertGreaterThan(testFrame.minY, shortcutFrame.maxY)
+        XCTAssertEqual(logFrame.midY, saveFrame.midY, accuracy: 1)
+        XCTAssertLessThan(logFrame.minX, saveFrame.minX)
     }
 
     func testManualRimeEntryFormShowsAllEditableFields() {

@@ -95,7 +95,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             labeled("SecretId", view: secretIDField),
             labeled("SecretKey", view: secretKeyField),
             labeled("识别引擎", view: enginePopup),
-            labeled("已充值时长（当前模型）", view: prepaidHoursPopup)
+            labeled("已充值时长（当前模型）", view: prepaidHoursPopup),
+            testButton
         ])
         fields.orientation = .vertical
         fields.alignment = .leading
@@ -116,12 +117,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         testButton.isEnabled = onTestConnection != nil
         permissionCheckButton.target = self
         permissionCheckButton.action = #selector(checkPermissionsPressed)
-        let buttons = NSStackView(views: [statusLabel, NSView(), testButton, saveButton])
+        let buttons = NSStackView(views: [logCheckbox, statusLabel, NSView(), saveButton])
         buttons.alignment = .centerY
         buttons.spacing = 8
 
         let permissionView = buildPermissionView()
-        let content = NSStackView(views: [versionLabel, fields, shortcutRow, logCheckbox, permissionView, buttons])
+        let content = NSStackView(views: [versionLabel, fields, shortcutRow, permissionView, buttons])
         content.orientation = .vertical
         content.alignment = .leading
         content.spacing = 16
