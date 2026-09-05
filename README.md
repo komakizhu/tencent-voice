@@ -5,7 +5,7 @@
 ## 使用
 
 1. 在腾讯云开通实时语音识别，准备 AppID、SecretId、SecretKey。
-2. 运行 `./scripts/build-app.sh`。
+2. 运行 `./scripts/build-app.sh`。每次成功执行应用构建时，脚本都会将 `CFBundleVersion` 自动加 1，并把新 build 号写入 `Resources/Info.plist` 和应用产物。
 3. 打开 `dist/TencentVoiceMVP.app`。
 4. 首次运行后，在菜单栏“设置…”的“系统权限”区域点击“检查权限”。缺少权限时，点击对应项目旁的“打开设置”，按中文用途说明在当前 macOS 账户中开启麦克风、辅助功能、发送键盘事件和输入监控，回来再点击“检查权限”。之后在设置中保存腾讯凭证。
 5. 默认点击 Command+0 开始录音，再点击 Command+0 停止；设置中可以重新录制快捷键。

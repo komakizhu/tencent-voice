@@ -12,6 +12,7 @@ final class StatusMenuController: NSObject {
     private var onToggleRecording: (() -> Void)?
     private var onSelectRimeTheme: ((String) -> Void)?
     private var onManageRimeDictionary: (() -> Void)?
+    private var onSyncRimeDictionary: (() -> Void)?
     private(set) var statusText = "就绪"
 
     func install() {
@@ -34,6 +35,9 @@ final class StatusMenuController: NSObject {
         let dictionary = NSMenuItem(title: "Rime 词库管理…", action: #selector(rimeDictionaryPressed), keyEquivalent: "")
         dictionary.target = self
         menu.addItem(dictionary)
+        let syncDictionary = NSMenuItem(title: "同步 Rime 词库", action: #selector(syncRimeDictionaryPressed), keyEquivalent: "")
+        syncDictionary.target = self
+        menu.addItem(syncDictionary)
         let settings = NSMenuItem(title: "设置…", action: #selector(settingsPressed), keyEquivalent: ",")
         settings.target = self
         let record = NSMenuItem(title: "开始录音", action: #selector(toggleRecordingPressed), keyEquivalent: "")
@@ -70,12 +74,14 @@ final class StatusMenuController: NSObject {
         onSettings: @escaping () -> Void,
         onToggleRecording: @escaping () -> Void,
         onSelectRimeTheme: @escaping (String) -> Void,
-        onManageRimeDictionary: @escaping () -> Void
+        onManageRimeDictionary: @escaping () -> Void,
+        onSyncRimeDictionary: @escaping () -> Void
     ) {
         self.onSettings = onSettings
         self.onToggleRecording = onToggleRecording
         self.onSelectRimeTheme = onSelectRimeTheme
         self.onManageRimeDictionary = onManageRimeDictionary
+        self.onSyncRimeDictionary = onSyncRimeDictionary
     }
 
     func update(rimeThemes snapshot: RimeThemeSnapshot) {
@@ -120,6 +126,10 @@ final class StatusMenuController: NSObject {
         onManageRimeDictionary?()
     }
 
+    @objc private func syncRimeDictionaryPressed() {
+        onSyncRimeDictionary?()
+    }
+
     func uninstall() {
         guard let statusItem else { return }
         NSStatusBar.system.removeStatusItem(statusItem)
@@ -133,5 +143,6 @@ final class StatusMenuController: NSObject {
         onToggleRecording = nil
         onSelectRimeTheme = nil
         onManageRimeDictionary = nil
+        onSyncRimeDictionary = nil
     }
 }

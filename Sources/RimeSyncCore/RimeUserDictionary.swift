@@ -107,12 +107,14 @@ public enum RimeSnapshotParserError: LocalizedError, Equatable {
     case invalidEncoding
     case missingDatabaseHeader
     case wrongDatabase(String)
+    case wrongDatabaseType(String)
 
     public var errorDescription: String? {
         switch self {
         case .invalidEncoding: return "Rime 快照不是有效的 UTF-8"
         case .missingDatabaseHeader: return "Rime 快照缺少数据库表头"
         case let .wrongDatabase(name): return "不支持的 Rime 用户库：\(name)"
+        case let .wrongDatabaseType(type): return "Rime 快照数据库类型无效：\(type)"
         }
     }
 }
@@ -126,6 +128,7 @@ public struct RimeSnapshotParser: Sendable {
         }
 
         var databaseName: String?
+        var databaseType: String?
         var rimeVersion: String?
         var tick: Int64?
         var invalidHeaderCount = 0
@@ -135,12 +138,14 @@ public struct RimeSnapshotParser: Sendable {
         for rawLine in text.components(separatedBy: .newlines) {
             let line = rawLine.hasSuffix("\r") ? String(rawLine.dropLast()) : rawLine
             guard !line.isEmpty, !line.hasPrefix("#") else {
-                if line.hasPrefix("#@/") { parseHeader(line, databaseName: &databaseName, rimeVersion: &rimeVersion, tick: &tick, invalidHeaderCount: &invalidHeaderCount) }
+                if line.hasPrefix("#@/") {
+                    parseHeader(line, databaseName: &databaseName, databaseType: &databaseType, rimeVersion: &rimeVersion, tick: &tick, invalidHeaderCount: &invalidHeaderCount)
+                }
                 continue
             }
 
             let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
-            guard fields.count >= 3 else {
+            guard fields.count == 3 else {
                 ignoredRowCount += 1
                 continue
             }
@@ -159,6 +164,9 @@ public struct RimeSnapshotParser: Sendable {
 
         guard let databaseName else { throw RimeSnapshotParserError.missingDatabaseHeader }
         guard databaseName == "rime_ice" || databaseName == "rime_ice.userdb" else { throw RimeSnapshotParserError.wrongDatabase(databaseName) }
+        if let databaseType, databaseType != "userdb" {
+            throw RimeSnapshotParserError.wrongDatabaseType(databaseType)
+        }
         let digest = Self.digest(data)
         let snapshot = RimeUserDictionarySnapshot(
             sourceInstallationID: sourceInstallationID,
@@ -178,6 +186,7 @@ public struct RimeSnapshotParser: Sendable {
     private func parseHeader(
         _ line: String,
         databaseName: inout String?,
+        databaseType: inout String?,
         rimeVersion: inout String?,
         tick: inout Int64?,
         invalidHeaderCount: inout Int
@@ -191,6 +200,7 @@ public struct RimeSnapshotParser: Sendable {
         let value = String(fields[1]).trimmingCharacters(in: .whitespacesAndNewlines)
         switch key {
         case "#@/db_name": databaseName = value
+        case "#@/db_type": databaseType = value
         case "#@/rime_version": rimeVersion = value
         case "#@/tick":
             if let parsed = Int64(value) { tick = parsed } else { invalidHeaderCount += 1 }
@@ -279,6 +289,7 @@ public struct RimeReviewState: Codable, Equatable, Sendable {
     public var pendingActions: [String: RimePendingAuditAction]
     public var proposals: [String: [RimeAuditProposal]]
     public var completedActions: [String: RimeCompletedAuditAction]
+    public var replacementRecords: [String: RimeAuditReplacementRecord]
     public var backupIDs: [String]
     public var migration: RimeReviewMigration
 
@@ -293,6 +304,7 @@ public struct RimeReviewState: Codable, Equatable, Sendable {
         pendingActions: [String: RimePendingAuditAction] = [:],
         proposals: [String: [RimeAuditProposal]] = [:],
         completedActions: [String: RimeCompletedAuditAction] = [:],
+        replacementRecords: [String: RimeAuditReplacementRecord] = [:],
         backupIDs: [String] = [],
         migration: RimeReviewMigration = RimeReviewMigration()
     ) {
@@ -306,6 +318,7 @@ public struct RimeReviewState: Codable, Equatable, Sendable {
         self.pendingActions = pendingActions
         self.proposals = proposals
         self.completedActions = completedActions
+        self.replacementRecords = replacementRecords
         self.backupIDs = backupIDs
         self.migration = migration
     }
@@ -313,7 +326,7 @@ public struct RimeReviewState: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, initialized, entries, lastAppliedSnapshotDigests
         case nodeObservations, actions, permanentIgnoredIDs, pendingActions
-        case proposals, completedActions, backupIDs, migration
+        case proposals, completedActions, replacementRecords, backupIDs, migration
     }
 
     public init(from decoder: Decoder) throws {
@@ -331,6 +344,7 @@ public struct RimeReviewState: Codable, Equatable, Sendable {
         self.pendingActions = try container.decodeIfPresent([String: RimePendingAuditAction].self, forKey: .pendingActions) ?? [:]
         self.proposals = try container.decodeIfPresent([String: [RimeAuditProposal]].self, forKey: .proposals) ?? [:]
         self.completedActions = try container.decodeIfPresent([String: RimeCompletedAuditAction].self, forKey: .completedActions) ?? [:]
+        self.replacementRecords = try container.decodeIfPresent([String: RimeAuditReplacementRecord].self, forKey: .replacementRecords) ?? [:]
         self.backupIDs = try container.decodeIfPresent([String].self, forKey: .backupIDs) ?? []
         var migration = try container.decodeIfPresent(RimeReviewMigration.self, forKey: .migration) ?? RimeReviewMigration()
         if version < 2 { migration.migratedFromSchemaVersion = version }

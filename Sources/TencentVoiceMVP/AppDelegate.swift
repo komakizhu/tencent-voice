@@ -11,11 +11,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let localUsageStore: LocalUsageStore
     private let sharedUsageStore: SharedUsageStore
     private let rimeThemeStore: RimeThemeStore
+    private let rimeBackupRetentionStore: RimeBackupRetentionStore
     private let rimeReviewCoordinator: RimeReviewSyncCoordinator?
     private var settingsWindowController: SettingsWindowController?
     private var rimeDictionaryWindowController: RimeDictionaryWindowController?
     private var usageMonitorTask: Task<Void, Never>?
     private var rimeThemeSelectionTask: Task<Void, Never>?
+    private var rimeSyncTask: Task<Void, Never>?
     private var cachedCredentials: TencentCredentials?
     private var activeUsageSessionID: UUID?
 
@@ -29,6 +31,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let localUsageStore = LocalUsageStore()
         let sharedUsageStore = SharedUsageStore()
         let rimeThemeStore = RimeThemeStore()
+        let rimeBackupRetentionStore = RimeBackupRetentionStore(
+            policy: RimeBackupSettings.loadPolicy()
+        )
         let localRimeDirectory = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Rime", isDirectory: true)
         let sharedRimeRoot = URL(fileURLWithPath: "/Users/Shared/RimeSync", isDirectory: true)
@@ -49,13 +54,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             let ordinaryRimeSync = DefaultRimeSyncEngine(
                 configuration: rimeConfiguration,
-                maintenance: rimeMaintenance
+                maintenance: rimeMaintenance,
+                retentionStore: rimeBackupRetentionStore
             )
             rimeReviewCoordinator = RimeReviewSyncCoordinator(
                 configuration: rimeConfiguration,
                 maintenance: rimeMaintenance,
                 reloader: rimeMaintenance,
-                ordinarySync: ordinaryRimeSync
+                ordinarySync: ordinaryRimeSync,
+                retentionStore: rimeBackupRetentionStore
             )
         }
         self.settingsStore = settingsStore
@@ -65,6 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.localUsageStore = localUsageStore
         self.sharedUsageStore = sharedUsageStore
         self.rimeThemeStore = rimeThemeStore
+        self.rimeBackupRetentionStore = rimeBackupRetentionStore
         self.rimeReviewCoordinator = rimeReviewCoordinator
         coordinator = SessionCoordinator(
             asr: TencentASRClient(),
@@ -101,6 +109,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             onManageRimeDictionary: { [weak self] in
                 self?.showRimeDictionaryManager()
+            },
+            onSyncRimeDictionary: { [weak self] in
+                self?.syncRimeDictionary()
             }
         )
         refreshRimeThemes()
@@ -143,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         usageMonitorTask?.cancel()
         rimeThemeSelectionTask?.cancel()
+        rimeSyncTask?.cancel()
         rimeDictionaryWindowController?.close()
         hotkeyManager.unregister()
         endTrackedUsageSession()
@@ -279,6 +291,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.window?.makeKeyAndOrderFront(nil)
         controller.window?.orderFrontRegardless()
         controller.begin()
+    }
+
+    private func syncRimeDictionary() {
+        guard let rimeReviewCoordinator else {
+            menu.update(status: "Rime 词库同步不可用")
+            return
+        }
+        guard rimeSyncTask == nil else { return }
+
+        menu.update(status: "正在同步 Rime 词库…")
+        rimeSyncTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { rimeSyncTask = nil }
+            let result: Result<RimeUserDictionarySyncReport, Error> = await Task.detached(priority: .userInitiated) {
+                do {
+                    return .success(try rimeReviewCoordinator.syncUserDictionary())
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+            switch result {
+            case let .success(report):
+                menu.update(status: "Rime 词库同步完成 · \(report.entryCount) 条审核记录")
+                rimeDictionaryWindowController?.reloadFromStoredSnapshot()
+            case let .failure(error):
+                menu.update(status: "Rime 词库同步失败：\(error.localizedDescription)")
+            }
+        }
     }
 
     private func toggleRecording() async {

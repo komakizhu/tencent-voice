@@ -200,8 +200,20 @@ public struct SquirrelMaintenance: NativeRimeMaintaining, RimeUserDictionaryMain
     private func withSquirrelStopped<T>(_ body: () throws -> T) throws -> T {
         try run(arguments: ["--quit"])
         Thread.sleep(forTimeInterval: 0.2)
-        defer { try? launchSquirrel() }
-        return try body()
+        do {
+            let result = try body()
+            try launchSquirrel()
+            return result
+        } catch let originalError {
+            do {
+                try launchSquirrel()
+            } catch let restartError {
+                throw RimeSyncError.unsupportedOperation(
+                    "Rime 用户库操作失败：\(originalError.localizedDescription)；Squirrel 重启也失败：\(restartError.localizedDescription)"
+                )
+            }
+            throw originalError
+        }
     }
 
     private func launchSquirrel() throws {
@@ -299,14 +311,80 @@ public enum AtomicFileStore {
     }
 }
 
-public struct RimeBackupManager {
+public struct RimeBackupRetentionPolicy: Codable, Equatable, Sendable {
+    public static let defaultLimit = 10
+    public static let defaultValue = try! RimeBackupRetentionPolicy(limit: defaultLimit)
+
+    public let limit: Int
+
+    public init(limit: Int = RimeBackupRetentionPolicy.defaultLimit) throws {
+        guard limit >= 1 else {
+            throw RimeSyncError.unsupportedOperation("备份保留数量必须至少为 1")
+        }
+        self.limit = limit
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(limit: container.decode(Int.self, forKey: .limit))
+    }
+
+    private enum CodingKeys: String, CodingKey { case limit }
+}
+
+/// The retention setting is shared by the ordinary resource synchronizer and
+/// the audit coordinator.  The reference is deliberately lock-protected so
+/// the UI can change it while a background sync is in progress.
+public final class RimeBackupRetentionStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var policy: RimeBackupRetentionPolicy
+
+    public init(policy: RimeBackupRetentionPolicy = .defaultValue) {
+        self.policy = policy
+    }
+
+    public var current: RimeBackupRetentionPolicy {
+        lock.lock(); defer { lock.unlock() }
+        return policy
+    }
+
+    @discardableResult
+    public func update(limit: Int) throws -> RimeBackupRetentionPolicy {
+        let updated = try RimeBackupRetentionPolicy(limit: limit)
+        lock.lock(); defer { lock.unlock() }
+        policy = updated
+        return updated
+    }
+}
+
+public struct RimeBackupDescriptor: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let nodeID: String
+    public let createdAt: Date?
+
+    public init(id: String, nodeID: String, createdAt: Date?) {
+        self.id = id
+        self.nodeID = nodeID
+        self.createdAt = createdAt
+    }
+}
+
+public protocol RimeBackupListing {
+    func listBackups(configuration: SyncConfiguration) throws -> [RimeBackupDescriptor]
+}
+
+public struct RimeBackupManager: RimeBackupListing {
     public let fileManager: FileManager
 
     public init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
     }
 
-    public func createBackup(configuration: SyncConfiguration) throws -> String {
+    public func createBackup(
+        configuration: SyncConfiguration,
+        retention: RimeBackupRetentionPolicy = .defaultValue,
+        pruneAfterCreation: Bool = true
+    ) throws -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
@@ -334,13 +412,66 @@ public struct RimeBackupManager {
             configuration.sharedRoot.appendingPathComponent("rime-userdata", isDirectory: true),
             to: sharedDestination.appendingPathComponent("rime-userdata", isDirectory: true)
         )
-        try prune(configuration: configuration)
+        if pruneAfterCreation {
+            try pruneBackups(configuration: configuration, retention: retention)
+        }
         return id
     }
 
+    /// Lists only backups that contain a complete snapshot for the current
+    /// node, so every row shown by the restore UI is actually restorable by
+    /// the current account.
+    public func listBackups(configuration: SyncConfiguration) throws -> [RimeBackupDescriptor] {
+        guard fileManager.fileExists(atPath: configuration.backupRoot.path) else { return [] }
+        let directories = try fileManager.contentsOfDirectory(
+            at: configuration.backupRoot,
+            includingPropertiesForKeys: [.isDirectoryKey, .creationDateKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )
+        return directories.compactMap { directory in
+            guard (try? directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return nil }
+            let snapshot = directory
+                .appendingPathComponent(configuration.nodeID, isDirectory: true)
+                .appendingPathComponent("Rime", isDirectory: true)
+            guard fileManager.fileExists(atPath: snapshot.path) else { return nil }
+            return RimeBackupDescriptor(
+                id: directory.lastPathComponent,
+                nodeID: configuration.nodeID,
+                createdAt: backupDate(for: directory)
+            )
+        }
+        .sorted { lhs, rhs in
+            switch (lhs.createdAt, rhs.createdAt) {
+            case let (left?, right?) where left != right:
+                return left > right
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            default:
+                return lhs.id > rhs.id
+            }
+        }
+    }
+
+    /// Removes old backups for the current node only.  Backups belonging to
+    /// the other macOS account are not affected by this account's setting.
+    public func pruneBackups(
+        configuration: SyncConfiguration,
+        retention: RimeBackupRetentionPolicy,
+        protectedBackupIDs: Set<String> = []
+    ) throws {
+        let backups = try listBackups(configuration: configuration)
+        var keep = Set(backups.prefix(retention.limit).map(\.id))
+        keep.formUnion(protectedBackupIDs)
+        for backup in backups where !keep.contains(backup.id) {
+            try fileManager.removeItem(at: configuration.backupRoot.appendingPathComponent(backup.id, isDirectory: true))
+        }
+    }
+
     public func restore(backupID: String, configuration: SyncConfiguration) throws {
-        let snapshot = configuration.backupRoot
-            .appendingPathComponent(backupID, isDirectory: true)
+        let backupDirectory = try validatedBackupDirectory(backupID, configuration: configuration)
+        let snapshot = backupDirectory
             .appendingPathComponent(configuration.nodeID, isDirectory: true)
             .appendingPathComponent("Rime", isDirectory: true)
         guard fileManager.fileExists(atPath: snapshot.path) else {
@@ -350,12 +481,8 @@ public struct RimeBackupManager {
             .appendingPathComponent(".rime-restore-\(UUID().uuidString)", isDirectory: true)
         defer { try? fileManager.removeItem(at: staged) }
         try fileManager.copyItem(at: snapshot, to: staged)
-        if fileManager.fileExists(atPath: configuration.localRimeDirectory.path) {
-            try fileManager.removeItem(at: configuration.localRimeDirectory)
-        }
-        try fileManager.moveItem(at: staged, to: configuration.localRimeDirectory)
-        let sharedSnapshot = configuration.backupRoot
-            .appendingPathComponent(backupID, isDirectory: true)
+        try replaceDirectory(at: configuration.localRimeDirectory, with: staged)
+        let sharedSnapshot = backupDirectory
             .appendingPathComponent("shared", isDirectory: true)
         try restoreDirectoryIfPresent(
             sharedSnapshot.appendingPathComponent("config", isDirectory: true),
@@ -379,23 +506,45 @@ public struct RimeBackupManager {
             .appendingPathComponent(".rime-restore-shared-\(UUID().uuidString)", isDirectory: true)
         defer { try? fileManager.removeItem(at: staged) }
         try fileManager.copyItem(at: source, to: staged)
-        if fileManager.fileExists(atPath: destination.path) {
-            try fileManager.removeItem(at: destination)
-        }
-        try fileManager.moveItem(at: staged, to: destination)
+        try replaceDirectory(at: destination, with: staged)
     }
 
-    private func prune(configuration: SyncConfiguration) throws {
-        guard let entries = try? fileManager.contentsOfDirectory(
-            at: configuration.backupRoot,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return }
-        let directories = entries.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
-            .sorted { $0.lastPathComponent > $1.lastPathComponent }
-        for old in directories.dropFirst(3) {
-            try fileManager.removeItem(at: old)
+    private func replaceDirectory(at destination: URL, with staged: URL) throws {
+        if fileManager.fileExists(atPath: destination.path) {
+            _ = try fileManager.replaceItemAt(destination, withItemAt: staged)
+        } else {
+            try fileManager.moveItem(at: staged, to: destination)
         }
+    }
+
+    private func validatedBackupDirectory(_ backupID: String, configuration: SyncConfiguration) throws -> URL {
+        let backupComponent = URL(fileURLWithPath: backupID).lastPathComponent
+        guard !backupID.isEmpty,
+              backupID.unicodeScalars.allSatisfy({ $0.value != 0 }),
+              backupComponent == backupID else {
+            throw RimeSyncError.backupNotFound(backupID)
+        }
+
+        let root = configuration.backupRoot.standardizedFileURL.resolvingSymlinksInPath()
+        let candidate = root
+            .appendingPathComponent(backupID, isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        guard candidate.path.hasPrefix(root.path + "/") else {
+            throw RimeSyncError.backupNotFound(backupID)
+        }
+        return candidate
+    }
+
+    private func backupDate(for directory: URL) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMdd-HHmmssSSS"
+        let prefix = directory.lastPathComponent.split(separator: "-", maxSplits: 2).prefix(2).joined(separator: "-")
+        if let date = formatter.date(from: prefix) { return date }
+        let values = try? directory.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
+        return values?.creationDate ?? values?.contentModificationDate
     }
 }
 
@@ -405,18 +554,21 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
     private let fileManager: FileManager
     private let now: () -> Date
     private let backupManager: RimeBackupManager
+    private let retentionStore: RimeBackupRetentionStore
 
     public init(
         configuration: SyncConfiguration,
         maintenance: any NativeRimeMaintaining = SquirrelMaintenance(),
         fileManager: FileManager = .default,
-        now: @escaping () -> Date = Date.init
+        now: @escaping () -> Date = Date.init,
+        retentionStore: RimeBackupRetentionStore = RimeBackupRetentionStore()
     ) {
         self.configuration = configuration
         self.maintenance = maintenance
         self.fileManager = fileManager
         self.now = now
         self.backupManager = RimeBackupManager(fileManager: fileManager)
+        self.retentionStore = retentionStore
     }
 
     public func status() throws -> SyncReport {
@@ -429,7 +581,7 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
         let lock = DirectoryLock(lockURL: configuration.lockURL, fileManager: fileManager)
         return try lock.withLock {
             try SharedDirectoryLayout.prepare(sharedRoot: configuration.sharedRoot, nodeIDs: [configuration.nodeID], fileManager: fileManager)
-            let backupID = try backupManager.createBackup(configuration: configuration)
+            let backupID = try backupManager.createBackup(configuration: configuration, retention: retentionStore.current)
             let plan = try makePlan()
             try execute(plan: plan, conflictID: backupID)
             try plan.manifest.saving(to: configuration.manifestURL, fileManager: fileManager)
@@ -445,9 +597,26 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
         let lock = DirectoryLock(lockURL: configuration.lockURL, fileManager: fileManager)
         try lock.withLock {
             try SharedDirectoryLayout.prepare(sharedRoot: configuration.sharedRoot, nodeIDs: [configuration.nodeID], fileManager: fileManager)
-            _ = try backupManager.createBackup(configuration: configuration)
-            try backupManager.restore(backupID: backupID, configuration: configuration)
-            try maintenance.reload()
+            let rollbackBackupID = try backupManager.createBackup(
+                configuration: configuration,
+                retention: retentionStore.current,
+                pruneAfterCreation: false
+            )
+            do {
+                try backupManager.restore(backupID: backupID, configuration: configuration)
+                try maintenance.reload()
+                try backupManager.pruneBackups(configuration: configuration, retention: retentionStore.current)
+            } catch let originalError {
+                do {
+                    try backupManager.restore(backupID: rollbackBackupID, configuration: configuration)
+                    try maintenance.reload()
+                } catch let recoveryError {
+                    throw RimeSyncError.unsupportedOperation(
+                        "恢复失败：\(originalError.localizedDescription)；回滚也失败：\(recoveryError.localizedDescription)；请使用备份 \(rollbackBackupID) 恢复"
+                    )
+                }
+                throw originalError
+            }
         }
     }
 

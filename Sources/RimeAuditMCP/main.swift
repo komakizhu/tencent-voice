@@ -10,22 +10,22 @@ import RimeSyncCore
 private final class RimeAuditMCPService: @unchecked Sendable {
     private let options: RimeAuditMCPOptions
     private let fileManager: FileManager
-    private let batchStore: RimeAuditBatchStore
-    private let reviewStore: RimeReviewStore
+    private let auditCoordinator: RimeReviewSyncCoordinator
 
     init(options: RimeAuditMCPOptions, fileManager: FileManager = .default) {
         self.options = options
         self.fileManager = fileManager
-        self.batchStore = RimeAuditBatchStore(
-            url: options.sharedRoot
-                .appendingPathComponent("config", isDirectory: true)
-                .appendingPathComponent("rime-audit-batch.json"),
-            fileManager: fileManager
+        let configuration = SyncConfiguration(
+            localRimeDirectory: options.localRimeDirectory,
+            sharedRoot: options.sharedRoot,
+            installationID: options.installationID
         )
-        self.reviewStore = RimeReviewStore(
-            url: options.sharedRoot
-                .appendingPathComponent("config", isDirectory: true)
-                .appendingPathComponent("rime-review-state.json"),
+        let maintenance = SquirrelMaintenance()
+        self.auditCoordinator = RimeReviewSyncCoordinator(
+            configuration: configuration,
+            maintenance: maintenance,
+            reloader: maintenance,
+            ordinarySync: DefaultRimeSyncEngine(configuration: configuration, maintenance: maintenance, fileManager: fileManager),
             fileManager: fileManager
         )
     }
@@ -47,12 +47,12 @@ private final class RimeAuditMCPService: @unchecked Sendable {
             Tool(
                 name: "rime_audit_export",
                 description: "导出当前审核批次的 RFC 4180 CSV，供 AI 离线分析。",
-                inputSchema: Self.objectSchema(),
+                inputSchema: Self.listSchema(),
                 annotations: readOnlyAnnotations
             ),
             Tool(
                 name: "rime_audit_submit_proposal",
-                description: "校验并保存 AI 审核提案；不会应用提案或修改 userdb。",
+                description: "校验并保存 AI 审核提案（包括 replace_entry）；不会应用提案或修改 userdb。",
                 inputSchema: Self.submitSchema(),
                 annotations: Tool.Annotations(
                     readOnlyHint: false,
@@ -63,7 +63,7 @@ private final class RimeAuditMCPService: @unchecked Sendable {
             ),
             Tool(
                 name: "rime_audit_preview",
-                description: "预览已提交的 AI 提案数量，并报告批次是否已经过期。",
+                description: "预览已提交的 AI 提案，包括 replace_entry 的旧词、新词、来源 c/d/t 和永久保存结果，并报告批次是否已经过期。",
                 inputSchema: Self.objectSchema(),
                 annotations: readOnlyAnnotations
             )
@@ -79,7 +79,7 @@ private final class RimeAuditMCPService: @unchecked Sendable {
             case "rime_audit_list":
                 text = try list(arguments: parameters.arguments ?? [:])
             case "rime_audit_export":
-                text = try export()
+                text = try export(arguments: parameters.arguments ?? [:])
             case "rime_audit_submit_proposal":
                 text = try submitProposal(arguments: parameters.arguments ?? [:])
             case "rime_audit_preview":
@@ -103,7 +103,7 @@ private final class RimeAuditMCPService: @unchecked Sendable {
 
     private func summary() throws -> String {
         let batch = try loadBatch()
-        let state = try reviewStore.load()
+        let state = try auditCoordinator.reviewState()
         let statusCounts = Dictionary(grouping: batch.entries, by: { $0.currentStatus.rawValue })
             .mapValues(\.count)
         let output = SummaryOutput(
@@ -122,7 +122,7 @@ private final class RimeAuditMCPService: @unchecked Sendable {
 
     private func list(arguments: [String: Value]) throws -> String {
         let batch = try loadBatch()
-        let query = try makeQuery(arguments: arguments)
+        let query = try makeQuery(arguments: arguments, defaultView: .all, defaultLimit: 100)
         let result = RimeAuditFilter.filter(batch.entries, query: query)
         let output = ListOutput(
             schemaVersion: batch.schemaVersion,
@@ -135,63 +135,45 @@ private final class RimeAuditMCPService: @unchecked Sendable {
         return try json(output)
     }
 
-    private func export() throws -> String {
+    private func export(arguments: [String: Value]) throws -> String {
         let batch = try loadBatch()
-        return String(decoding: RimeAuditCSV.export(batch: batch), as: UTF8.self)
+        let query = try makeQuery(arguments: arguments, defaultView: .recommendations, defaultLimit: nil)
+        let result = RimeAuditFilter.filter(batch.entries, query: query)
+        return String(decoding: RimeAuditCSV.export(batch: batch, entries: result.entries), as: UTF8.self)
     }
 
     private func submitProposal(arguments: [String: Value]) throws -> String {
-        guard let csv = arguments["csv"]?.stringValue else {
-            throw RimeSyncError.unsupportedOperation("rime_audit_submit_proposal 需要 csv 字段")
-        }
         let batch = try loadBatch()
-        let proposals = try RimeAuditCSV.importProposals(data: Data(csv.utf8), batch: batch)
-        guard try currentAggregateDigest() == batch.snapshotDigest else {
-            throw RimeSyncError.unsupportedOperation("AI 提案对应的 Rime 快照已变化，请重新导出和分析")
+        let proposals: [RimeAuditProposal]
+        if let jsonText = arguments["proposals_json"]?.stringValue {
+            proposals = try JSONDecoder.rimeDecoder.decode([RimeAuditProposal].self, from: Data(jsonText.utf8))
+        } else if let csv = arguments["csv"]?.stringValue {
+            proposals = try RimeAuditCSV.importProposals(data: Data(csv.utf8), batch: batch)
+        } else {
+            throw RimeSyncError.unsupportedOperation("rime_audit_submit_proposal 需要 csv 或 proposals_json 字段")
         }
-        let lock = DirectoryLock(
-            lockURL: options.sharedRoot.appendingPathComponent(".lock", isDirectory: true),
-            fileManager: fileManager
-        )
-        try lock.withLock {
-            var state = try reviewStore.load()
-            state.proposals[batch.batchID] = proposals
-            try reviewStore.save(state)
-        }
-        return try json(previewOutput(batch: batch, proposals: proposals))
+        let preview = try auditCoordinator.submitProposals(proposals, for: batch)
+        return try json(PreviewOutput(preview))
     }
 
     private func preview() throws -> String {
         let batch = try loadBatch()
-        let state = try reviewStore.load()
-        let proposals = state.proposals[batch.batchID] ?? []
-        return try json(previewOutput(batch: batch, proposals: proposals))
-    }
-
-    private func previewOutput(batch: RimeAuditBatch, proposals: [RimeAuditProposal]) -> PreviewOutput {
-        var counts: [String: Int] = [:]
-        for proposal in proposals {
-            counts[proposal.action.rawValue, default: 0] += 1
-        }
-        let currentDigest = (try? currentAggregateDigest()) ?? nil
-        return PreviewOutput(
-            batchID: batch.batchID,
-            snapshotDigest: batch.snapshotDigest,
-            proposalCount: proposals.count,
-            countsByAction: counts,
-            stale: currentDigest != batch.snapshotDigest
-        )
+        return try json(PreviewOutput(auditCoordinator.previewProposals(for: batch)))
     }
 
     private func loadBatch() throws -> RimeAuditBatch {
-        guard let batch = try batchStore.load() else {
+        guard let batch = try auditCoordinator.latestBatch() else {
             throw RimeSyncError.unsupportedOperation("尚未生成 Rime 审核批次，请先在菜单栏程序中读取词库")
         }
         return batch
     }
 
-    private func makeQuery(arguments: [String: Value]) throws -> RimeAuditQuery {
-        let view = try parse(RimeAuditView.self, key: "view", arguments: arguments) ?? .all
+    private func makeQuery(
+        arguments: [String: Value],
+        defaultView: RimeAuditView,
+        defaultLimit: Int?
+    ) throws -> RimeAuditQuery {
+        let view = try parse(RimeAuditView.self, key: "view", arguments: arguments) ?? defaultView
         let commitBand = try parse(RimeCommitCountBand.self, key: "commit_band", arguments: arguments) ?? .all
         let heatBand = try parse(RimeHeatBand.self, key: "heat_band", arguments: arguments) ?? .all
         let activityBand = try parse(
@@ -201,8 +183,7 @@ private final class RimeAuditMCPService: @unchecked Sendable {
         ) ?? .all
         let sortKey = try parse(RimeAuditSortKey.self, key: "sort", arguments: arguments) ?? .heat
         let offset = max(0, arguments["offset"]?.intValue ?? 0)
-        let requestedLimit = arguments["limit"]?.intValue ?? 100
-        let limit = min(1_000, max(0, requestedLimit))
+        let limit = arguments["limit"]?.intValue.map { min(1_000, max(0, $0)) } ?? defaultLimit
         return RimeAuditQuery(
             view: view,
             commitBand: commitBand,
@@ -225,45 +206,6 @@ private final class RimeAuditMCPService: @unchecked Sendable {
         guard let raw = arguments[key]?.stringValue else { return nil }
         guard let result = T(rawValue: raw) else {
             throw RimeSyncError.unsupportedOperation("参数 \(key) 无效：\(raw)")
-        }
-        return result
-    }
-
-    private func currentAggregateDigest() throws -> String {
-        let digests = try currentSnapshotDigests()
-        return RimeAuditBatch.aggregateSnapshotDigest(digests)
-    }
-
-    private func currentSnapshotDigests() throws -> [String: String] {
-        let root = options.sharedRoot.appendingPathComponent("rime-userdata", isDirectory: true)
-        var result: [String: String] = [:]
-        if fileManager.fileExists(atPath: root.path) {
-            let directories = try fileManager.contentsOfDirectory(
-                at: root,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            )
-            for directory in directories where
-                (try? directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-            {
-                let snapshot = directory.appendingPathComponent("rime_ice.userdb.txt")
-                guard fileManager.fileExists(atPath: snapshot.path) else { continue }
-                result[directory.lastPathComponent] = RimeSnapshotParser.digest(
-                    try Data(contentsOf: snapshot, options: [.mappedIfSafe])
-                )
-            }
-        }
-
-        let localSnapshot = options.localRimeDirectory
-            .appendingPathComponent("sync", isDirectory: true)
-            .appendingPathComponent(options.installationID, isDirectory: true)
-            .appendingPathComponent("rime_ice.userdb.txt")
-        if result[options.installationID] == nil,
-           fileManager.fileExists(atPath: localSnapshot.path)
-        {
-            result[options.installationID] = RimeSnapshotParser.digest(
-                try Data(contentsOf: localSnapshot, options: [.mappedIfSafe])
-            )
         }
         return result
     }
@@ -325,9 +267,16 @@ private final class RimeAuditMCPService: @unchecked Sendable {
                 "csv": .object([
                     "type": .string("string"),
                     "description": .string("由 rime_audit_export 导出的批次提案 CSV")
+                ]),
+                "proposals_json": .object([
+                    "type": .string("string"),
+                    "description": .string("RimeAuditProposal JSON 数组；可包含 replace_entry 的 replacementText/replacementCode")
                 ])
             ]),
-            "required": .array([.string("csv")])
+            "anyOf": .array([
+                .object(["required": .array([.string("csv")])]),
+                .object(["required": .array([.string("proposals_json")])])
+            ])
         ])
     }
 }
@@ -380,13 +329,23 @@ private struct PreviewOutput: Codable {
     let proposalCount: Int
     let countsByAction: [String: Int]
     let stale: Bool
+    let replacements: [RimeAuditReplacementPreview]
+
+    init(_ preview: RimeAuditPreview) {
+        self.batchID = preview.batchID
+        self.snapshotDigest = preview.snapshotDigest
+        self.proposalCount = preview.proposalCount
+        self.countsByAction = preview.countsByAction
+        self.stale = preview.stale
+        self.replacements = preview.replacements
+    }
 
     enum CodingKeys: String, CodingKey {
         case batchID = "batch_id"
         case snapshotDigest = "snapshot_digest"
         case proposalCount = "proposal_count"
         case countsByAction = "counts_by_action"
-        case stale
+        case stale, replacements
     }
 }
 
@@ -451,7 +410,7 @@ private struct RimeAuditMCPMain {
             let service = RimeAuditMCPService(options: options)
             let server = Server(
                 name: "RimeAuditMCP",
-                version: "0.1.1",
+                version: "0.2.0",
                 instructions: "只读取 Rime 审核数据并提交提案；所有实际修改必须由 TencentVoiceMVP 菜单栏界面确认。",
                 capabilities: .init(tools: .init(listChanged: false)),
                 configuration: .strict
