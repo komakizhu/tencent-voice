@@ -10,6 +10,9 @@ final class TextInjector {
     }
 
     private let target: TextTarget
+    private let keyboardPacing: KeyboardPacingConfiguration
+    private let pacingClock: KeyboardPacingClock
+    private var keyboardPacer: KeyboardCharacterPacer?
     private var snapshot: TextSnapshot?
     private var ownedRange = TextRange(location: 0, length: 0)
     private var lastDocumentText = ""
@@ -27,8 +30,14 @@ final class TextInjector {
     private(set) var errorCount = 0
     private(set) var degradationReason: String?
 
-    init(target: TextTarget) {
+    init(
+        target: TextTarget,
+        keyboardSmoothing: KeyboardSmoothingConfiguration = .immediate,
+        pacingClock: KeyboardPacingClock? = nil
+    ) {
         self.target = target
+        self.keyboardPacing = keyboardSmoothing
+        self.pacingClock = pacingClock ?? ContinuousKeyboardPacingClock()
     }
 
     var modeDescription: String {
@@ -41,6 +50,8 @@ final class TextInjector {
     }
 
     func begin() throws {
+        keyboardPacer?.cancel()
+        keyboardPacer = nil
         do {
             let captured = try target.capture()
             snapshot = captured
@@ -55,6 +66,7 @@ final class TextInjector {
             errorCount = 0
             degradationReason = nil
             mode = captured.supportsAXReplacement ? .ax : .keyboardLiveTail
+            installKeyboardPacerIfNeeded()
         } catch TextTargetError.unsupported, TextTargetError.targetChanged, TextTargetError.writeFailed {
             snapshot = nil
             lastDocumentText = ""
@@ -67,6 +79,7 @@ final class TextInjector {
             errorCount = 0
             degradationReason = nil
             mode = .keyboardLiveTail
+            installKeyboardPacerIfNeeded()
         }
     }
 
@@ -85,13 +98,50 @@ final class TextInjector {
         }
     }
 
-    func finish(finalText: String) throws {
+    func beginStopping() {
+        guard mode == .keyboardLiveTail, let keyboardPacer else { return }
+        do {
+            try keyboardPacer.beginStopping()
+        } catch {
+            enterSafeCopy(after: error)
+        }
+    }
+
+    func finish(finalText: String) async throws {
         let completionText = finalText.isEmpty ? lastProjectionText : finalText
 
         switch mode {
         case .keyboardLiveTail:
             do {
-                try applyKeyboardCandidate(completionText)
+                if let keyboardPacer {
+                    try await keyboardPacer.finish(candidate: completionText)
+                } else {
+                    try applyKeyboardCandidate(completionText)
+                }
+            } catch {
+                enterSafeCopy(after: error)
+            }
+            if mode == .safeCopy {
+                try target.copyToClipboard(completionText)
+            }
+        case .safeCopy:
+            try target.copyToClipboard(completionText)
+        case .ax, .inactive:
+            break
+        }
+    }
+
+    func finishImmediately(finalText: String) throws {
+        let completionText = finalText.isEmpty ? lastProjectionText : finalText
+
+        switch mode {
+        case .keyboardLiveTail:
+            do {
+                if let keyboardPacer {
+                    try keyboardPacer.finishImmediately(candidate: completionText)
+                } else {
+                    try applyKeyboardCandidate(completionText)
+                }
             } catch {
                 enterSafeCopy(after: error)
             }
@@ -138,7 +188,18 @@ final class TextInjector {
     private func applyKeyboardLiveTail(_ projection: ASRProjection) {
         lastProjectionText = projection.text
         do {
-            try applyKeyboardCandidate(projection.text)
+            guard let keyboardPacer else {
+                try applyKeyboardCandidate(projection.text)
+                return
+            }
+            let trigger: KeyboardCharacterPacer.Trigger = if projection.isStreamEnded {
+                .streamEnd
+            } else if projection.isFinal {
+                .segmentFinal
+            } else {
+                .partial
+            }
+            try keyboardPacer.accept(candidate: projection.text, trigger: trigger)
         } catch {
             enterSafeCopy(after: error)
         }
@@ -151,9 +212,9 @@ final class TextInjector {
             let suffix = String(candidateText.dropFirst(lastSubmittedText.count))
             if !suffix.isEmpty {
                 try target.paste(suffix)
+                lastSubmittedText = candidateText
                 writeCount += 1
             }
-            lastSubmittedText = candidateText
             return
         }
 
@@ -172,13 +233,51 @@ final class TextInjector {
         lastSubmittedText = candidateText
     }
 
+    private func installKeyboardPacerIfNeeded() {
+        guard mode == .keyboardLiveTail, keyboardPacing.isEnabled else { return }
+        keyboardPacer = KeyboardCharacterPacer(
+            configuration: keyboardPacing,
+            clock: pacingClock,
+            append: { [weak self] text in
+                guard let self else { throw TextTargetError.writeFailed }
+                try self.appendPacedText(text)
+            },
+            replaceTrailingText: { [weak self] previousText, text in
+                guard let self else { throw TextTargetError.writeFailed }
+                try self.replacePacedTrailingText(previousText, with: text)
+            },
+            onFailure: { [weak self] error in
+                self?.enterSafeCopy(after: error)
+            }
+        )
+        keyboardPacer?.beginSession()
+    }
+
+    private func appendPacedText(_ text: String) throws {
+        try target.paste(text)
+        lastSubmittedText.append(contentsOf: text)
+        writeCount += 1
+    }
+
+    private func replacePacedTrailingText(_ previousText: String, with text: String) throws {
+        guard lastSubmittedText.hasSuffix(previousText) else {
+            throw TextTargetError.targetChanged
+        }
+        try target.replaceTrailingText(previousText, with: text)
+        lastSubmittedText = String(lastSubmittedText.dropLast(previousText.count)) + text
+        writeCount += 1
+    }
+
     private func enterSafeCopy(after error: Error) {
+        keyboardPacer?.cancel()
         mode = .safeCopy
         errorCount += 1
         degradationReason = error.localizedDescription
     }
 
     private func reset() {
+        keyboardPacer?.cancel()
+        keyboardPacer = nil
         snapshot = nil
         ownedRange = TextRange(location: 0, length: 0)
         lastDocumentText = ""

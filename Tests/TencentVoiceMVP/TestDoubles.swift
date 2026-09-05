@@ -49,6 +49,62 @@ final class FakeTextTarget: TextTarget {
     }
 }
 
+@MainActor
+final class ManualKeyboardPacingClock: KeyboardPacingClock {
+    private struct Sleeper {
+        let deadline: UInt64
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private(set) var nowNanoseconds: UInt64 = 0
+    private var sleepers: [UUID: Sleeper] = [:]
+
+    func sleep(nanoseconds: UInt64) async throws {
+        let deadline = nowNanoseconds + nanoseconds
+        guard deadline > nowNanoseconds else { return }
+        let id = UUID()
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                sleepers[id] = Sleeper(deadline: deadline, continuation: continuation)
+            }
+        }, onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self, let sleeper = self.sleepers.removeValue(forKey: id) else { return }
+                sleeper.continuation.resume(throwing: CancellationError())
+            }
+        })
+    }
+
+    func advance(by nanoseconds: UInt64) {
+        nowNanoseconds += nanoseconds
+        let ready = sleepers.filter { $0.value.deadline <= nowNanoseconds }
+        for (id, sleeper) in ready {
+            sleepers.removeValue(forKey: id)
+            sleeper.continuation.resume()
+        }
+    }
+}
+
+extension KeyboardPacingConfiguration {
+    static let test = KeyboardPacingConfiguration(
+        firstCharacterDelayNanoseconds: 0,
+        reservoirDelayNanoseconds: 40_000_000,
+        initialCharacterIntervalNanoseconds: 20_000_000,
+        minimumCharacterIntervalNanoseconds: 20_000_000,
+        maximumCharacterIntervalNanoseconds: 60_000_000,
+        normalMaximumLagNanoseconds: 250_000_000,
+        defaultPartialCadenceNanoseconds: 600_000_000,
+        cadenceFillRatio: 0.75,
+        velocityChangeLimit: 0.12,
+        continuityMinimumNanoseconds: 250_000_000,
+        continuityMaximumNanoseconds: 900_000_000,
+        finalFlushMaximumDurationNanoseconds: 120_000_000,
+        frameIntervalNanoseconds: 16_000_000,
+        ewmaAlpha: 0.25,
+        easeOutExponent: 1.6
+    )
+}
+
 final class FakeRealtimeASRClient: RealtimeASRClient {
     private var continuation: AsyncThrowingStream<ASRUpdate, Error>.Continuation?
     private(set) var finishCallCount = 0

@@ -3,6 +3,89 @@ import XCTest
 
 @MainActor
 final class TextInjectorTests: XCTestCase {
+    func testKeyboardPacingShowsFirstCharacterImmediatelyAndCompletesWithinDeadline() async throws {
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let clock = ManualKeyboardPacingClock()
+        let injector = TextInjector(target: target, keyboardSmoothing: .live, pacingClock: clock)
+
+        try injector.begin()
+        injector.apply(projection: projection(
+            committed: "",
+            active: "甲乙丙丁戊",
+            id: 1,
+            revision: 1
+        ))
+
+        XCTAssertEqual(target.text, "甲")
+        XCTAssertEqual(target.pastedTexts, ["甲"])
+
+        await settle()
+        clock.advance(by: 250_000_000)
+        await settle()
+
+        XCTAssertEqual(target.text, "甲乙丙丁戊")
+        XCTAssertEqual(target.pastedTexts.first, "甲")
+        XCTAssertEqual(target.pastedTexts.dropFirst().joined(), "乙丙丁戊")
+    }
+
+    func testKeyboardPacingRevisesPendingCharactersWithoutTouchingVisibleText() async throws {
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let clock = ManualKeyboardPacingClock()
+        let injector = TextInjector(target: target, keyboardSmoothing: .live, pacingClock: clock)
+
+        try injector.begin()
+        injector.apply(projection: projection(
+            committed: "",
+            active: "甲乙丙丁戊",
+            id: 1,
+            revision: 1
+        ))
+        await settle()
+        injector.apply(projection: projection(
+            committed: "",
+            active: "甲乙改丁戊",
+            id: 1,
+            revision: 2
+        ))
+
+        XCTAssertEqual(target.text, "甲")
+
+        clock.advance(by: 250_000_000)
+        await settle()
+
+        XCTAssertEqual(target.text, "甲乙改丁戊")
+        XCTAssertFalse(target.text.contains("丙"))
+    }
+
+    func testKeyboardPacingFlushesPendingCharactersOnFinal() async throws {
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let clock = ManualKeyboardPacingClock()
+        let injector = TextInjector(target: target, keyboardSmoothing: .live, pacingClock: clock)
+
+        try injector.begin()
+        injector.apply(projection: projection(
+            committed: "",
+            active: "甲乙丙丁戊",
+            id: 1,
+            revision: 1
+        ))
+        injector.apply(projection: projection(
+            committed: "",
+            active: "甲乙丙丁戊",
+            id: 1,
+            revision: 2,
+            isFinal: true
+        ))
+
+        XCTAssertEqual(target.text, "甲乙")
+
+        await settle()
+        clock.advance(by: 120_000_000)
+        await settle()
+
+        XCTAssertEqual(target.text, "甲乙丙丁戊")
+    }
+
     func testKeyboardFinalRevisionDoesNotDisableFollowingSegment() throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let injector = TextInjector(target: target)
@@ -39,7 +122,7 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertNil(target.copiedText)
     }
 
-    func testKeyboardTargetChangeUsesSafeCopyInsteadOfEditingTheWrongText() throws {
+    func testKeyboardTargetChangeUsesSafeCopyInsteadOfEditingTheWrongText() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let injector = TextInjector(target: target)
 
@@ -57,7 +140,7 @@ final class TextInjectorTests: XCTestCase {
             id: 1,
             revision: 2
         ))
-        try injector.finish(finalText: "我想吃香蕉")
+        try await injector.finish(finalText: "我想吃香蕉")
 
         XCTAssertEqual(target.text, "用户已经移动到其他文字")
         XCTAssertEqual(target.copiedText, "我想吃香蕉")
@@ -91,7 +174,7 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertEqual(injector.backspaceCount, 0)
     }
 
-    func testFinishKeepsReplacementMetricsUntilSessionCleanup() throws {
+    func testFinishKeepsReplacementMetricsUntilSessionCleanup() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let injector = TextInjector(target: target)
         let initial = "这是很长很长的旧候选文字，后面仍然有很多内容"
@@ -110,7 +193,7 @@ final class TextInjectorTests: XCTestCase {
             id: 1,
             revision: 2
         ))
-        try injector.finish(finalText: revised)
+        try await injector.finish(finalText: revised)
 
         XCTAssertEqual(injector.deepReplacementCount, 1)
         XCTAssertGreaterThan(injector.maximumTrailingReplacementLength, 12)
@@ -217,7 +300,7 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertEqual(injector.backspaceCount, 0)
     }
 
-    func testFinalKeepsServerStablePrefixAndFlushesOnlyTheUnstableTail() throws {
+    func testFinalKeepsServerStablePrefixAndFlushesOnlyTheUnstableTail() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let injector = TextInjector(target: target)
 
@@ -236,7 +319,7 @@ final class TextInjectorTests: XCTestCase {
             revision: 2,
             isFinal: true
         ))
-        try injector.finish(finalText: "我想吃香蕉")
+        try await injector.finish(finalText: "我想吃香蕉")
 
         XCTAssertEqual(target.pastedTexts, ["我想吃苹果"])
         XCTAssertEqual(target.text, "我想吃香蕉")
@@ -316,7 +399,7 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertEqual(injector.backspaceCount, 0)
     }
 
-    func testKeyboardShorterInterimProjectionDoesNotTripSafeCopy() throws {
+    func testKeyboardShorterInterimProjectionDoesNotTripSafeCopy() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let injector = TextInjector(target: target)
 
@@ -362,38 +445,38 @@ final class TextInjectorTests: XCTestCase {
             revision: 5,
             isFinal: true
         ))
-        try injector.finish(finalText: "这是一段正在输入的文字，继续完成")
+        try await injector.finish(finalText: "这是一段正在输入的文字，继续完成")
 
         XCTAssertEqual(target.text, "这是一段正在输入的文字，继续完成")
         XCTAssertNil(target.copiedText)
         XCTAssertEqual(target.replaceCallCount, 0)
     }
 
-    func testPartialUpdatesReplaceOwnedRange() throws {
+    func testPartialUpdatesReplaceOwnedRange() async throws {
         let target = FakeTextTarget(text: "前缀")
         let injector = TextInjector(target: target)
         try injector.begin()
         injector.apply(projection: projection(committed: "", active: "你", id: 1, revision: 1))
         injector.apply(projection: projection(committed: "", active: "你好", id: 1, revision: 2))
         injector.apply(projection: projection(committed: "", active: "你好呀", id: 1, revision: 3, isFinal: true))
-        try injector.finish(finalText: "你好呀")
+        try await injector.finish(finalText: "你好呀")
         XCTAssertEqual(target.text, "前缀你好呀")
         XCTAssertEqual(target.replaceCallCount, 3)
     }
 
-    func testExternalEditStopsLiveReplacementAndCopiesFinal() throws {
+    func testExternalEditStopsLiveReplacementAndCopiesFinal() async throws {
         let target = FakeTextTarget(text: "原文")
         let injector = TextInjector(target: target)
         try injector.begin()
         injector.apply(projection: projection(committed: "", active: "临时", id: 1, revision: 1))
         target.text = "用户自己改过的文字"
         injector.apply(projection: projection(committed: "", active: "最终", id: 1, revision: 2))
-        try injector.finish(finalText: "最终")
+        try await injector.finish(finalText: "最终")
         XCTAssertEqual(target.text, "用户自己改过的文字")
         XCTAssertEqual(target.copiedText, "最终")
     }
 
-    func testAXUnsupportedTargetUsesKeyboardSegmentCommitMode() throws {
+    func testAXUnsupportedTargetUsesKeyboardSegmentCommitMode() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let injector = TextInjector(target: target)
 
@@ -401,7 +484,7 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
         injector.apply(projection: projection(committed: "", active: "实时", id: 1, revision: 1))
         injector.apply(projection: projection(committed: "", active: "实时结果", id: 1, revision: 2, isFinal: true))
-        try injector.finish(finalText: "实时结果")
+        try await injector.finish(finalText: "实时结果")
 
         XCTAssertEqual(target.pastedTexts, ["实时", "结果"])
         XCTAssertEqual(target.text, "实时结果")
@@ -409,7 +492,7 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertNil(target.copiedText)
     }
 
-    func testKeyboardSegmentCommitDoesNotDeleteEarlierSegment() throws {
+    func testKeyboardSegmentCommitDoesNotDeleteEarlierSegment() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let injector = TextInjector(target: target)
 
@@ -417,7 +500,7 @@ final class TextInjectorTests: XCTestCase {
         injector.apply(projection: projection(committed: "", active: "第一段", id: 1, revision: 1))
         injector.apply(projection: projection(committed: "第一段", active: "第二段", id: 2, revision: 2))
         injector.apply(projection: projection(committed: "第一段", active: "第二段", id: 2, revision: 3, isFinal: true))
-        try injector.finish(finalText: "第一段第二段")
+        try await injector.finish(finalText: "第一段第二段")
 
         XCTAssertEqual(target.pastedTexts, ["第一段", "第二段"])
         XCTAssertEqual(target.text, "第一段第二段")
@@ -425,7 +508,7 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertNil(target.copiedText)
     }
 
-    func testKeyboardLiveTailPureGrowthOnlyAppendsText() throws {
+    func testKeyboardLiveTailPureGrowthOnlyAppendsText() async throws {
         let target = AppendOnlyTextTarget()
         let injector = TextInjector(target: target)
 
@@ -433,13 +516,13 @@ final class TextInjectorTests: XCTestCase {
         injector.apply(projection: projection(committed: "", active: "第一", id: 1, revision: 1))
         injector.apply(projection: projection(committed: "第一", active: "第二", id: 2, revision: 2))
         injector.apply(projection: projection(committed: "第一", active: "第二段", id: 2, revision: 3, isFinal: true))
-        try injector.finish(finalText: "第一第二段")
+        try await injector.finish(finalText: "第一第二段")
 
         XCTAssertEqual(target.pastedTexts, ["第一", "第二", "段"])
         XCTAssertNil(target.copiedText)
     }
 
-    func testKeyboardStreamEndCommitsBufferedPartialOnce() throws {
+    func testKeyboardStreamEndCommitsBufferedPartialOnce() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let injector = TextInjector(target: target)
 
@@ -457,19 +540,19 @@ final class TextInjectorTests: XCTestCase {
             isFinal: false,
             isStreamEnded: true
         ))
-        try injector.finish(finalText: "未完成")
+        try await injector.finish(finalText: "未完成")
 
         XCTAssertEqual(target.pastedTexts, ["未完成"])
         XCTAssertEqual(target.text, "未完成")
     }
 
-    func testKeyboardEmptyFinishUsesLastKnownPartial() throws {
+    func testKeyboardEmptyFinishUsesLastKnownPartial() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let injector = TextInjector(target: target)
 
         try injector.begin()
         injector.apply(projection: projection(committed: "", active: "最后的 partial", id: 1, revision: 1))
-        try injector.finish(finalText: "")
+        try await injector.finish(finalText: "")
 
         XCTAssertEqual(target.pastedTexts, ["最后的 partial"])
         XCTAssertEqual(target.text, "最后的 partial")
@@ -495,7 +578,7 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertEqual(target.text, "第一句")
     }
 
-    func testKeyboardSegmentCommitPreservesEmojiAndCombiningCharacters() throws {
+    func testKeyboardSegmentCommitPreservesEmojiAndCombiningCharacters() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let injector = TextInjector(target: target)
 
@@ -503,13 +586,13 @@ final class TextInjectorTests: XCTestCase {
         injector.apply(projection: projection(committed: "", active: "😀", id: 1, revision: 1))
         injector.apply(projection: projection(committed: "😀", active: "e\u{301}", id: 2, revision: 2))
         injector.apply(projection: projection(committed: "😀", active: "e\u{301}", id: 2, revision: 3, isFinal: true))
-        try injector.finish(finalText: "😀e\u{301}")
+        try await injector.finish(finalText: "😀e\u{301}")
 
         XCTAssertEqual(target.pastedTexts, ["😀", "e\u{301}"])
         XCTAssertEqual(target.text, "😀e\u{301}")
     }
 
-    func testKeyboardRepeatedFinalDoesNotDuplicateText() throws {
+    func testKeyboardRepeatedFinalDoesNotDuplicateText() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let injector = TextInjector(target: target)
 
@@ -525,13 +608,13 @@ final class TextInjectorTests: XCTestCase {
             changed: false,
             isFinal: true
         ))
-        try injector.finish(finalText: "最终")
+        try await injector.finish(finalText: "最终")
 
         XCTAssertEqual(target.pastedTexts, ["最终"])
         XCTAssertEqual(target.text, "最终")
     }
 
-    func testKeyboardCommittedRevisionIsCorrectedWithoutStoppingInput() throws {
+    func testKeyboardCommittedRevisionIsCorrectedWithoutStoppingInput() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let injector = TextInjector(target: target)
 
@@ -539,11 +622,17 @@ final class TextInjectorTests: XCTestCase {
         injector.apply(projection: projection(committed: "第一", active: "当前", id: 1, revision: 1))
         injector.apply(projection: projection(committed: "不同", active: "当前", id: 1, revision: 2))
         XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
-        try injector.finish(finalText: "不同当前")
+        try await injector.finish(finalText: "不同当前")
 
         XCTAssertEqual(target.text, "不同当前")
         XCTAssertNil(target.copiedText)
         XCTAssertEqual(target.pastedTexts, ["第一当前"])
+    }
+
+    private func settle() async {
+        for _ in 0..<10 {
+            await Task.yield()
+        }
     }
 }
 

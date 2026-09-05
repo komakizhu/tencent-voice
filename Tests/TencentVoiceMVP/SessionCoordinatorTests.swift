@@ -4,6 +4,118 @@ import XCTest
 
 @MainActor
 final class SessionCoordinatorTests: XCTestCase {
+    func testStopFlushesPendingKeyboardSmoothingCharacters() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let coordinator = makeCoordinator(
+            asr: asr,
+            target: target,
+            finishTimeoutNanoseconds: 10_000_000,
+            keyboardSmoothing: .live
+        )
+
+        try await coordinator.begin()
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 0,
+            segmentText: "甲乙丙丁戊",
+            phase: .partial
+        ))
+        await Task.yield()
+        await Task.yield()
+
+        try await coordinator.end()
+
+        XCTAssertEqual(target.text, "甲乙丙丁戊")
+        XCTAssertEqual(coordinator.state, .idle)
+    }
+
+    func testStoppingStartsPacingFlushBeforeASRWaitCompletes() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        let clock = ManualKeyboardPacingClock()
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let coordinator = makeCoordinator(
+            asr: asr,
+            target: target,
+            finishTimeoutNanoseconds: 3_000_000_000,
+            keyboardSmoothing: .live,
+            pacingClock: clock
+        )
+
+        try await coordinator.begin()
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 0,
+            segmentText: "甲乙丙丁戊",
+            phase: .partial
+        ))
+        await settleCoordinator()
+        XCTAssertEqual(target.text, "甲")
+
+        let ending = Task { @MainActor in
+            try? await coordinator.end()
+        }
+        await settleCoordinator()
+        XCTAssertEqual(coordinator.state, .stopping)
+        XCTAssertEqual(target.text, "甲乙")
+
+        clock.advance(by: 120_000_000)
+        await settleCoordinator()
+        XCTAssertEqual(target.text, "甲乙丙丁戊")
+
+        asr.finishStream()
+        await ending.value
+        XCTAssertEqual(coordinator.state, .idle)
+    }
+
+    func testLateFinalDuringStoppingUsesTheShortFlushWindow() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        let clock = ManualKeyboardPacingClock()
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let coordinator = makeCoordinator(
+            asr: asr,
+            target: target,
+            finishTimeoutNanoseconds: 3_000_000_000,
+            keyboardSmoothing: .live,
+            pacingClock: clock
+        )
+
+        try await coordinator.begin()
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 0,
+            segmentText: "这是一句未完成",
+            phase: .partial
+        ))
+        await settleCoordinator()
+
+        let ending = Task { @MainActor in
+            try? await coordinator.end()
+        }
+        await settleCoordinator()
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 1,
+            segmentText: "这是一句未完成的话",
+            phase: .final,
+            wireFinal: true
+        ))
+        await settleCoordinator()
+        clock.advance(by: 120_000_000)
+        await settleCoordinator()
+
+        XCTAssertEqual(target.text, "这是一句未完成的话")
+        asr.finishStream()
+        await ending.value
+    }
+
     func testKeyboardPartialThenFinalIsAppendedWithoutReplacement() async throws {
         let asr = FakeRealtimeASRClient()
         let audio = FakeAudioCapture()
@@ -424,7 +536,9 @@ private func makeCoordinator(
     audio: AudioCapture = FakeAudioCapture(),
     target: TextTarget,
     credentials: TencentCredentials? = TencentCredentials(appID: "app", secretID: "id", secretKey: "key"),
-    finishTimeoutNanoseconds: UInt64 = 3_000_000_000
+    finishTimeoutNanoseconds: UInt64 = 3_000_000_000,
+    keyboardSmoothing: KeyboardSmoothingConfiguration = .immediate,
+    pacingClock: KeyboardPacingClock? = nil
 ) -> SessionCoordinator {
     SessionCoordinator(
         asr: asr,
@@ -433,8 +547,17 @@ private func makeCoordinator(
         settingsStore: UserDefaultsSettingsStore(suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"),
         credentialStore: InMemoryCredentialStore(credentials),
         finishTimeoutNanoseconds: finishTimeoutNanoseconds,
+        keyboardSmoothing: keyboardSmoothing,
+        pacingClock: pacingClock,
         onStateChange: { _ in }
     )
+}
+
+@MainActor
+private func settleCoordinator() async {
+    for _ in 0..<10 {
+        await Task.yield()
+    }
 }
 
 private func assertThrowsAsync<T>(_ body: () async throws -> T) async {

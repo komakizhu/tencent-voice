@@ -56,6 +56,8 @@ final class SessionCoordinator: SessionCoordinating {
     private var finishSent = false
     private var sessionID: UUID?
     private let finishTimeoutNanoseconds: UInt64
+    private let keyboardSmoothing: KeyboardSmoothingConfiguration
+    private let pacingClock: KeyboardPacingClock
     private var discardCount = 0
     private var errorCount = 0
     private var safeCopyWasLogged = false
@@ -68,6 +70,8 @@ final class SessionCoordinator: SessionCoordinating {
         credentialStore: CredentialStore,
         logger: SessionLogger = SessionLogger(enabled: { false }),
         finishTimeoutNanoseconds: UInt64 = 3_000_000_000,
+        keyboardSmoothing: KeyboardSmoothingConfiguration = .live,
+        pacingClock: KeyboardPacingClock? = nil,
         onStateChange: @escaping (SessionState) -> Void
     ) {
         self.asr = asr
@@ -77,6 +81,8 @@ final class SessionCoordinator: SessionCoordinating {
         self.credentialStore = credentialStore
         self.logger = logger
         self.finishTimeoutNanoseconds = finishTimeoutNanoseconds
+        self.keyboardSmoothing = keyboardSmoothing
+        self.pacingClock = pacingClock ?? ContinuousKeyboardPacingClock()
         self.onStateChange = onStateChange
     }
 
@@ -91,7 +97,11 @@ final class SessionCoordinator: SessionCoordinating {
             }
             try await ensureMicrophonePermission()
 
-            let newInjector = TextInjector(target: textTarget)
+            let newInjector = TextInjector(
+                target: textTarget,
+                keyboardSmoothing: keyboardSmoothing,
+                pacingClock: pacingClock
+            )
             do {
                 try newInjector.begin()
             } catch {
@@ -183,6 +193,7 @@ final class SessionCoordinator: SessionCoordinating {
         }
         setState(.stopping)
         log(event: "stop_requested")
+        injector?.beginStopping()
         let currentAudioForwarder = audioForwarder
         audio.stop()
         currentAudioForwarder?.stopAccepting()
@@ -212,7 +223,7 @@ final class SessionCoordinator: SessionCoordinating {
 
         if let injector {
             do {
-                try injector.finish(finalText: latestProjection?.text ?? "")
+                try await injector.finish(finalText: latestProjection?.text ?? "")
                 log(event: streamCompleted ? "finished" : "finished_timeout", projection: latestProjection)
                 injector.cancel()
             } catch {
@@ -283,7 +294,7 @@ final class SessionCoordinator: SessionCoordinating {
         log(event: "error", error: error)
         let finalProjection = latestProjection
         do {
-            try injector?.finish(finalText: finalProjection?.text ?? "")
+            try injector?.finishImmediately(finalText: finalProjection?.text ?? "")
         } catch {
             errorCount += 1
             log(event: "finish_error", projection: finalProjection, error: error)
