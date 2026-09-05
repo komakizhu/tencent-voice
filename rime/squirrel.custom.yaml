@@ -171,17 +171,17 @@ patch:
     label_font_point: 12
     comment_font_face: Helvetica
     comment_font_point: 14
-    back_color: '0xF3F8F5'
-    border_color: '0xE5DED9'
-    text_color: '0x2D4127'
-    hilited_text_color: '0x203C26'
-    candidate_text_color: '0x2D4127'
+    back_color: '0xF1F4F0'
+    border_color: '0xDBE2D8'
+    text_color: '0x3B4631'
+    hilited_text_color: '0x313C26'
+    candidate_text_color: '0x3B4631'
     hilited_candidate_text_color: '0xFFFFFF'
-    hilited_candidate_back_color: '0x689A5C'
-    label_color: '0x6A8062'
+    hilited_candidate_back_color: '0x839B72'
+    label_color: '0x788171'
     hilited_candidate_label_color: '0xFFFFFF'
-    comment_text_color: '0x778972'
-    hilited_comment_text_color: '0xE0F0E2'
+    comment_text_color: '0x848B7E'
+    hilited_comment_text_color: '0xF0F5ED'
 
   "preset_color_schemes/sage_dark":
     name: "舒缓绿深色 / Sage Dark"
@@ -210,17 +210,17 @@ patch:
     label_font_point: 12
     comment_font_face: Helvetica
     comment_font_point: 14
-    back_color: '0x15110F'
-    border_color: '0x312D2B'
-    text_color: '0xDCEDD9'
-    hilited_text_color: '0xE9F8E8'
-    candidate_text_color: '0xDCEDD9'
+    back_color: '0x141710'
+    border_color: '0x31382A'
+    text_color: '0xD9E3D5'
+    hilited_text_color: '0xECF5E8'
+    candidate_text_color: '0xD9E3D5'
     hilited_candidate_text_color: '0xFFFFFF'
-    hilited_candidate_back_color: '0x629F4E'
-    label_color: '0x97B68A'
+    hilited_candidate_back_color: '0x6C805D'
+    label_color: '0xA4B59A'
     hilited_candidate_label_color: '0xFFFFFF'
-    comment_text_color: '0x9FBC9B'
-    hilited_comment_text_color: '0xE3F8D8'
+    comment_text_color: '0xA5B29E'
+    hilited_comment_text_color: '0xE7F1E1'
 
   "preset_color_schemes/solarized":
     name: "日光 / Solarized"
@@ -405,7 +405,7 @@ patch:
     label_font_point: 12
     comment_font_face: Helvetica
     comment_font_point: 14
-    back_color: '0xF2F8F8'
+    back_color: '0xF8F4ED'
     border_color: '0xE5DED9'
     text_color: '0x362A28'
     hilited_text_color: '0x282A36'
