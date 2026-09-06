@@ -60,7 +60,7 @@ final class SessionCoordinator: SessionCoordinating {
     private let pacingClock: KeyboardPacingClock
     private var discardCount = 0
     private var errorCount = 0
-    private var safeCopyWasLogged = false
+    private var degradationWasLogged = false
 
     init(
         asr: RealtimeASRClient,
@@ -68,7 +68,7 @@ final class SessionCoordinator: SessionCoordinating {
         textTarget: TextTarget,
         settingsStore: SettingsStore,
         credentialStore: CredentialStore,
-        logger: SessionLogger = SessionLogger(enabled: { false }),
+        logger: SessionLogger? = nil,
         finishTimeoutNanoseconds: UInt64 = 3_000_000_000,
         keyboardSmoothing: KeyboardSmoothingConfiguration = .live,
         pacingClock: KeyboardPacingClock? = nil,
@@ -79,7 +79,7 @@ final class SessionCoordinator: SessionCoordinating {
         self.textTarget = textTarget
         self.settingsStore = settingsStore
         self.credentialStore = credentialStore
-        self.logger = logger
+        self.logger = logger ?? SessionLogger(enabled: { false })
         self.finishTimeoutNanoseconds = finishTimeoutNanoseconds
         self.keyboardSmoothing = keyboardSmoothing
         self.pacingClock = pacingClock ?? ContinuousKeyboardPacingClock()
@@ -97,10 +97,12 @@ final class SessionCoordinator: SessionCoordinating {
             }
             try await ensureMicrophonePermission()
 
+            let settings = settingsStore.load()
             let newInjector = TextInjector(
                 target: textTarget,
                 keyboardSmoothing: keyboardSmoothing,
-                pacingClock: pacingClock
+                pacingClock: pacingClock,
+                safeCopyEnabled: settings.safeCopyEnabled
             )
             do {
                 try newInjector.begin()
@@ -112,9 +114,8 @@ final class SessionCoordinator: SessionCoordinating {
             finishSent = false
             discardCount = 0
             errorCount = 0
-            safeCopyWasLogged = false
+            degradationWasLogged = false
 
-            let settings = settingsStore.load()
             let wordInfo = settings.engineModelType == TencentEnginePreset.largeV2.rawValue ? 0 : 1
             let configuration = TencentSessionConfiguration(
                 appID: credentials.appID,
@@ -140,9 +141,11 @@ final class SessionCoordinator: SessionCoordinating {
                     }
                 }
             }
+            log(event: "audio_capture_started")
             guard sessionID == id, state == .connecting else { throw SessionError.cancelled }
 
             let stream = try await asr.start(configuration: configuration)
+            log(event: "asr_started")
             guard sessionID == id, state == .connecting else { throw SessionError.cancelled }
             try await buffer.attach { [weak self, asr] chunk in
                 do {
@@ -194,13 +197,17 @@ final class SessionCoordinator: SessionCoordinating {
         setState(.stopping)
         log(event: "stop_requested")
         injector?.beginStopping()
+        logDegradationIfNeeded(projection: latestProjection)
         let currentAudioForwarder = audioForwarder
         audio.stop()
+        log(event: "audio_capture_stop_requested")
         currentAudioForwarder?.stopAccepting()
         await currentAudioForwarder?.drain()
+        log(event: "audio_capture_drained")
         var finishTask: Task<Void, Never>?
         if !finishSent {
             finishSent = true
+            log(event: "asr_finish_requested")
             // Sending the end marker must not block the UI if the socket is stuck.
             finishTask = Task { [asr] in try? await asr.finish() }
         }
@@ -224,9 +231,11 @@ final class SessionCoordinator: SessionCoordinating {
         if let injector {
             do {
                 try await injector.finish(finalText: latestProjection?.text ?? "")
+                logDegradationIfNeeded(projection: latestProjection)
                 log(event: streamCompleted ? "finished" : "finished_timeout", projection: latestProjection)
                 injector.cancel()
             } catch {
+                logDegradationIfNeeded(projection: latestProjection)
                 log(event: "finish_error", error: error)
                 setState(.error(error.localizedDescription))
                 resetSession()
@@ -243,6 +252,7 @@ final class SessionCoordinator: SessionCoordinating {
     }
 
     func cancel() {
+        log(event: "cancel_requested")
         audioForwarder?.cancel()
         audio.stop()
         asr.cancel()
@@ -262,7 +272,7 @@ final class SessionCoordinator: SessionCoordinating {
                 latestProjection = projection
                 injector?.apply(projection: projection)
                 log(event: "stream_ended", update: update, projection: projection)
-                logSafeCopyIfNeeded(update: update, projection: projection)
+                logDegradationIfNeeded(update: update, projection: projection)
             }
             return
         }
@@ -274,15 +284,26 @@ final class SessionCoordinator: SessionCoordinating {
         latestProjection = projection
         injector?.apply(projection: projection)
         log(event: projection.isFinal ? "final" : "partial", update: update, projection: projection)
-        logSafeCopyIfNeeded(update: update, projection: projection)
+        logDegradationIfNeeded(update: update, projection: projection)
     }
 
     private var projectionAccumulator = ASRProjectionAccumulator()
 
-    private func logSafeCopyIfNeeded(update: ASRUpdate, projection: ASRProjection) {
-        guard injector?.modeDescription == "safe_copy", !safeCopyWasLogged else { return }
-        safeCopyWasLogged = true
-        log(event: "safe_copy", update: update, projection: projection)
+    private func logDegradationIfNeeded(
+        update: ASRUpdate? = nil,
+        projection: ASRProjection? = nil
+    ) {
+        guard let injector,
+              ["safe_copy", "disabled_after_error"].contains(injector.modeDescription),
+              !degradationWasLogged else { return }
+        degradationWasLogged = true
+        log(
+            event: injector.modeDescription == "safe_copy" ? "safe_copy" : "input_error",
+            update: update,
+            projection: projection,
+            failureCode: injector.degradationCode,
+            failureMessage: injector.degradationReason
+        )
     }
 
     private func handleASRError(_ error: Error, sessionID: UUID? = nil) {
@@ -299,6 +320,7 @@ final class SessionCoordinator: SessionCoordinating {
             errorCount += 1
             log(event: "finish_error", projection: finalProjection, error: error)
         }
+        logDegradationIfNeeded(projection: finalProjection)
         let currentPrebuffer = prebuffer
         eventTask?.cancel()
         resetSession()
@@ -345,7 +367,7 @@ final class SessionCoordinator: SessionCoordinating {
         sessionID = nil
         discardCount = 0
         errorCount = 0
-        safeCopyWasLogged = false
+        degradationWasLogged = false
         projectionAccumulator = ASRProjectionAccumulator()
     }
 
@@ -384,6 +406,8 @@ final class SessionCoordinator: SessionCoordinating {
         update: ASRUpdate? = nil,
         projection: ASRProjection? = nil,
         error: Error? = nil,
+        failureCode: String? = nil,
+        failureMessage: String? = nil,
         sessionID overrideSessionID: UUID? = nil
     ) {
         guard let sessionID = overrideSessionID ?? sessionID else { return }
@@ -400,12 +424,17 @@ final class SessionCoordinator: SessionCoordinating {
         } else {
             errorCode = nil
         }
+        let resolvedFailureCode = failureCode ?? error.map(DiagnosticErrorFormatter.code(for:))
+        let resolvedFailureMessage = failureMessage ?? error.map(DiagnosticErrorFormatter.message(for:))
         let entry = SessionLogEntry(
             timestamp: Date(),
             sessionID: sessionID,
             event: event,
             state: stateName,
             injectionMode: injector?.modeDescription,
+            targetApplicationName: injector?.targetApplication?.name,
+            targetApplicationBundleIdentifier: injector?.targetApplication?.bundleIdentifier,
+            targetApplicationProcessID: injector?.targetApplication?.processIdentifier,
             sequence: update?.sequence,
             sliceType: update?.sliceType,
             wireFinal: update?.wireFinal,
@@ -421,10 +450,13 @@ final class SessionCoordinator: SessionCoordinating {
             maximumTrailingReplacementLength: injector?.maximumTrailingReplacementLength,
             discardCount: discardCount,
             errorCount: errorCount + (injector?.errorCount ?? 0),
-            errorCode: errorCode
+            errorCode: errorCode,
+            failureCode: resolvedFailureCode,
+            failureMessage: resolvedFailureMessage
         )
         try? logger.append(entry)
     }
+
 }
 
 actor AudioPrebuffer {

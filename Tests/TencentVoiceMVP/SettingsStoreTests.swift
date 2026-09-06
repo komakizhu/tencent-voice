@@ -29,6 +29,7 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(settings.shortcut, .defaultCommand0)
         XCTAssertEqual(settings.engineModelType, "16k_zh")
         XCTAssertFalse(settings.saveTextLogs)
+        XCTAssertFalse(settings.safeCopyEnabled)
         XCTAssertTrue(settings.prepaidQuotaHoursByModel.isEmpty)
     }
 
@@ -80,6 +81,7 @@ final class SettingsStoreTests: XCTestCase {
             shortcut: Shortcut(keyCode: UInt32(kVK_F5), modifiers: UInt32(optionKey)),
             engineModelType: "16k_zh_en_2.0",
             saveTextLogs: true,
+            safeCopyEnabled: true,
             prepaidQuotaHoursByModel: ["16k_zh_en_2.0": 60]
         )
         store.save(settings)
@@ -97,6 +99,7 @@ final class SettingsStoreTests: XCTestCase {
 
         let settings = try JSONDecoder().decode(AppSettings.self, from: data)
         XCTAssertTrue(settings.prepaidQuotaHoursByModel.isEmpty)
+        XCTAssertFalse(settings.safeCopyEnabled)
     }
 }
 

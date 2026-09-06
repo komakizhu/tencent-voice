@@ -10,12 +10,23 @@ final class AXTextTarget: TextTarget {
     private var expectedKeyboardSelection: TextRange?
     private let keyboardEventSender = KeyboardEventSender()
 
+    func currentApplication() -> TextTargetApplication? {
+        NSWorkspace.shared.frontmostApplication.map {
+            TextTargetApplication(
+                name: $0.localizedName ?? "未知应用",
+                bundleIdentifier: $0.bundleIdentifier,
+                processIdentifier: Int32($0.processIdentifier)
+            )
+        }
+    }
+
     func capture() throws -> TextSnapshot {
         try requestInputPermissionsIfNeeded()
         targetElement = nil
         targetProcessID = nil
         targetApplicationProcessID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         expectedKeyboardSelection = nil
+        let targetApplication = currentApplication()
 
         // Some Electron/WebKit controls expose neither a stable AX value nor
         // a stable focused AX element while the DOM is being rebuilt. That is
@@ -55,7 +66,8 @@ final class AXTextTarget: TextTarget {
             selection: selection,
             supportsAXReplacement: hasReadableAXTextState && (element.map {
                 selectedTextIsSettable(on: $0) || valueIsSettable(on: $0)
-            } ?? false)
+            } ?? false),
+            targetApplication: targetApplication
         )
     }
 
@@ -153,8 +165,13 @@ final class AXTextTarget: TextTarget {
 
     func copyToClipboard(_ text: String) throws {
         let pasteboard = NSPasteboard.general
+        let previousString = pasteboard.string(forType: .string)
         pasteboard.clearContents()
         guard pasteboard.setString(text, forType: .string) else {
+            pasteboard.clearContents()
+            if let previousString {
+                _ = pasteboard.setString(previousString, forType: .string)
+            }
             throw TextTargetError.writeFailed
         }
     }

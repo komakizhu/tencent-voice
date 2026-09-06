@@ -18,6 +18,14 @@ enum AudioCaptureError: Error, LocalizedError {
         case let .engineStartFailed(error): return "麦克风启动失败：\(error.localizedDescription)"
         }
     }
+
+    var diagnosticCode: String {
+        switch self {
+        case .inputUnavailable: return "microphone_input_unavailable"
+        case .converterUnavailable: return "microphone_converter_unavailable"
+        case .engineStartFailed: return "microphone_engine_start_failed"
+        }
+    }
 }
 
 final class SystemAudioCapture: AudioCapture, @unchecked Sendable {

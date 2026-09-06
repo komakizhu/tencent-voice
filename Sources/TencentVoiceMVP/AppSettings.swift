@@ -32,12 +32,14 @@ struct AppSettings: Codable, Equatable, Sendable {
     var shortcut: Shortcut
     var engineModelType: String
     var saveTextLogs: Bool
+    var safeCopyEnabled: Bool
     var prepaidQuotaHoursByModel: [String: Int]
 
     private enum CodingKeys: String, CodingKey {
         case shortcut
         case engineModelType
         case saveTextLogs
+        case safeCopyEnabled
         case prepaidQuotaHoursByModel
     }
 
@@ -45,11 +47,13 @@ struct AppSettings: Codable, Equatable, Sendable {
         shortcut: Shortcut = .defaultCommand0,
         engineModelType: String = TencentEnginePreset.defaultPreset.rawValue,
         saveTextLogs: Bool = false,
+        safeCopyEnabled: Bool = false,
         prepaidQuotaHoursByModel: [String: Int] = [:]
     ) {
         self.shortcut = shortcut
         self.engineModelType = engineModelType
         self.saveTextLogs = saveTextLogs
+        self.safeCopyEnabled = safeCopyEnabled
         self.prepaidQuotaHoursByModel = prepaidQuotaHoursByModel
     }
 
@@ -58,6 +62,7 @@ struct AppSettings: Codable, Equatable, Sendable {
         shortcut = try container.decode(Shortcut.self, forKey: .shortcut)
         engineModelType = try container.decode(String.self, forKey: .engineModelType)
         saveTextLogs = try container.decode(Bool.self, forKey: .saveTextLogs)
+        safeCopyEnabled = try container.decodeIfPresent(Bool.self, forKey: .safeCopyEnabled) ?? false
         prepaidQuotaHoursByModel = try container.decodeIfPresent(
             [String: Int].self,
             forKey: .prepaidQuotaHoursByModel

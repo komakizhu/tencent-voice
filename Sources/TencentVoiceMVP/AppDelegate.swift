@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let hotkeyManager: CarbonHotkeyManager
     private let menu: StatusMenuController
     private let coordinator: SessionCoordinator
+    private let sessionLogger: SessionLogger
     private let localUsageStore: LocalUsageStore
     private let sharedUsageStore: SharedUsageStore
     private let rimeThemeStore: RimeThemeStore
@@ -33,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sharedUsageStore = SharedUsageStore()
         let rimeThemeStore = RimeThemeStore()
         let permissionChecker = SystemPrivacyPermissionChecker()
+        let sessionLogger = SessionLogger(enabled: { settingsStore.load().saveTextLogs })
         let rimeBackupRetentionStore = RimeBackupRetentionStore(
             policy: RimeBackupSettings.loadPolicy()
         )
@@ -77,14 +79,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.rimeBackupRetentionStore = rimeBackupRetentionStore
         self.permissionChecker = permissionChecker
         self.rimeReviewCoordinator = rimeReviewCoordinator
+        self.sessionLogger = sessionLogger
         coordinator = SessionCoordinator(
             asr: TencentASRClient(),
             audio: SystemAudioCapture(),
             textTarget: AXTextTarget(),
             settingsStore: settingsStore,
             credentialStore: credentialStore,
-            logger: SessionLogger(enabled: { settingsStore.load().saveTextLogs }),
+            logger: sessionLogger,
             onStateChange: { state in
+                let diagnosticState: String = switch state {
+                case .idle: "idle"
+                case .connecting: "connecting"
+                case .listening: "listening"
+                case .stopping: "stopping"
+                case .error: "error"
+                }
+                sessionLogger.recordDiagnosticAction("session_state_changed", fields: [
+                    "state": diagnosticState
+                ])
                 switch state {
                 case .idle: menu.update(status: "就绪")
                 case .connecting: menu.update(status: "连接中…")
@@ -119,6 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         refreshRimeThemes()
         registerHotkey()
+        recoverInterruptedDiagnosticRecordingIfNeeded()
         localUsageStore.migrateLegacyUnscopedUsage(to: TencentEnginePreset.standard.rawValue)
         _ = try? sharedUsageStore.recoverAbandonedSessions()
         migrateLocalUsageIfNeeded()
@@ -162,6 +176,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeyManager.unregister()
         endTrackedUsageSession()
         coordinator.cancel()
+        if sessionLogger.isDiagnosticRecording {
+            sessionLogger.recordDiagnosticAction("application_terminating")
+            _ = try? sessionLogger.stopDiagnosticRecordingAndExport()
+        }
         menu.uninstall()
     }
 
@@ -180,12 +198,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             menu.update(status: "就绪 · \(ShortcutFormatter.string(for: settings.shortcut))")
         } catch {
+            sessionLogger.recordDiagnosticAction("hotkey_registration_failed", fields: [
+                "errorCode": DiagnosticErrorFormatter.code(for: error),
+                "errorMessage": DiagnosticErrorFormatter.message(for: error)
+            ])
             menu.update(status: "错误：\(error.localizedDescription)")
         }
     }
 
     private func showSettings() {
         if let existing = settingsWindowController, existing.window?.isVisible == true {
+            sessionLogger.recordDiagnosticAction("settings_opened")
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
             existing.window?.makeKeyAndOrderFront(nil)
@@ -193,6 +216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        sessionLogger.recordDiagnosticAction("settings_opened")
         var settings = settingsStore.load()
         let credentials = loadCredentialsForSettings()
         if let credentials,
@@ -238,6 +262,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
                 try await TencentASRClient().testConnection(configuration: configuration)
             },
+            onDiagnosticRecordingToggle: { [weak self] isStarting in
+                guard let self else { throw DiagnosticRecordingError.unavailable }
+                return try self.toggleDiagnosticRecording(isStarting)
+            },
+            diagnosticRecordingActive: sessionLogger.isDiagnosticRecording,
+            onRecordDiagnosticAction: { [weak self] name, fields in
+                self?.sessionLogger.recordDiagnosticAction(name, fields: fields)
+            },
             permissionChecker: permissionChecker,
             onClose: { [weak self] in
                 guard self != nil else { return }
@@ -251,6 +283,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.window?.center()
         controller.window?.makeKeyAndOrderFront(nil)
         controller.window?.orderFrontRegardless()
+    }
+
+    private func buildDiagnosticReport() -> String {
+        DiagnosticReportBuilder(
+            permissionChecker: permissionChecker,
+            credentialStore: credentialStore,
+            settingsStore: settingsStore,
+            logger: sessionLogger
+        ).build().renderedText()
+    }
+
+    private func toggleDiagnosticRecording(_ start: Bool) throws -> URL? {
+        if start {
+            try sessionLogger.startDiagnosticRecording()
+            recordDiagnosticContextSnapshot(phase: "start")
+            sessionLogger.recordDiagnosticAction("diagnostic_recording_started")
+            return nil
+        }
+
+        recordDiagnosticContextSnapshot(phase: "stop")
+        sessionLogger.recordDiagnosticAction("diagnostic_recording_stopping")
+        return try sessionLogger.stopDiagnosticRecordingAndExport()
+    }
+
+    private func recoverInterruptedDiagnosticRecordingIfNeeded() {
+        do {
+            guard let url = try sessionLogger.recoverInterruptedDiagnosticRecording() else { return }
+            menu.update(status: "已恢复故障诊断 JSON：\(url.lastPathComponent)")
+        } catch {
+            // A corrupt or unwritable diagnostic journal must never prevent the
+            // main application from launching.
+        }
+    }
+
+    private func recordDiagnosticContextSnapshot(phase: String) {
+        let settings = settingsStore.load()
+        let permissions = permissionChecker.report()
+        var fields: [String: String] = [
+            "phase": phase,
+            "shortcut": ShortcutFormatter.string(for: settings.shortcut),
+            "engineModelType": settings.engineModelType,
+            "saveTextLogs": String(settings.saveTextLogs),
+            "safeCopyEnabled": String(settings.safeCopyEnabled),
+            "permissionMissingCount": String(permissions.missing.count)
+        ]
+        for permission in PrivacyPermission.allCases {
+            fields["permission_\(permission.rawValue)_granted"] = String(
+                permissions.status(for: permission)?.isGranted ?? false
+            )
+        }
+        do {
+            fields["authConfigured"] = String(try credentialStore.load() != nil)
+            fields["authReadable"] = "true"
+        } catch {
+            fields["authConfigured"] = "false"
+            fields["authReadable"] = "false"
+        }
+        sessionLogger.recordDiagnosticAction("diagnostic_context_snapshot", fields: fields)
     }
 
     private func refreshRimeThemes() {
@@ -328,6 +418,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func toggleRecording() async {
+        let stateName: String = switch coordinator.state {
+        case .idle: "idle"
+        case .connecting: "connecting"
+        case .listening: "listening"
+        case .stopping: "stopping"
+        case .error: "error"
+        }
+        sessionLogger.recordDiagnosticAction("recording_toggle_requested", fields: [
+            "state": stateName
+        ])
         switch coordinator.state {
         case .idle:
             let engineModelType = settingsStore.load().engineModelType

@@ -9,14 +9,22 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let enginePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let prepaidHoursPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let logCheckbox = NSButton(checkboxWithTitle: "保存崩溃日志", target: nil, action: nil)
+    private let safeCopyCheckbox = NSButton(
+        checkboxWithTitle: "Safe Copy（始终复制到剪贴板）",
+        target: nil,
+        action: nil
+    )
     private let shortcutLabel = NSTextField(labelWithString: "")
     private let versionLabel = NSTextField(labelWithString: AppVersion.displayText)
     private let statusLabel = NSTextField(labelWithString: "凭证优先保存在本机 YAML")
     private let testButton = NSButton(title: "测试连接", target: nil, action: nil)
+    private let diagnosticCheckbox = NSButton(checkboxWithTitle: "故障诊断记录", target: nil, action: nil)
     private let permissionCheckButton = NSButton(title: "检查权限", target: nil, action: nil)
     private let permissionRowsStack = NSStackView()
     private let onSave: (AppSettings, TencentCredentials) throws -> Void
     private let onTestConnection: ((TencentCredentials, String) async throws -> Void)?
+    private let onDiagnosticRecordingToggle: ((Bool) throws -> URL?)?
+    private let onRecordDiagnosticAction: ((String, [String: String]) -> Void)?
     private let permissionChecker: PrivacyPermissionChecking
     private let onClose: () -> Void
     private var currentShortcut: Shortcut
@@ -32,11 +40,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         credentials: TencentCredentials?,
         onSave: @escaping (AppSettings, TencentCredentials) throws -> Void,
         onTestConnection: ((TencentCredentials, String) async throws -> Void)? = nil,
+        onDiagnosticRecordingToggle: ((Bool) throws -> URL?)? = nil,
+        diagnosticRecordingActive: Bool = false,
+        onRecordDiagnosticAction: ((String, [String: String]) -> Void)? = nil,
         permissionChecker: PrivacyPermissionChecking? = nil,
         onClose: @escaping () -> Void = {}
     ) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 650),
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 710),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -44,6 +55,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.title = "腾讯语音输入设置"
         self.onSave = onSave
         self.onTestConnection = onTestConnection
+        self.onDiagnosticRecordingToggle = onDiagnosticRecordingToggle
+        self.onRecordDiagnosticAction = onRecordDiagnosticAction
         self.permissionChecker = permissionChecker ?? SystemPrivacyPermissionChecker()
         self.onClose = onClose
         currentShortcut = settings.shortcut
@@ -73,6 +86,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         prepaidHoursPopup.action = #selector(prepaidHoursChanged)
         rebuildPrepaidHoursPopup()
         logCheckbox.state = settings.saveTextLogs ? .on : .off
+        safeCopyCheckbox.state = settings.safeCopyEnabled ? .on : .off
+        diagnosticCheckbox.state = diagnosticRecordingActive ? .on : .off
         shortcutLabel.stringValue = ShortcutFormatter.string(for: currentShortcut)
         buildView()
         refreshPermissionReport()
@@ -96,7 +111,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             labeled("SecretKey", view: secretKeyField),
             labeled("识别引擎", view: enginePopup),
             labeled("已充值时长（当前模型）", view: prepaidHoursPopup),
-            testButton
+            testButton,
+            safeCopyRow(),
+            diagnosticRow()
         ])
         fields.orientation = .vertical
         fields.alignment = .leading
@@ -115,6 +132,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         testButton.target = self
         testButton.action = #selector(testConnectionPressed)
         testButton.isEnabled = onTestConnection != nil
+        diagnosticCheckbox.target = self
+        diagnosticCheckbox.action = #selector(diagnosticRecordingToggled)
+        diagnosticCheckbox.isEnabled = onDiagnosticRecordingToggle != nil
+        diagnosticCheckbox.toolTip = "勾选开始记录；再次取消勾选后自动导出 JSON。不会记录密钥、录音或识别正文。"
         permissionCheckButton.target = self
         permissionCheckButton.action = #selector(checkPermissionsPressed)
         let buttons = NSStackView(views: [logCheckbox, statusLabel, NSView(), saveButton])
@@ -189,13 +210,50 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return view
     }
 
+    private func diagnosticRow() -> NSView {
+        let description = NSTextField(
+            labelWithString: "勾选后记录故障与动作元数据；再次点击结束并自动导出桌面 JSON（不含密钥、录音和识别正文）"
+        )
+        description.textColor = .secondaryLabelColor
+        description.lineBreakMode = .byWordWrapping
+        description.maximumNumberOfLines = 2
+        description.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [diagnosticCheckbox, description])
+        row.alignment = .centerY
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        return row
+    }
+
+    private func safeCopyRow() -> NSView {
+        let description = NSTextField(
+            labelWithString: "适用于所有支持文本输入的应用；保存后生效；关闭时发生输入错误不会自动复制"
+        )
+        description.textColor = .secondaryLabelColor
+        description.lineBreakMode = .byWordWrapping
+        description.maximumNumberOfLines = 2
+        description.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [safeCopyCheckbox, description])
+        row.alignment = .centerY
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        return row
+    }
+
     @objc private func checkPermissionsPressed() {
-        refreshPermissionReport()
+        let report = refreshPermissionReport()
+        onRecordDiagnosticAction?("permissions_checked", [
+            "missingCount": String(report.missing.count),
+            "grantedCount": String(report.statuses.filter { $0.isGranted }.count)
+        ])
         statusLabel.stringValue = "权限检查完成；缺失项可点击旁边的“打开设置”"
     }
 
     @objc private func openPermissionSettingsPressed(_ sender: NSButton) {
         guard let permission = PrivacyPermission(rawValue: sender.tag) else { return }
+        onRecordDiagnosticAction?("permission_settings_open_requested", [
+            "permission": String(permission.rawValue)
+        ])
         if permissionChecker.openSettings(for: permission) {
             statusLabel.stringValue = "已打开“\(permission.title)”设置；开启后回来点击“检查权限”"
         } else {
@@ -203,7 +261,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    private func refreshPermissionReport() {
+    @discardableResult
+    private func refreshPermissionReport() -> PrivacyPermissionReport {
         let report = permissionChecker.report()
         for status in report.statuses {
             permissionStateLabels[status.permission]?.stringValue = status.detail
@@ -211,6 +270,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 ? .systemGreen
                 : .systemRed
         }
+        return report
     }
 
     private func labeled(_ title: String, view: NSView) -> NSView {
@@ -240,6 +300,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             }
             self.currentShortcut = shortcut
             self.shortcutLabel.stringValue = ShortcutFormatter.string(for: shortcut)
+            self.onRecordDiagnosticAction?("shortcut_selected", [
+                "shortcut": ShortcutFormatter.string(for: shortcut)
+            ])
             self.statusLabel.stringValue = "快捷键已选择，保存后生效"
             self.stopShortcutCapture()
             return nil
@@ -255,13 +318,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             engineModelType: enginePopup.selectedItem?.representedObject as? String
                 ?? TencentEnginePreset.defaultPreset.rawValue,
             saveTextLogs: logCheckbox.state == .on,
+            safeCopyEnabled: safeCopyCheckbox.state == .on,
             prepaidQuotaHoursByModel: prepaidQuotaHoursByModel
         )
         do {
             try onSave(settings, credentials)
             storedCredentials = credentials
+            onRecordDiagnosticAction?("settings_saved", [
+                "engineModelType": settings.engineModelType,
+                "saveTextLogs": String(settings.saveTextLogs),
+                "safeCopyEnabled": String(settings.safeCopyEnabled)
+            ])
             statusLabel.stringValue = "已保存到本机共享目录"
         } catch {
+            onRecordDiagnosticAction?("settings_save_failed", [
+                "errorCode": DiagnosticErrorFormatter.code(for: error),
+                "errorMessage": DiagnosticErrorFormatter.message(for: error)
+            ])
             statusLabel.stringValue = "保存失败：\(error.localizedDescription)"
         }
     }
@@ -275,6 +348,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         guard let credentials = credentialsFromFields() else { return }
 
         let model = selectedEngineModelType
+        onRecordDiagnosticAction?("connection_test_started", ["engineModelType": model])
         testButton.isEnabled = false
         statusLabel.stringValue = "正在握手测试（不会录音）…"
         testTask = Task { [weak self] in
@@ -285,13 +359,48 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             do {
                 try await onTestConnection(credentials, model)
                 guard !Task.isCancelled else { return }
+                self?.onRecordDiagnosticAction?("connection_test_finished", [
+                    "engineModelType": model,
+                    "result": "success"
+                ])
                 self?.statusLabel.stringValue = "连接成功：凭证和当前引擎可用"
             } catch {
                 guard !Task.isCancelled else { return }
+                self?.onRecordDiagnosticAction?("connection_test_finished", [
+                    "engineModelType": model,
+                    "result": "failure",
+                    "errorCode": DiagnosticErrorFormatter.code(for: error),
+                    "errorMessage": DiagnosticErrorFormatter.message(for: error)
+                ])
                 self?.statusLabel.stringValue = "连接失败：\(error.localizedDescription)"
             }
             self?.testButton.isEnabled = true
             self?.testTask = nil
+        }
+    }
+
+    @objc private func diagnosticRecordingToggled() {
+        guard let onDiagnosticRecordingToggle else {
+            diagnosticCheckbox.state = .off
+            statusLabel.stringValue = "当前版本不支持故障诊断记录"
+            return
+        }
+
+        let starting = diagnosticCheckbox.state == .on
+        do {
+            let url = try onDiagnosticRecordingToggle(starting)
+            if starting {
+                statusLabel.stringValue = "故障诊断记录中；复现问题后再次点击结束"
+            } else if let url {
+                statusLabel.stringValue = "诊断已结束，JSON 已导出：\(url.lastPathComponent)"
+            } else {
+                statusLabel.stringValue = "诊断记录已结束"
+            }
+        } catch {
+            // Keep the checkbox on after an export failure so the user can
+            // retry without losing the in-memory trace.
+            diagnosticCheckbox.state = starting ? .off : .on
+            statusLabel.stringValue = "故障诊断操作失败：\(error.localizedDescription)"
         }
     }
 
@@ -302,6 +411,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             ? (storedCredentials?.secretKey ?? "")
             : secretKeyField.stringValue
         guard !appID.isEmpty, !secretID.isEmpty, !secretKey.isEmpty else {
+            onRecordDiagnosticAction?("credentials_validation_failed", [:])
             statusLabel.stringValue = "请填写完整的 AppID、SecretId 和 SecretKey"
             return nil
         }
@@ -319,10 +429,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         persistSelectedPrepaidHours(for: displayedEngineModelType)
         displayedEngineModelType = selectedEngineModelType
         rebuildPrepaidHoursPopup()
+        onRecordDiagnosticAction?("engine_selected", ["engineModelType": displayedEngineModelType])
     }
 
     @objc private func prepaidHoursChanged() {
         persistSelectedPrepaidHours()
+        onRecordDiagnosticAction?("prepaid_hours_selected", [
+            "hours": String(prepaidHoursPopup.selectedItem?.tag ?? 0)
+        ])
     }
 
     private func rebuildPrepaidHoursPopup() {

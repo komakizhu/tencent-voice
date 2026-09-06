@@ -4,7 +4,7 @@ import AppKit
 import CoreGraphics
 import Foundation
 
-enum PrivacyPermission: Int, CaseIterable, Equatable, Hashable, Sendable {
+enum PrivacyPermission: Int, CaseIterable, Codable, Equatable, Hashable, Sendable {
     case microphone
     case accessibility
     case postEvent
@@ -45,13 +45,13 @@ enum PrivacyPermission: Int, CaseIterable, Equatable, Hashable, Sendable {
     }
 }
 
-struct PrivacyPermissionStatus: Equatable, Sendable {
+struct PrivacyPermissionStatus: Codable, Equatable, Sendable {
     let permission: PrivacyPermission
     let isGranted: Bool
     let detail: String
 }
 
-struct PrivacyPermissionReport: Equatable, Sendable {
+struct PrivacyPermissionReport: Codable, Equatable, Sendable {
     let statuses: [PrivacyPermissionStatus]
 
     var allGranted: Bool {

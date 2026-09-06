@@ -23,6 +23,15 @@ enum HotkeyError: Error, LocalizedError {
         case let .hotkeyUnavailable(status): return "快捷键注册失败（\(status)）"
         }
     }
+
+    var diagnosticCode: String {
+        switch self {
+        case .invalidShortcut:
+            return "hotkey_invalid_shortcut"
+        case let .hotkeyUnavailable(status):
+            return "hotkey_unavailable_\(status)"
+        }
+    }
 }
 
 private final class HotkeyEventTapContext: @unchecked Sendable {

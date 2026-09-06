@@ -6,6 +6,12 @@ struct TextRange: Equatable, Sendable {
     var length: Int
 }
 
+struct TextTargetApplication: Codable, Equatable, Sendable {
+    let name: String
+    let bundleIdentifier: String?
+    let processIdentifier: Int32
+}
+
 struct TextReplacementDelta: Equatable, Sendable {
     let prefixUTF16Length: Int
     let previousMiddleUTF16Length: Int
@@ -47,22 +53,26 @@ struct TextSnapshot {
     let text: String
     let selection: TextRange
     let supportsAXReplacement: Bool
+    let targetApplication: TextTargetApplication?
 
     init(
         element: AXUIElement? = nil,
         text: String,
         selection: TextRange,
-        supportsAXReplacement: Bool = true
+        supportsAXReplacement: Bool = true,
+        targetApplication: TextTargetApplication? = nil
     ) {
         self.element = element
         self.text = text
         self.selection = selection
         self.supportsAXReplacement = supportsAXReplacement
+        self.targetApplication = targetApplication
     }
 }
 
 @MainActor
 protocol TextTarget: AnyObject {
+    func currentApplication() -> TextTargetApplication?
     func capture() throws -> TextSnapshot
     func replace(snapshot: TextSnapshot, range: TextRange, expectedText: String, with text: String) throws -> TextRange
     func paste(_ text: String) throws
@@ -71,6 +81,8 @@ protocol TextTarget: AnyObject {
 }
 
 extension TextTarget {
+    func currentApplication() -> TextTargetApplication? { nil }
+
     func replaceTrailingText(_ previousText: String, with text: String) throws {
         throw TextTargetError.unsupported
     }
@@ -90,6 +102,28 @@ enum TextTargetError: Error, LocalizedError {
         case .writeFailed: return "无法写入当前输入框"
         case .accessibilityDenied: return "请在系统设置的“隐私与安全性 → 辅助功能”中允许腾讯语音输入 MVP"
         case .postEventDenied: return "系统禁止腾讯语音输入 MVP 发送键盘事件，请在辅助功能中重新允许后重启应用"
+        }
+    }
+
+    var diagnosticCode: String {
+        switch self {
+        case .unsupported: return "text_target_unsupported"
+        case .targetChanged: return "text_target_changed"
+        case .writeFailed: return "text_target_write_failed"
+        case .accessibilityDenied: return "accessibility_denied"
+        case .postEventDenied: return "post_event_denied"
+        }
+    }
+}
+
+extension SessionError {
+    var diagnosticCode: String {
+        switch self {
+        case .credentialsMissing: return "credentials_missing"
+        case .microphoneDenied: return "microphone_denied"
+        case .noTextTarget: return "text_target_missing"
+        case .busy: return "session_busy"
+        case .cancelled: return "session_cancelled"
         }
     }
 }

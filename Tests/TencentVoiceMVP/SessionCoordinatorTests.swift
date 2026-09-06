@@ -528,6 +528,28 @@ final class SessionCoordinatorTests: XCTestCase {
         await assertThrowsAsync { try await coordinator.begin() }
         XCTAssertEqual(target.text, "原文")
     }
+
+    func testEnabledSafeCopyIsWiredThroughSettingsStore() async throws {
+        let settingsStore = UserDefaultsSettingsStore(
+            suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"
+        )
+        settingsStore.save(AppSettings(safeCopyEnabled: true))
+        let asr = FakeRealtimeASRClient()
+        let target = FakeTextTarget(text: "原文", supportsAXReplacement: false)
+        let coordinator = makeCoordinator(
+            asr: asr,
+            target: target,
+            settingsStore: settingsStore
+        )
+
+        try await coordinator.begin()
+        asr.emit(ASRUpdate(text: "安全复制结果", isFinal: true, sequence: 0))
+        await settleCoordinator()
+        try await coordinator.end()
+
+        XCTAssertEqual(target.text, "原文")
+        XCTAssertEqual(target.copiedText, "安全复制结果")
+    }
 }
 
 @MainActor
@@ -536,6 +558,7 @@ private func makeCoordinator(
     audio: AudioCapture = FakeAudioCapture(),
     target: TextTarget,
     credentials: TencentCredentials? = TencentCredentials(appID: "app", secretID: "id", secretKey: "key"),
+    settingsStore: SettingsStore? = nil,
     finishTimeoutNanoseconds: UInt64 = 3_000_000_000,
     keyboardSmoothing: KeyboardSmoothingConfiguration = .immediate,
     pacingClock: KeyboardPacingClock? = nil
@@ -544,7 +567,8 @@ private func makeCoordinator(
         asr: asr,
         audio: audio,
         textTarget: target,
-        settingsStore: UserDefaultsSettingsStore(suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"),
+        settingsStore: settingsStore
+            ?? UserDefaultsSettingsStore(suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"),
         credentialStore: InMemoryCredentialStore(credentials),
         finishTimeoutNanoseconds: finishTimeoutNanoseconds,
         keyboardSmoothing: keyboardSmoothing,

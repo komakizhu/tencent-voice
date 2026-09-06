@@ -78,4 +78,14 @@ enum TencentASRError: Error, LocalizedError {
         case .alreadyFinished: return "语音连接已经结束"
         }
     }
+
+    var diagnosticCode: String {
+        switch self {
+        case .invalidURL: return "tencent_asr_invalid_url"
+        case let .server(code, _): return "tencent_asr_server_\(code)"
+        case .handshakeTimeout: return "tencent_asr_handshake_timeout"
+        case .notStarted: return "tencent_asr_not_started"
+        case .alreadyFinished: return "tencent_asr_already_finished"
+        }
+    }
 }

@@ -81,6 +81,16 @@ final class AppSmokeTests: XCTestCase {
         })
         XCTAssertTrue(labels.contains { $0.stringValue == "保存崩溃日志" })
         XCTAssertFalse(labels.contains { $0.stringValue == "保存文本日志" })
+        XCTAssertTrue(
+            flatten(contentView)
+                .compactMap { $0 as? NSButton }
+                .contains { $0.title == "故障诊断记录" }
+        )
+        XCTAssertTrue(
+            flatten(contentView)
+                .compactMap { $0 as? NSButton }
+                .contains { $0.title == "Safe Copy（始终复制到剪贴板）" }
+        )
 
         let permissionTitle = labels.first { $0.stringValue == "系统权限（当前 macOS 账户）" }
         let permissionCheckButton = flatten(contentView)
@@ -116,6 +126,39 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertGreaterThan(testFrame.minY, shortcutFrame.maxY)
         XCTAssertEqual(logFrame.midY, saveFrame.midY, accuracy: 1)
         XCTAssertLessThan(logFrame.minX, saveFrame.minX)
+    }
+
+    func testSettingsDiagnosticCheckboxStartsAndStopsRecording() throws {
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .authorized },
+            accessibilityStatus: { true },
+            postEventStatus: { true },
+            inputMonitoringStatus: { true }
+        )
+        var requestedStates: [Bool] = []
+        let controller = SettingsWindowController(
+            settings: AppSettings(),
+            credentials: nil,
+            onSave: { _, _ in },
+            onDiagnosticRecordingToggle: { isStarting in
+                requestedStates.append(isStarting)
+                return isStarting
+                    ? nil
+                    : URL(fileURLWithPath: "/tmp/TencentVoiceMVP-Diagnostic.json")
+            },
+            permissionChecker: checker
+        )
+        let checkbox = try XCTUnwrap(
+            flatten(controller.window?.contentView)
+                .compactMap { $0 as? NSButton }
+                .first { $0.title == "故障诊断记录" }
+        )
+
+        checkbox.performClick(nil)
+        checkbox.performClick(nil)
+
+        XCTAssertEqual(requestedStates, [true, false])
+        XCTAssertEqual(checkbox.state, .off)
     }
 
     func testManualRimeEntryFormShowsAllEditableFields() {

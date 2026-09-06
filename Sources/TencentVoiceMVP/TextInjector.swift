@@ -7,9 +7,11 @@ final class TextInjector {
         case ax
         case keyboardLiveTail
         case safeCopy
+        case disabledAfterError
     }
 
     private let target: TextTarget
+    private let safeCopyEnabled: Bool
     private let keyboardPacing: KeyboardPacingConfiguration
     private let pacingClock: KeyboardPacingClock
     private var keyboardPacer: KeyboardCharacterPacer?
@@ -33,9 +35,11 @@ final class TextInjector {
     init(
         target: TextTarget,
         keyboardSmoothing: KeyboardSmoothingConfiguration = .immediate,
-        pacingClock: KeyboardPacingClock? = nil
+        pacingClock: KeyboardPacingClock? = nil,
+        safeCopyEnabled: Bool = false
     ) {
         self.target = target
+        self.safeCopyEnabled = safeCopyEnabled
         self.keyboardPacing = keyboardSmoothing
         self.pacingClock = pacingClock ?? ContinuousKeyboardPacingClock()
     }
@@ -46,12 +50,25 @@ final class TextInjector {
         case .ax: return "ax"
         case .keyboardLiveTail: return "keyboard_live_tail"
         case .safeCopy: return "safe_copy"
+        case .disabledAfterError: return "disabled_after_error"
         }
     }
 
+    var targetApplication: TextTargetApplication? {
+        snapshot?.targetApplication ?? target.currentApplication()
+    }
+
+    private(set) var degradationCode: String?
+
     func begin() throws {
-        keyboardPacer?.cancel()
-        keyboardPacer = nil
+        resetForBegin()
+        if safeCopyEnabled {
+            mode = .safeCopy
+            degradationCode = "safe_copy_manual"
+            degradationReason = DiagnosticErrorFormatter.canonicalMessage(for: "safe_copy_manual")
+            return
+        }
+
         do {
             let captured = try target.capture()
             snapshot = captured
@@ -64,20 +81,12 @@ final class TextInjector {
             deepReplacementCount = 0
             maximumTrailingReplacementLength = 0
             errorCount = 0
+            degradationCode = nil
             degradationReason = nil
             mode = captured.supportsAXReplacement ? .ax : .keyboardLiveTail
             installKeyboardPacerIfNeeded()
         } catch TextTargetError.unsupported, TextTargetError.targetChanged, TextTargetError.writeFailed {
-            snapshot = nil
-            lastDocumentText = ""
-            lastProjectionText = ""
-            lastSubmittedText = ""
-            writeCount = 0
-            backspaceCount = 0
-            deepReplacementCount = 0
-            maximumTrailingReplacementLength = 0
-            errorCount = 0
-            degradationReason = nil
+            resetForBegin()
             mode = .keyboardLiveTail
             installKeyboardPacerIfNeeded()
         }
@@ -93,7 +102,9 @@ final class TextInjector {
             applyAX(projection)
         case .keyboardLiveTail:
             applyKeyboardLiveTail(projection)
-        case .safeCopy, .inactive:
+        case .safeCopy, .disabledAfterError:
+            lastProjectionText = projection.text
+        case .inactive:
             break
         }
     }
@@ -122,11 +133,11 @@ final class TextInjector {
                 enterSafeCopy(after: error)
             }
             if mode == .safeCopy {
-                try target.copyToClipboard(completionText)
+                try copyIfNeeded(completionText)
             }
         case .safeCopy:
-            try target.copyToClipboard(completionText)
-        case .ax, .inactive:
+            try copyIfNeeded(completionText)
+        case .ax, .inactive, .disabledAfterError:
             break
         }
     }
@@ -146,17 +157,22 @@ final class TextInjector {
                 enterSafeCopy(after: error)
             }
             if mode == .safeCopy {
-                try target.copyToClipboard(completionText)
+                try copyIfNeeded(completionText)
             }
         case .safeCopy:
-            try target.copyToClipboard(completionText)
-        case .ax, .inactive:
+            try copyIfNeeded(completionText)
+        case .ax, .inactive, .disabledAfterError:
             break
         }
     }
 
     func cancel() {
         reset()
+    }
+
+    private func copyIfNeeded(_ text: String) throws {
+        guard !text.isEmpty else { return }
+        try target.copyToClipboard(text)
     }
 
     private func applyAX(_ projection: ASRProjection) {
@@ -270,9 +286,28 @@ final class TextInjector {
 
     private func enterSafeCopy(after error: Error) {
         keyboardPacer?.cancel()
-        mode = .safeCopy
+        mode = safeCopyEnabled ? .safeCopy : .disabledAfterError
         errorCount += 1
-        degradationReason = error.localizedDescription
+        degradationCode = DiagnosticErrorFormatter.code(for: error)
+        degradationReason = DiagnosticErrorFormatter.message(for: error)
+    }
+
+    private func resetForBegin() {
+        keyboardPacer?.cancel()
+        keyboardPacer = nil
+        snapshot = nil
+        ownedRange = TextRange(location: 0, length: 0)
+        lastDocumentText = ""
+        lastProjectionText = ""
+        lastSubmittedText = ""
+        writeCount = 0
+        backspaceCount = 0
+        deepReplacementCount = 0
+        maximumTrailingReplacementLength = 0
+        errorCount = 0
+        degradationCode = nil
+        degradationReason = nil
+        mode = .inactive
     }
 
     private func reset() {
@@ -288,6 +323,7 @@ final class TextInjector {
         deepReplacementCount = 0
         maximumTrailingReplacementLength = 0
         errorCount = 0
+        degradationCode = nil
         degradationReason = nil
         mode = .inactive
     }
