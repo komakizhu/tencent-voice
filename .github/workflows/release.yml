@@ -3,7 +3,7 @@ name: macOS build and release
 on:
   push:
     tags:
-      - 'v*-macos'
+      - 'v*-macos*'
   workflow_dispatch:
 
 permissions:
