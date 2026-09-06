@@ -15,7 +15,7 @@ enum TencentSigner {
         nonce: Int
     ) throws -> URL {
         let hostPath = "asr.cloud.tencent.com/asr/v2/\(configuration.appID)"
-        let pairs: [(String, String)] = [
+        var pairs: [(String, String)] = [
             ("engine_model_type", configuration.engineModelType),
             ("expired", String(expired)),
             ("needvad", String(configuration.needVAD)),
@@ -24,7 +24,11 @@ enum TencentSigner {
             ("timestamp", String(timestamp)),
             ("voice_format", String(configuration.voiceFormat)),
             ("voice_id", configuration.voiceID)
-        ].sorted { $0.0 < $1.0 }
+        ]
+        if configuration.wordInfo > 0 {
+            pairs.append(("word_info", String(configuration.wordInfo)))
+        }
+        pairs.sort { $0.0 < $1.0 }
 
         let canonicalQuery = pairs.map { "\($0.0)=\($0.1)" }.joined(separator: "&")
         let source = "\(hostPath)?\(canonicalQuery)"

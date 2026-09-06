@@ -15,7 +15,8 @@ final class TencentSignerTests: XCTestCase {
             secretID: "secret-id",
             secretKey: "secret-key",
             engineModelType: "16k_zh_en_2.0",
-            voiceID: "voice-1"
+            voiceID: "voice-1",
+            wordInfo: 1
         )
         let url = try TencentSigner.makeURL(
             configuration: configuration,
@@ -25,6 +26,7 @@ final class TencentSignerTests: XCTestCase {
         )
         XCTAssertEqual(url.scheme, "wss")
         XCTAssertTrue(url.absoluteString.contains("signature="))
+        XCTAssertTrue(url.absoluteString.contains("word_info=1"))
         XCTAssertFalse(url.absoluteString.contains("secret-key"))
     }
 }

@@ -1,0 +1,110 @@
+#!/bin/bash
+set -u
+
+# Refresh the current account's Rime user-dictionary snapshot safely.
+# The script briefly stops Squirrel because rime_dict_manager requires the
+# user dictionary files to be released before it creates a snapshot.
+
+RIME_ROOT="${HOME}/Library/Rime"
+SQUIRREL_APP="/Library/Input Methods/Squirrel.app"
+SQUIRREL="${SQUIRREL_APP}/Contents/MacOS/Squirrel"
+DICT_MANAGER="${SQUIRREL_APP}/Contents/MacOS/rime_dict_manager"
+FRAMEWORKS="${SQUIRREL_APP}/Contents/Frameworks"
+SQUIRREL_PATTERN='^/Library/Input Methods/Squirrel\.app/Contents/MacOS/Squirrel$'
+
+fail() {
+    echo "RIME_SNAPSHOT_ERROR: $1" >&2
+    exit 1
+}
+
+[ -d "$RIME_ROOT" ] || fail "Rime directory not found: $RIME_ROOT"
+[ -x "$SQUIRREL" ] || fail "Squirrel executable not found: $SQUIRREL"
+[ -x "$DICT_MANAGER" ] || fail "rime_dict_manager not found: $DICT_MANAGER"
+
+installation_id="$(grep -m 1 '^installation_id:' "$RIME_ROOT/installation.yaml" 2>/dev/null | sed "s/^installation_id:[[:space:]]*//; s/[\"']//g")"
+[ -n "$installation_id" ] || fail "installation_id not found in $RIME_ROOT/installation.yaml"
+
+raw_directory="$RIME_ROOT/rime_ice.userdb"
+snapshot="$RIME_ROOT/sync/$installation_id/rime_ice.userdb.txt"
+[ -d "$raw_directory" ] || fail "rime_ice.userdb not found: $raw_directory"
+
+newest_raw_mtime() {
+    local result
+    result="$(find "$raw_directory" -type f -exec stat -f '%m' {} \; 2>/dev/null | sort -n | tail -1)"
+    if [ -n "$result" ]; then
+        echo "$result"
+    else
+        echo 0
+    fi
+}
+
+snapshot_mtime() {
+    if [ -f "$snapshot" ]; then
+        stat -f '%m' "$snapshot" 2>/dev/null || echo 0
+    else
+        echo 0
+    fi
+}
+
+was_running=0
+if pgrep -f "$SQUIRREL_PATTERN" >/dev/null 2>&1; then
+    was_running=1
+fi
+
+restart_squirrel() {
+    if [ "$was_running" -eq 1 ]; then
+        /usr/bin/open "$SQUIRREL_APP" >/dev/null 2>&1
+    fi
+}
+
+before_snapshot="$(snapshot_mtime)"
+before_raw="$(newest_raw_mtime)"
+
+echo "RIME_ROOT: $RIME_ROOT"
+echo "INSTALLATION_ID: $installation_id"
+echo "BEFORE_SNAPSHOT_MTIME: $before_snapshot"
+echo "BEFORE_RAW_USERDB_MTIME: $before_raw"
+
+if [ "$was_running" -eq 1 ]; then
+    echo "SQUIRREL: stopping"
+    "$SQUIRREL" --quit >/dev/null 2>&1 || true
+    stopped=0
+    attempt=0
+    while [ "$attempt" -lt 40 ]; do
+        if ! pgrep -f "$SQUIRREL_PATTERN" >/dev/null 2>&1; then
+            stopped=1
+            break
+        fi
+        sleep 0.25
+        attempt=$((attempt + 1))
+    done
+    [ "$stopped" -eq 1 ] || { restart_squirrel || true; fail "Squirrel did not stop; userdb was not touched"; }
+fi
+
+echo "SNAPSHOT: generating"
+(
+    cd "$RIME_ROOT" || exit 1
+    if [ -n "${DYLD_LIBRARY_PATH:-}" ]; then
+        DYLD_LIBRARY_PATH="$FRAMEWORKS:$DYLD_LIBRARY_PATH" "$DICT_MANAGER" --backup rime_ice
+    else
+        DYLD_LIBRARY_PATH="$FRAMEWORKS" "$DICT_MANAGER" --backup rime_ice
+    fi
+)
+manager_status=$?
+
+restart_squirrel || fail "snapshot generated, but Squirrel could not be restarted"
+
+[ "$manager_status" -eq 0 ] || fail "rime_dict_manager failed with status $manager_status"
+
+after_snapshot="$(snapshot_mtime)"
+after_raw="$(newest_raw_mtime)"
+
+echo "AFTER_SNAPSHOT_MTIME: $after_snapshot"
+echo "AFTER_RAW_USERDB_MTIME: $after_raw"
+
+if [ "$after_snapshot" -gt 0 ] && [ "$after_snapshot" -ge "$after_raw" ]; then
+    echo "RIME_SNAPSHOT_OK: rime_ice.userdb snapshot is current"
+    exit 0
+fi
+
+fail "snapshot is still older than rime_ice.userdb; snapshot=$after_snapshot raw=$after_raw"

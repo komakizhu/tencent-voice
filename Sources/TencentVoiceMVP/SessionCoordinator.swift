@@ -50,11 +50,14 @@ final class SessionCoordinator: SessionCoordinating {
 
     private var injector: TextInjector?
     private var prebuffer: AudioPrebuffer?
+    private var audioForwarder: AudioChunkForwarder?
     private var eventTask: Task<Void, Never>?
     private var latestProjection: ASRProjection?
     private var finishSent = false
     private var sessionID: UUID?
     private let finishTimeoutNanoseconds: UInt64
+    private let keyboardSmoothing: KeyboardSmoothingConfiguration
+    private let pacingClock: KeyboardPacingClock
     private var discardCount = 0
     private var errorCount = 0
     private var safeCopyWasLogged = false
@@ -67,6 +70,8 @@ final class SessionCoordinator: SessionCoordinating {
         credentialStore: CredentialStore,
         logger: SessionLogger = SessionLogger(enabled: { false }),
         finishTimeoutNanoseconds: UInt64 = 3_000_000_000,
+        keyboardSmoothing: KeyboardSmoothingConfiguration = .live,
+        pacingClock: KeyboardPacingClock? = nil,
         onStateChange: @escaping (SessionState) -> Void
     ) {
         self.asr = asr
@@ -76,6 +81,8 @@ final class SessionCoordinator: SessionCoordinating {
         self.credentialStore = credentialStore
         self.logger = logger
         self.finishTimeoutNanoseconds = finishTimeoutNanoseconds
+        self.keyboardSmoothing = keyboardSmoothing
+        self.pacingClock = pacingClock ?? ContinuousKeyboardPacingClock()
         self.onStateChange = onStateChange
     }
 
@@ -90,7 +97,11 @@ final class SessionCoordinator: SessionCoordinating {
             }
             try await ensureMicrophonePermission()
 
-            let newInjector = TextInjector(target: textTarget)
+            let newInjector = TextInjector(
+                target: textTarget,
+                keyboardSmoothing: keyboardSmoothing,
+                pacingClock: pacingClock
+            )
             do {
                 try newInjector.begin()
             } catch {
@@ -104,23 +115,28 @@ final class SessionCoordinator: SessionCoordinating {
             safeCopyWasLogged = false
 
             let settings = settingsStore.load()
+            let wordInfo = settings.engineModelType == TencentEnginePreset.largeV2.rawValue ? 0 : 1
             let configuration = TencentSessionConfiguration(
                 appID: credentials.appID,
                 secretID: credentials.secretID,
                 secretKey: credentials.secretKey,
                 engineModelType: settings.engineModelType,
-                voiceID: UUID().uuidString
+                voiceID: UUID().uuidString,
+                needVAD: 1,
+                wordInfo: wordInfo
             )
             let buffer = AudioPrebuffer()
+            let forwarder = AudioChunkForwarder()
             prebuffer = buffer
-            let coordinator = self
-            try await audio.start { [weak coordinator, weak buffer] chunk in
+            audioForwarder = forwarder
+            try await audio.start { [weak self, weak buffer] chunk in
                 guard let buffer else { return }
-                Task { @MainActor [weak coordinator, buffer] in
+                forwarder.submit { [weak self, weak buffer] in
+                    guard let buffer else { return }
                     do {
                         try await buffer.append(chunk)
                     } catch {
-                        coordinator?.handleAudioError(error, sessionID: id)
+                        await self?.handleAudioError(error, sessionID: id)
                     }
                 }
             }
@@ -128,11 +144,11 @@ final class SessionCoordinator: SessionCoordinating {
 
             let stream = try await asr.start(configuration: configuration)
             guard sessionID == id, state == .connecting else { throw SessionError.cancelled }
-            try await buffer.attach { [weak coordinator, asr] chunk in
+            try await buffer.attach { [weak self, asr] chunk in
                 do {
                     try await asr.sendAudio(chunk)
                 } catch {
-                    await coordinator?.handleAudioError(error, sessionID: id)
+                    await self?.handleAudioError(error, sessionID: id)
                     throw error
                 }
             }
@@ -176,7 +192,12 @@ final class SessionCoordinator: SessionCoordinating {
             return
         }
         setState(.stopping)
+        log(event: "stop_requested")
+        injector?.beginStopping()
+        let currentAudioForwarder = audioForwarder
         audio.stop()
+        currentAudioForwarder?.stopAccepting()
+        await currentAudioForwarder?.drain()
         var finishTask: Task<Void, Never>?
         if !finishSent {
             finishSent = true
@@ -202,8 +223,9 @@ final class SessionCoordinator: SessionCoordinating {
 
         if let injector {
             do {
-                try injector.finish(finalText: latestProjection?.text ?? "")
+                try await injector.finish(finalText: latestProjection?.text ?? "")
                 log(event: streamCompleted ? "finished" : "finished_timeout", projection: latestProjection)
+                injector.cancel()
             } catch {
                 log(event: "finish_error", error: error)
                 setState(.error(error.localizedDescription))
@@ -221,6 +243,7 @@ final class SessionCoordinator: SessionCoordinating {
     }
 
     func cancel() {
+        audioForwarder?.cancel()
         audio.stop()
         asr.cancel()
         eventTask?.cancel()
@@ -237,7 +260,9 @@ final class SessionCoordinator: SessionCoordinating {
         if update.isStreamEnded {
             if let projection = projectionAccumulator.apply(update) {
                 latestProjection = projection
+                injector?.apply(projection: projection)
                 log(event: "stream_ended", update: update, projection: projection)
+                logSafeCopyIfNeeded(update: update, projection: projection)
             }
             return
         }
@@ -249,13 +274,16 @@ final class SessionCoordinator: SessionCoordinating {
         latestProjection = projection
         injector?.apply(projection: projection)
         log(event: projection.isFinal ? "final" : "partial", update: update, projection: projection)
-        if injector?.modeDescription == "safe_copy", !safeCopyWasLogged {
-            safeCopyWasLogged = true
-            log(event: "safe_copy", update: update, projection: projection)
-        }
+        logSafeCopyIfNeeded(update: update, projection: projection)
     }
 
     private var projectionAccumulator = ASRProjectionAccumulator()
+
+    private func logSafeCopyIfNeeded(update: ASRUpdate, projection: ASRProjection) {
+        guard injector?.modeDescription == "safe_copy", !safeCopyWasLogged else { return }
+        safeCopyWasLogged = true
+        log(event: "safe_copy", update: update, projection: projection)
+    }
 
     private func handleASRError(_ error: Error, sessionID: UUID? = nil) {
         if let sessionID, self.sessionID != sessionID { return }
@@ -266,7 +294,7 @@ final class SessionCoordinator: SessionCoordinating {
         log(event: "error", error: error)
         let finalProjection = latestProjection
         do {
-            try injector?.finish(finalText: finalProjection?.text ?? "")
+            try injector?.finishImmediately(finalText: finalProjection?.text ?? "")
         } catch {
             errorCount += 1
             log(event: "finish_error", projection: finalProjection, error: error)
@@ -286,21 +314,18 @@ final class SessionCoordinator: SessionCoordinating {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             return
-        case .denied, .restricted:
+        case .denied, .restricted, .notDetermined:
+            // Permission requests are intentionally owned by the explicit
+            // install/request script. Starting a recording must never trigger
+            // a new macOS prompt or re-request a permission the user denied.
             throw SessionError.microphoneDenied
-        case .notDetermined:
-            let granted = await withCheckedContinuation { continuation in
-                AVCaptureDevice.requestAccess(for: .audio) { granted in
-                    continuation.resume(returning: granted)
-                }
-            }
-            guard granted else { throw SessionError.microphoneDenied }
         @unknown default:
             throw SessionError.microphoneDenied
         }
     }
 
     private func cleanUpAfterFailedStart() async {
+        audioForwarder?.cancel()
         audio.stop()
         asr.cancel()
         await prebuffer?.clear()
@@ -313,6 +338,7 @@ final class SessionCoordinator: SessionCoordinating {
     private func resetSession() {
         injector = nil
         prebuffer = nil
+        audioForwarder = nil
         eventTask = nil
         latestProjection = nil
         finishSent = false
@@ -391,6 +417,8 @@ final class SessionCoordinator: SessionCoordinating {
             revision: projection?.revision,
             writeCount: injector?.writeCount,
             backspaceCount: injector?.backspaceCount,
+            deepReplacementCount: injector?.deepReplacementCount,
+            maximumTrailingReplacementLength: injector?.maximumTrailingReplacementLength,
             discardCount: discardCount,
             errorCount: errorCount + (injector?.errorCount ?? 0),
             errorCode: errorCode

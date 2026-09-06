@@ -14,9 +14,20 @@ enum LocalYAMLCredentialStoreError: Error, LocalizedError {
 
 final class LocalYAMLCredentialStore: CredentialStore {
     let fileURL: URL
+    private let filePermissions: Int
+    private let directoryPermissions: Int
+    private let groupOwnerAccountName: String?
 
-    init(fileURL: URL = LocalYAMLCredentialStore.defaultFileURL) {
+    init(
+        fileURL: URL = LocalYAMLCredentialStore.defaultFileURL,
+        filePermissions: Int = 0o600,
+        directoryPermissions: Int = 0o700,
+        groupOwnerAccountName: String? = nil
+    ) {
         self.fileURL = fileURL
+        self.filePermissions = filePermissions
+        self.directoryPermissions = directoryPermissions
+        self.groupOwnerAccountName = groupOwnerAccountName
     }
 
     func load() throws -> TencentCredentials? {
@@ -39,20 +50,30 @@ final class LocalYAMLCredentialStore: CredentialStore {
         }
 
         let directoryURL = fileURL.deletingLastPathComponent()
+        var directoryAttributes: [FileAttributeKey: Any] = [.posixPermissions: directoryPermissions]
+        if let groupOwnerAccountName {
+            directoryAttributes[.groupOwnerAccountName] = groupOwnerAccountName
+        }
         try FileManager.default.createDirectory(
             at: directoryURL,
             withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
+            attributes: [.posixPermissions: directoryPermissions]
         )
+        try? FileManager.default.setAttributes(directoryAttributes, ofItemAtPath: directoryURL.path)
         let content = [
-            "# 腾讯语音输入凭证（明文，仅当前 macOS 用户可读）",
+            filePermissions == 0o600
+                ? "# 腾讯语音输入凭证（明文，仅当前 macOS 用户可读）"
+                : "# 腾讯语音输入凭证（明文，供本机 macOS 账户共享）",
             "app_id: \(quote(credentials.appID))",
             "secret_id: \(quote(credentials.secretID))",
             "secret_key: \(quote(credentials.secretKey))",
             ""
         ].joined(separator: "\n")
         try Data(content.utf8).write(to: fileURL, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: filePermissions],
+            ofItemAtPath: fileURL.path
+        )
     }
 
     func delete() throws {
@@ -65,6 +86,20 @@ final class LocalYAMLCredentialStore: CredentialStore {
         return applicationSupport
             .appendingPathComponent("TencentVoiceMVP", isDirectory: true)
             .appendingPathComponent("tencent-credentials.yaml")
+    }
+
+    static var sharedFileURL: URL {
+        URL(fileURLWithPath: "/Users/Shared/TencentVoiceMVP", isDirectory: true)
+            .appendingPathComponent("tencent-credentials.yaml")
+    }
+
+    static var shared: LocalYAMLCredentialStore {
+        LocalYAMLCredentialStore(
+            fileURL: sharedFileURL,
+            filePermissions: 0o660,
+            directoryPermissions: 0o2770,
+            groupOwnerAccountName: "staff"
+        )
     }
 
     private func parse(_ content: String) throws -> [String: String] {
@@ -98,22 +133,30 @@ final class LocalYAMLCredentialStore: CredentialStore {
 
 final class PersistentCredentialStore: CredentialStore {
     private let primary: LocalYAMLCredentialStore
+    private let perUserFallback: CredentialStore?
     private let legacy: CredentialStore
 
     init(
-        primary: LocalYAMLCredentialStore = LocalYAMLCredentialStore(),
-        legacy: CredentialStore = KeychainCredentialStore()
+        primary: LocalYAMLCredentialStore = .shared,
+        legacy: CredentialStore = KeychainCredentialStore(),
+        perUserFallback: CredentialStore? = nil
     ) {
         self.primary = primary
+        self.perUserFallback = perUserFallback
         self.legacy = legacy
     }
 
     func load() throws -> TencentCredentials? {
-        try primary.load()
+        if let credentials = try primary.load() { return credentials }
+        guard let perUserFallback, let credentials = try perUserFallback.load() else {
+            return nil
+        }
+        try primary.save(credentials)
+        return credentials
     }
 
     func migrateLegacyIfNeeded() throws -> TencentCredentials? {
-        if let credentials = try primary.load() { return credentials }
+        if let credentials = try load() { return credentials }
         guard let credentials = try legacy.load() else { return nil }
         try primary.save(credentials)
         return credentials
@@ -125,6 +168,7 @@ final class PersistentCredentialStore: CredentialStore {
 
     func delete() throws {
         try primary.delete()
+        try perUserFallback?.delete()
         try legacy.delete()
     }
 }

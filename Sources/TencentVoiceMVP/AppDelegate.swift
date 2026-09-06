@@ -1,4 +1,5 @@
 import AppKit
+import RimeSyncCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -8,22 +9,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let menu: StatusMenuController
     private let coordinator: SessionCoordinator
     private let localUsageStore: LocalUsageStore
+    private let sharedUsageStore: SharedUsageStore
+    private let rimeThemeStore: RimeThemeStore
+    private let rimeBackupRetentionStore: RimeBackupRetentionStore
+    private let permissionChecker: SystemPrivacyPermissionChecker
+    private let rimeReviewCoordinator: RimeReviewSyncCoordinator?
     private var settingsWindowController: SettingsWindowController?
+    private var rimeDictionaryWindowController: RimeDictionaryWindowController?
     private var usageMonitorTask: Task<Void, Never>?
+    private var rimeThemeSelectionTask: Task<Void, Never>?
+    private var rimeSyncTask: Task<Void, Never>?
     private var cachedCredentials: TencentCredentials?
     private var activeUsageSessionID: UUID?
 
     override init() {
         let settingsStore = UserDefaultsSettingsStore()
-        let credentialStore = PersistentCredentialStore()
+        let credentialStore = PersistentCredentialStore(
+            perUserFallback: LocalYAMLCredentialStore()
+        )
         let hotkeyManager = CarbonHotkeyManager()
         let menu = StatusMenuController()
         let localUsageStore = LocalUsageStore()
+        let sharedUsageStore = SharedUsageStore()
+        let rimeThemeStore = RimeThemeStore()
+        let permissionChecker = SystemPrivacyPermissionChecker()
+        let rimeBackupRetentionStore = RimeBackupRetentionStore(
+            policy: RimeBackupSettings.loadPolicy()
+        )
+        let localRimeDirectory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Rime", isDirectory: true)
+        let sharedRimeRoot = URL(fileURLWithPath: "/Users/Shared/RimeSync", isDirectory: true)
+        let installationURL = localRimeDirectory.appendingPathComponent("installation.yaml")
+        var rimeReviewCoordinator: RimeReviewSyncCoordinator?
+        let installationID: String?
+        do {
+            installationID = try RimeInstallationFile.loading(from: installationURL)?.installationID
+        } catch {
+            installationID = nil
+        }
+        if let installationID {
+            let rimeMaintenance = SquirrelMaintenance()
+            let rimeConfiguration = SyncConfiguration(
+                localRimeDirectory: localRimeDirectory,
+                sharedRoot: sharedRimeRoot,
+                installationID: installationID
+            )
+            let ordinaryRimeSync = DefaultRimeSyncEngine(
+                configuration: rimeConfiguration,
+                maintenance: rimeMaintenance,
+                retentionStore: rimeBackupRetentionStore
+            )
+            rimeReviewCoordinator = RimeReviewSyncCoordinator(
+                configuration: rimeConfiguration,
+                maintenance: rimeMaintenance,
+                reloader: rimeMaintenance,
+                ordinarySync: ordinaryRimeSync,
+                retentionStore: rimeBackupRetentionStore
+            )
+        }
         self.settingsStore = settingsStore
         self.credentialStore = credentialStore
         self.hotkeyManager = hotkeyManager
         self.menu = menu
         self.localUsageStore = localUsageStore
+        self.sharedUsageStore = sharedUsageStore
+        self.rimeThemeStore = rimeThemeStore
+        self.rimeBackupRetentionStore = rimeBackupRetentionStore
+        self.permissionChecker = permissionChecker
+        self.rimeReviewCoordinator = rimeReviewCoordinator
         coordinator = SessionCoordinator(
             asr: TencentASRClient(),
             audio: SystemAudioCapture(),
@@ -53,11 +106,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Task { @MainActor [weak self] in
                     await self?.toggleRecording()
                 }
+            },
+            onSelectRimeTheme: { [weak self] themeID in
+                self?.selectRimeTheme(themeID)
+            },
+            onManageRimeDictionary: { [weak self] in
+                self?.showRimeDictionaryManager()
+            },
+            onSyncRimeDictionary: { [weak self] in
+                self?.syncRimeDictionary()
             }
         )
+        refreshRimeThemes()
         registerHotkey()
         localUsageStore.migrateLegacyUnscopedUsage(to: TencentEnginePreset.standard.rawValue)
-        localUsageStore.recoverAbandonedSession()
+        _ = try? sharedUsageStore.recoverAbandonedSessions()
+        migrateLocalUsageIfNeeded()
         updateLocalUsageDisplay()
         startLocalUsageMonitor()
     }
@@ -92,6 +156,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         usageMonitorTask?.cancel()
+        rimeThemeSelectionTask?.cancel()
+        rimeSyncTask?.cancel()
+        rimeDictionaryWindowController?.close()
         hotkeyManager.unregister()
         endTrackedUsageSession()
         coordinator.cancel()
@@ -100,6 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func registerHotkey() {
         let settings = settingsStore.load()
+        menu.update(shortcut: settings.shortcut)
         do {
             try hotkeyManager.register(
                 settings.shortcut,
@@ -125,27 +193,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let settings = settingsStore.load()
+        var settings = settingsStore.load()
         let credentials = loadCredentialsForSettings()
-        let controller = SettingsWindowController(settings: settings, credentials: credentials ?? nil) { [weak self] newSettings, newCredentials in
-            guard let self else { return }
-            // Credentials must be persisted before attempting a potentially conflicting hotkey.
-            try credentialStore.save(newCredentials)
-            cachedCredentials = newCredentials
-            try hotkeyManager.register(
+        if let credentials,
+           let sharedHours = try? sharedUsageStore.prepaidQuotaHours(
+               for: credentials,
+               engineModelType: settings.engineModelType
+           ) {
+            settings.prepaidQuotaHoursByModel[settings.engineModelType] = sharedHours
+        }
+        let controller = SettingsWindowController(
+            settings: settings,
+            credentials: credentials,
+            onSave: { [weak self] newSettings, newCredentials in
+                guard let self else { return }
+                // Credentials must be persisted before attempting a potentially conflicting hotkey.
+                try credentialStore.save(newCredentials)
+                cachedCredentials = newCredentials
+                try sharedUsageStore.setPrepaidQuotaHours(
+                    newSettings.prepaidQuotaHoursByModel[newSettings.engineModelType],
+                    for: newCredentials,
+                    engineModelType: newSettings.engineModelType
+                )
+                try hotkeyManager.register(
                     newSettings.shortcut,
                     onPress: { [weak self] in
                         Task { @MainActor [weak self] in await self?.toggleRecording() }
                     },
                     onRelease: {}
-            )
-            settingsStore.save(newSettings)
-            menu.update(status: "就绪 · \(ShortcutFormatter.string(for: newSettings.shortcut))")
-            updateLocalUsageDisplay()
-        } onClose: { [weak self] in
-            guard self != nil else { return }
-            NSApp.setActivationPolicy(.accessory)
-        }
+                )
+                menu.update(shortcut: newSettings.shortcut)
+                settingsStore.save(newSettings)
+                migrateLocalUsageIfNeeded()
+                menu.update(status: "就绪 · \(ShortcutFormatter.string(for: newSettings.shortcut))")
+                updateLocalUsageDisplay()
+            },
+            onTestConnection: { credentials, engineModelType in
+                let configuration = TencentSessionConfiguration(
+                    appID: credentials.appID,
+                    secretID: credentials.secretID,
+                    secretKey: credentials.secretKey,
+                    engineModelType: engineModelType,
+                    voiceID: UUID().uuidString
+                )
+                try await TencentASRClient().testConnection(configuration: configuration)
+            },
+            permissionChecker: permissionChecker,
+            onClose: { [weak self] in
+                guard self != nil else { return }
+                NSApp.setActivationPolicy(.accessory)
+            }
+        )
         settingsWindowController = controller
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -155,14 +253,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.window?.orderFrontRegardless()
     }
 
+    private func refreshRimeThemes() {
+        do {
+            menu.update(rimeThemes: try rimeThemeStore.load())
+        } catch {
+            menu.update(rimeThemeError: error.localizedDescription)
+        }
+    }
+
+    private func selectRimeTheme(_ themeID: String) {
+        guard rimeThemeSelectionTask == nil else { return }
+        rimeThemeSelectionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { rimeThemeSelectionTask = nil }
+            do {
+                menu.update(rimeThemes: try await rimeThemeStore.select(themeID: themeID))
+            } catch is CancellationError {
+                return
+            } catch {
+                menu.update(rimeThemeError: error.localizedDescription)
+            }
+        }
+    }
+
+    private func showRimeDictionaryManager() {
+        guard let rimeReviewCoordinator else {
+            menu.update(status: "Rime 词库管理不可用")
+            return
+        }
+        if let existing = rimeDictionaryWindowController, existing.window?.isVisible == true {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+            existing.window?.makeKeyAndOrderFront(nil)
+            existing.window?.orderFrontRegardless()
+            return
+        }
+        let controller = RimeDictionaryWindowController(reviewCoordinator: rimeReviewCoordinator)
+        rimeDictionaryWindowController = controller
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        controller.showWindow(nil)
+        controller.window?.center()
+        controller.window?.makeKeyAndOrderFront(nil)
+        controller.window?.orderFrontRegardless()
+        controller.begin()
+    }
+
+    private func syncRimeDictionary() {
+        guard let rimeReviewCoordinator else {
+            menu.update(status: "Rime 词库同步不可用")
+            return
+        }
+        guard rimeSyncTask == nil else { return }
+
+        menu.update(status: "正在同步 Rime 词库…")
+        rimeSyncTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { rimeSyncTask = nil }
+            let result: Result<RimeUserDictionarySyncReport, Error> = await Task.detached(priority: .userInitiated) {
+                do {
+                    return .success(try rimeReviewCoordinator.syncUserDictionary())
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+            switch result {
+            case let .success(report):
+                menu.update(status: "Rime 词库同步完成 · \(report.entryCount) 条审核记录")
+                rimeDictionaryWindowController?.reloadFromStoredSnapshot()
+            case let .failure(error):
+                menu.update(status: "Rime 词库同步失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
     private func toggleRecording() async {
         switch coordinator.state {
         case .idle:
             let engineModelType = settingsStore.load().engineModelType
             try? await coordinator.begin()
             if coordinator.state == .listening {
-                activeUsageSessionID = UUID()
-                localUsageStore.beginSession(for: engineModelType)
+                guard let credentials = loadCredentials() else { return }
+                activeUsageSessionID = try? sharedUsageStore.beginSession(
+                    for: credentials,
+                    engineModelType: engineModelType
+                )
                 updateLocalUsageDisplay()
             }
         case .connecting:
@@ -212,26 +387,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateLocalUsageDisplay(at date: Date = Date()) {
         let settings = settingsStore.load()
-        localUsageStore.touchSession(at: date)
-        let prepaidHours = settings.prepaidQuotaHoursByModel[settings.engineModelType]
-        let hasPrepaidQuota = prepaidHours.map { $0 > 0 } ?? false
-        let summary = TencentUsageSummary(
-            localUsedSeconds: hasPrepaidQuota
-                ? localUsageStore.currentTotalSeconds(for: settings.engineModelType, at: date)
-                : localUsageStore.currentSeconds(for: settings.engineModelType, at: date),
-            quotaSeconds: TencentUsageQuota.seconds(
-                for: settings.engineModelType,
-                prepaidHours: prepaidHours
-            ),
-            engineModelType: settings.engineModelType,
-            isPrepaid: hasPrepaidQuota
+        guard let credentials = loadCredentials() else {
+            menu.update(usage: "共享用量：请先在设置中配置腾讯凭证")
+            return
+        }
+        if let activeUsageSessionID {
+            try? sharedUsageStore.touchSession(activeUsageSessionID, at: date)
+        }
+        let sharedPrepaidHours = try? sharedUsageStore.prepaidQuotaHours(
+            for: credentials,
+            engineModelType: settings.engineModelType
         )
-        menu.update(usage: summary.displayText)
+        let prepaidHours = sharedPrepaidHours ?? settings.prepaidQuotaHoursByModel[settings.engineModelType]
+        let hasPrepaidQuota = prepaidHours.map { $0 > 0 } ?? false
+        do {
+            let usedSeconds = hasPrepaidQuota
+                ? try sharedUsageStore.currentTotalSeconds(
+                    for: credentials,
+                    engineModelType: settings.engineModelType,
+                    at: date
+                )
+                : try sharedUsageStore.currentSeconds(
+                    for: credentials,
+                    engineModelType: settings.engineModelType,
+                    at: date
+                )
+            let summary = TencentUsageSummary(
+                localUsedSeconds: usedSeconds,
+                quotaSeconds: TencentUsageQuota.seconds(
+                    for: settings.engineModelType,
+                    prepaidHours: prepaidHours
+                ),
+                engineModelType: settings.engineModelType,
+                isPrepaid: hasPrepaidQuota,
+                sharedAcrossUsers: true
+            )
+            menu.update(usage: summary.displayText)
+        } catch {
+            menu.update(usage: "共享用量读取失败：\(error.localizedDescription)")
+        }
     }
 
     private func endTrackedUsageSession(at date: Date = Date()) {
-        guard activeUsageSessionID != nil else { return }
+        guard let sessionID = activeUsageSessionID else { return }
         activeUsageSessionID = nil
-        localUsageStore.endSession(at: date)
+        _ = try? sharedUsageStore.endSession(sessionID, at: date)
+    }
+
+    private func migrateLocalUsageIfNeeded() {
+        guard let credentials = loadCredentials() else { return }
+        do {
+            try sharedUsageStore.migrateLocalUsageIfNeeded(
+                from: localUsageStore,
+                for: credentials
+            )
+            let settings = settingsStore.load()
+            for (engineModelType, hours) in settings.prepaidQuotaHoursByModel {
+                if try sharedUsageStore.prepaidQuotaHours(
+                    for: credentials,
+                    engineModelType: engineModelType
+                ) == nil {
+                    try sharedUsageStore.setPrepaidQuotaHours(
+                        hours,
+                        for: credentials,
+                        engineModelType: engineModelType
+                    )
+                }
+            }
+        } catch {
+            menu.update(usage: "共享用量迁移失败：\(error.localizedDescription)")
+        }
     }
 }

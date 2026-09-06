@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 1254 1254" fill="none">
+  <title>Voice input macOS template status bar icon</title>
+  <desc>Transparent monochrome mask: outlined speech bubble with four voice bars.</desc>
+  <g transform="translate(627 627) scale(1.06) translate(-627 -627)">
+    <path fill="#FFFFFF" fill-rule="evenodd" d="M627 68C322 68 74 315 74 620c0 111 33 214 89 301l-58 211c-9 34 27 62 59 46l191-96c83 44 175 69 272 69 305 0 553-247 553-553S932 68 627 68Z M627 140C358 140 146 356 146 620c0 94 28 181 78 256l-45 182c-4 16 10 28 25 21l154-77c81 43 173 67 269 67 269 0 485-216 485-449S896 140 627 140Z"/>
+    <g transform="translate(609 611) scale(.95) translate(-627 -627)">
+      <g fill="#FFFFFF" stroke="none">
+        <rect x="289" y="511" width="139" height="249" rx="69.5"/>
+        <rect x="484" y="366" width="139" height="454" rx="69.5"/>
+        <rect x="681" y="473" width="139" height="317" rx="69.5"/>
+        <rect x="882" y="383" width="70" height="498" rx="35"/>
+      </g>
+    </g>
+  </g>
+</svg>

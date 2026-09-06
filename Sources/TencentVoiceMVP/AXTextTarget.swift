@@ -7,6 +7,7 @@ final class AXTextTarget: TextTarget {
     private var targetElement: AXUIElement?
     private var targetProcessID: pid_t?
     private var targetApplicationProcessID: pid_t?
+    private var expectedKeyboardSelection: TextRange?
     private let keyboardEventSender = KeyboardEventSender()
 
     func capture() throws -> TextSnapshot {
@@ -14,11 +15,12 @@ final class AXTextTarget: TextTarget {
         targetElement = nil
         targetProcessID = nil
         targetApplicationProcessID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        expectedKeyboardSelection = nil
 
         // Some Electron/WebKit controls expose neither a stable AX value nor
         // a stable focused AX element while the DOM is being rebuilt. That is
         // still a valid keyboard target as long as a frontmost application is
-        // known; the keyboard transaction below owns only the text it sends.
+        // known; the keyboard append path only owns the text it sends.
         let element = try? focusedElement()
         targetElement = element
         if let element {
@@ -37,15 +39,16 @@ final class AXTextTarget: TextTarget {
         // Electron/web content controls do not always expose kAXValueAttribute,
         // even though they still accept Unicode keyboard events. Keep the
         // focused element as a keyboard target instead of falling all the way
-        // back to append-only mode. The keyboard transaction only needs the
-        // caret/selection to exist at capture time; it owns the text it sends
-        // afterwards and never needs to rewrite the document prefix.
+        // back to append-only mode. The keyboard append path uses the caret at
+        // capture time and never rewrites the document prefix afterwards.
         let text = element.flatMap { readableText(in: $0) } ?? ""
-        let selection = element.flatMap { readableSelection(in: $0) }
+        let readableKeyboardSelection = element.flatMap { readableSelection(in: $0) }
+        let selection = readableKeyboardSelection
             ?? TextRange(location: text.utf16.count, length: 0)
         let hasReadableAXTextState = element.map {
             readableText(in: $0) != nil && readableSelection(in: $0) != nil
         } ?? false
+        expectedKeyboardSelection = readableKeyboardSelection
         return TextSnapshot(
             element: element,
             text: text,
@@ -114,18 +117,38 @@ final class AXTextTarget: TextTarget {
         return newRange
     }
 
-    func replacePastedText(previousText: String, with text: String) throws {
-        try ensureTargetApplicationIsFrontmost()
-        try keyboardEventSender.replace(
-            previousText: previousText,
+    func paste(_ text: String) throws {
+        try ensureKeyboardTargetIsSafe()
+        try keyboardEventSender.send(text, processID: eventProcessID)
+        if let selection = expectedKeyboardSelection {
+            expectedKeyboardSelection = TextRange(
+                location: selection.location + text.utf16.count,
+                length: 0
+            )
+        }
+    }
+
+    func replaceTrailingText(_ previousText: String, with text: String) throws {
+        try ensureKeyboardTargetIsSafe()
+        let updatedSelection: TextRange?
+        if let selection = expectedKeyboardSelection {
+            guard selection.length == 0,
+                  selection.location >= previousText.utf16.count else {
+                throw TextTargetError.targetChanged
+            }
+            updatedSelection = TextRange(
+                location: selection.location - previousText.utf16.count + text.utf16.count,
+                length: 0
+            )
+        } else {
+            updatedSelection = nil
+        }
+        try keyboardEventSender.replaceTrailingText(
+            previousText,
             with: text,
             processID: eventProcessID
         )
-    }
-
-    func paste(_ text: String) throws {
-        try ensureTargetApplicationIsFrontmost()
-        try keyboardEventSender.send(text, processID: eventProcessID)
+        expectedKeyboardSelection = updatedSelection
     }
 
     func copyToClipboard(_ text: String) throws {
@@ -161,12 +184,17 @@ final class AXTextTarget: TextTarget {
         return status == .success && settable.boolValue
     }
 
-    private func ensureTargetIsFocused() throws {
+    private func ensureKeyboardTargetIsSafe() throws {
         try ensureTargetApplicationIsFrontmost()
         guard let targetElement else { return }
         let currentElement = try focusedElement()
         guard CFEqual(currentElement, targetElement) else {
             throw TextTargetError.targetChanged
+        }
+        if let expectedKeyboardSelection {
+            guard readableSelection(in: currentElement) == expectedKeyboardSelection else {
+                throw TextTargetError.targetChanged
+            }
         }
     }
 
@@ -213,12 +241,9 @@ final class AXTextTarget: TextTarget {
 
     private func requestInputPermissionsIfNeeded() throws {
         guard AXIsProcessTrusted() else {
-            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-            _ = AXIsProcessTrustedWithOptions(options)
             throw TextTargetError.accessibilityDenied
         }
         guard CGPreflightPostEventAccess() else {
-            _ = CGRequestPostEventAccess()
             throw TextTargetError.postEventDenied
         }
     }
@@ -242,14 +267,8 @@ final class AXTextTarget: TextTarget {
 
 private final class KeyboardEventSender: @unchecked Sendable {
     private let queue = DispatchQueue(label: "local.tencent.voice.mvp.keyboard-events")
-
-    func replace(previousText: String, with text: String, processID: pid_t?) throws {
-        let delta = PastedTextDelta(previousText: previousText, newText: text)
-        try queue.sync {
-            try sendBackspaces(count: delta.backspaceCount, processID: processID)
-            try sendText(delta.insertion, processID: processID)
-        }
-    }
+    private let leftArrowKeyCode: CGKeyCode = 123
+    private let deleteKeyCode: CGKeyCode = 51
 
     func send(_ text: String, processID: pid_t?) throws {
         try queue.sync {
@@ -257,26 +276,36 @@ private final class KeyboardEventSender: @unchecked Sendable {
         }
     }
 
-    private func sendBackspaces(count: Int, processID: pid_t?) throws {
-        guard count > 0 else { return }
-        guard let source = CGEventSource(stateID: .privateState) else {
-            throw TextTargetError.writeFailed
-        }
-        for _ in 0..<count {
-            guard let keyDown = SyntheticKeyboardEventFactory.keyEvent(
-                source: source,
-                keyCode: 0x33,
-                keyDown: true
-            ),
-                  let keyUp = SyntheticKeyboardEventFactory.keyEvent(
-                    source: source,
-                    keyCode: 0x33,
-                    keyDown: false
-                  ) else {
+    func replaceTrailingText(
+        _ previousText: String,
+        with text: String,
+        processID: pid_t?
+    ) throws {
+        try queue.sync {
+            guard !previousText.isEmpty else {
+                try sendText(text, processID: processID)
+                return
+            }
+            guard let source = CGEventSource(stateID: .privateState) else {
                 throw TextTargetError.writeFailed
             }
-            post(keyDown, processID: processID)
-            post(keyUp, processID: processID)
+            for _ in previousText {
+                try sendKey(
+                    keyCode: leftArrowKeyCode,
+                    flags: .maskShift,
+                    source: source,
+                    processID: processID
+                )
+            }
+            if text.isEmpty {
+                try sendKey(
+                    keyCode: deleteKeyCode,
+                    source: source,
+                    processID: processID
+                )
+            } else {
+                try sendText(text, processID: processID)
+            }
         }
     }
 
@@ -317,6 +346,30 @@ private final class KeyboardEventSender: @unchecked Sendable {
         }
     }
 
+    private func sendKey(
+        keyCode: CGKeyCode,
+        flags: CGEventFlags = [],
+        source: CGEventSource,
+        processID: pid_t?
+    ) throws {
+        guard let keyDown = SyntheticKeyboardEventFactory.keyEvent(
+            source: source,
+            keyCode: keyCode,
+            keyDown: true,
+            flags: flags
+        ),
+              let keyUp = SyntheticKeyboardEventFactory.keyEvent(
+                source: source,
+                keyCode: keyCode,
+                keyDown: false,
+                flags: flags
+              ) else {
+            throw TextTargetError.writeFailed
+        }
+        post(keyDown, processID: processID)
+        post(keyUp, processID: processID)
+    }
+
     private func post(_ event: CGEvent, processID: pid_t?) {
         if let processID {
             event.postToPid(processID)
@@ -330,14 +383,15 @@ enum SyntheticKeyboardEventFactory {
     static func keyEvent(
         source: CGEventSource,
         keyCode: CGKeyCode,
-        keyDown: Bool
+        keyDown: Bool,
+        flags: CGEventFlags = []
     ) -> CGEvent? {
         guard let event = CGEvent(
             keyboardEventSource: source,
             virtualKey: keyCode,
             keyDown: keyDown
         ) else { return nil }
-        event.flags = []
+        event.flags = flags
         return event
     }
 

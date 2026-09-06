@@ -1,11 +1,32 @@
 import Foundation
 
+protocol TencentWebSocket: AnyObject {
+    func resume()
+    func receive() async throws -> URLSessionWebSocketTask.Message
+    func send(_ message: URLSessionWebSocketTask.Message) async throws
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
+}
+
+extension URLSessionWebSocketTask: TencentWebSocket {}
+
 final class TencentASRClient: RealtimeASRClient {
-    private var socket: URLSessionWebSocketTask?
+    private var socket: TencentWebSocket?
     private var continuation: AsyncThrowingStream<ASRUpdate, Error>.Continuation?
     private var receiveTask: Task<Void, Never>?
     private var normalizer = ASRResultNormalizer()
     private var finished = false
+    private let webSocketFactory: (URL) -> TencentWebSocket
+    private let handshakeTimeoutNanoseconds: UInt64
+
+    init(
+        webSocketFactory: @escaping (URL) -> TencentWebSocket = {
+            URLSession.shared.webSocketTask(with: $0)
+        },
+        handshakeTimeoutNanoseconds: UInt64 = 10 * 1_000_000_000
+    ) {
+        self.webSocketFactory = webSocketFactory
+        self.handshakeTimeoutNanoseconds = handshakeTimeoutNanoseconds
+    }
 
     func start(configuration: TencentSessionConfiguration) async throws -> AsyncThrowingStream<ASRUpdate, Error> {
         cancel()
@@ -19,7 +40,7 @@ final class TencentASRClient: RealtimeASRClient {
             expired: now + 600,
             nonce: Int.random(in: 1...Int.max)
         )
-        let task = URLSession.shared.webSocketTask(with: url)
+        let task = webSocketFactory(url)
         socket = task
 
         let stream = AsyncThrowingStream<ASRUpdate, Error> { [weak self] continuation in
@@ -29,8 +50,7 @@ final class TencentASRClient: RealtimeASRClient {
         task.resume()
 
         do {
-            let firstMessage = try await task.receive()
-            try validateHandshake(firstMessage)
+            try await performHandshake(on: task)
         } catch {
             cancel()
             throw error
@@ -41,6 +61,32 @@ final class TencentASRClient: RealtimeASRClient {
             await self.receiveLoop(task: task)
         }
         return stream
+    }
+
+    func testConnection(configuration: TencentSessionConfiguration) async throws {
+        cancel()
+        finished = false
+
+        let now = Int(Date().timeIntervalSince1970)
+        let url = try TencentSigner.makeURL(
+            configuration: configuration,
+            timestamp: now,
+            expired: now + 600,
+            nonce: Int.random(in: 1...Int.max)
+        )
+        let task = webSocketFactory(url)
+        socket = task
+        task.resume()
+
+        do {
+            try await performHandshake(on: task)
+            task.cancel(with: .normalClosure, reason: Data("connection-test".utf8))
+            socket = nil
+            finished = true
+        } catch {
+            cancel()
+            throw error
+        }
     }
 
     func sendAudio(_ data: Data) async throws {
@@ -66,15 +112,28 @@ final class TencentASRClient: RealtimeASRClient {
         finished = true
     }
 
-    private func validateHandshake(_ message: URLSessionWebSocketTask.Message) throws {
-        let data = try message.dataValue
+    private func performHandshake(on task: TencentWebSocket) async throws {
+        let firstMessage = try await withThrowingTaskGroup(
+            of: URLSessionWebSocketTask.Message.self
+        ) { group in
+            group.addTask {
+                try await task.receive()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: self.handshakeTimeoutNanoseconds)
+                throw TencentASRError.handshakeTimeout
+            }
+            defer { group.cancelAll() }
+            return try await group.next()!
+        }
+        let data = try firstMessage.dataValue
         let response = try JSONDecoder().decode(TencentWireResponse.self, from: data)
         guard response.code == 0 else {
             throw TencentASRError.server(code: response.code, message: response.message)
         }
     }
 
-    private func receiveLoop(task: URLSessionWebSocketTask) async {
+    private func receiveLoop(task: TencentWebSocket) async {
         do {
             while !Task.isCancelled {
                 let message = try await task.receive()
@@ -94,7 +153,8 @@ final class TencentASRClient: RealtimeASRClient {
                         isFinal: response.isFinal == 1 || result.sliceType == 2,
                         isSegmentStart: result.sliceType == 0,
                         sliceType: result.sliceType,
-                        wireFinal: response.isFinal == 1
+                        wireFinal: response.isFinal == 1,
+                        stablePrefixText: result.stablePrefixText
                     ))
                     continuation?.yield(update)
                 }

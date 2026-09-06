@@ -1,0 +1,17 @@
+---
+name: wanxiang_entry
+version: "2024.01"
+sort: by_weight
+import_tables:
+  - wanxiang_dicts/zi
+  - wanxiang_dicts/jichu
+  - wanxiang_dicts/duoyin
+  - wanxiang_dicts/diming
+  - wanxiang_dicts/renming
+  - wanxiang_dicts/shici
+  - wanxiang_dicts/shuxue
+  - wanxiang_dicts/wuzhong
+  - wanxiang_dicts/dikuang
+  - wanxiang_dicts/cuoyin
+  - wanxiang_dicts/lianxiang
+...

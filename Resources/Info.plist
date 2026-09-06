@@ -4,18 +4,20 @@
 <dict>
 	<key>CFBundleDisplayName</key>
 	<string>腾讯语音输入 MVP</string>
+	<key>CFBundleExecutable</key>
+	<string>TencentVoiceMVP</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.tencent-voice-mvp</string>
 	<key>CFBundleName</key>
 	<string>TencentVoiceMVP</string>
-	<key>CFBundleExecutable</key>
-	<string>TencentVoiceMVP</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>44</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>

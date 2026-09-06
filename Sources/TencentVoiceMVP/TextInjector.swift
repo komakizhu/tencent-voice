@@ -5,112 +5,152 @@ final class TextInjector {
     private enum Mode: Equatable {
         case inactive
         case ax
-        case keyboardTransactional
-        case keyboardAppendOnly
+        case keyboardLiveTail
         case safeCopy
     }
 
     private let target: TextTarget
+    private let keyboardPacing: KeyboardPacingConfiguration
+    private let pacingClock: KeyboardPacingClock
+    private var keyboardPacer: KeyboardCharacterPacer?
     private var snapshot: TextSnapshot?
     private var ownedRange = TextRange(location: 0, length: 0)
     private var lastDocumentText = ""
-    private var lastRenderedText = ""
-    private var lastCommittedText = ""
-    private var lastAppendedText = ""
-    private var lastActiveSegmentID: Int?
-    private var lastActiveText = ""
+    private var lastProjectionText = ""
+    private var lastSubmittedText = ""
+    // Revisions inside this tail are the normal fast path. Deeper revisions
+    // still update immediately, but are counted separately because they select
+    // a longer suffix before replacing it in one transaction.
+    private let deepReplacementThreshold = 12
     private var mode: Mode = .inactive
     private(set) var writeCount = 0
     private(set) var backspaceCount = 0
+    private(set) var deepReplacementCount = 0
+    private(set) var maximumTrailingReplacementLength = 0
     private(set) var errorCount = 0
     private(set) var degradationReason: String?
 
-    init(target: TextTarget) {
+    init(
+        target: TextTarget,
+        keyboardSmoothing: KeyboardSmoothingConfiguration = .immediate,
+        pacingClock: KeyboardPacingClock? = nil
+    ) {
         self.target = target
+        self.keyboardPacing = keyboardSmoothing
+        self.pacingClock = pacingClock ?? ContinuousKeyboardPacingClock()
     }
 
     var modeDescription: String {
         switch mode {
         case .inactive: return "inactive"
         case .ax: return "ax"
-        case .keyboardTransactional: return "keyboard_transactional"
-        case .keyboardAppendOnly: return "keyboard_append_only"
+        case .keyboardLiveTail: return "keyboard_live_tail"
         case .safeCopy: return "safe_copy"
         }
     }
 
     func begin() throws {
+        keyboardPacer?.cancel()
+        keyboardPacer = nil
         do {
             let captured = try target.capture()
             snapshot = captured
             ownedRange = captured.selection
             lastDocumentText = captured.text
-            lastRenderedText = ""
-            lastCommittedText = ""
-            lastAppendedText = ""
-            lastActiveSegmentID = nil
-            lastActiveText = ""
+            lastProjectionText = ""
+            lastSubmittedText = ""
             writeCount = 0
             backspaceCount = 0
+            deepReplacementCount = 0
+            maximumTrailingReplacementLength = 0
             errorCount = 0
             degradationReason = nil
-            mode = captured.supportsAXReplacement ? .ax : .keyboardTransactional
+            mode = captured.supportsAXReplacement ? .ax : .keyboardLiveTail
+            installKeyboardPacerIfNeeded()
         } catch TextTargetError.unsupported, TextTargetError.targetChanged, TextTargetError.writeFailed {
             snapshot = nil
             lastDocumentText = ""
-            lastRenderedText = ""
-            lastCommittedText = ""
-            lastAppendedText = ""
-            lastActiveSegmentID = nil
-            lastActiveText = ""
+            lastProjectionText = ""
+            lastSubmittedText = ""
             writeCount = 0
             backspaceCount = 0
+            deepReplacementCount = 0
+            maximumTrailingReplacementLength = 0
             errorCount = 0
             degradationReason = nil
-            mode = .keyboardAppendOnly
+            mode = .keyboardLiveTail
+            installKeyboardPacerIfNeeded()
         }
     }
 
     func apply(projection: ASRProjection) {
-        guard projection.changed || projection.isFinal else { return }
+        guard projection.changed || projection.isFinal || projection.isStreamEnded else {
+            return
+        }
 
         switch mode {
         case .ax:
             applyAX(projection)
-        case .keyboardTransactional:
-            applyKeyboardTransactional(projection)
-        case .keyboardAppendOnly:
-            applyKeyboardAppendOnly(projection)
+        case .keyboardLiveTail:
+            applyKeyboardLiveTail(projection)
         case .safeCopy, .inactive:
             break
         }
     }
 
-    func finish(finalText: String) throws {
-        defer { reset() }
+    func beginStopping() {
+        guard mode == .keyboardLiveTail, let keyboardPacer else { return }
+        do {
+            try keyboardPacer.beginStopping()
+        } catch {
+            enterSafeCopy(after: error)
+        }
+    }
+
+    func finish(finalText: String) async throws {
+        let completionText = finalText.isEmpty ? lastProjectionText : finalText
 
         switch mode {
-        case .keyboardAppendOnly:
+        case .keyboardLiveTail:
             do {
-                guard finalText.hasPrefix(lastAppendedText) else {
-                    enterSafeCopy(after: TextTargetError.targetChanged)
-                    break
+                if let keyboardPacer {
+                    try await keyboardPacer.finish(candidate: completionText)
+                } else {
+                    try applyKeyboardCandidate(completionText)
                 }
-                let suffix = String(finalText.dropFirst(lastAppendedText.count))
-                if !suffix.isEmpty {
-                    try target.paste(suffix)
-                    writeCount += 1
-                }
-                lastAppendedText = finalText
             } catch {
                 enterSafeCopy(after: error)
             }
             if mode == .safeCopy {
-                try target.copyToClipboard(finalText)
+                try target.copyToClipboard(completionText)
             }
         case .safeCopy:
-            try target.copyToClipboard(finalText)
-        case .ax, .keyboardTransactional, .inactive:
+            try target.copyToClipboard(completionText)
+        case .ax, .inactive:
+            break
+        }
+    }
+
+    func finishImmediately(finalText: String) throws {
+        let completionText = finalText.isEmpty ? lastProjectionText : finalText
+
+        switch mode {
+        case .keyboardLiveTail:
+            do {
+                if let keyboardPacer {
+                    try keyboardPacer.finishImmediately(candidate: completionText)
+                } else {
+                    try applyKeyboardCandidate(completionText)
+                }
+            } catch {
+                enterSafeCopy(after: error)
+            }
+            if mode == .safeCopy {
+                try target.copyToClipboard(completionText)
+            }
+        case .safeCopy:
+            try target.copyToClipboard(completionText)
+        case .ax, .inactive:
             break
         }
     }
@@ -120,7 +160,7 @@ final class TextInjector {
     }
 
     private func applyAX(_ projection: ASRProjection) {
-        guard projection.text != lastRenderedText,
+        guard projection.text != lastProjectionText,
               let snapshot else { return }
         do {
             let previousRange = ownedRange
@@ -138,90 +178,115 @@ final class TextInjector {
             )
             ownedRange = newRange
             lastDocumentText = document as String
-            lastRenderedText = projection.text
+            lastProjectionText = projection.text
             writeCount += 1
         } catch {
             enterSafeCopy(after: error)
         }
     }
 
-    private func applyKeyboardTransactional(_ projection: ASRProjection) {
-        guard let activeSegmentID = projection.activeSegmentID else { return }
-
+    private func applyKeyboardLiveTail(_ projection: ASRProjection) {
+        lastProjectionText = projection.text
         do {
-            if lastActiveSegmentID == activeSegmentID {
-                guard projection.committedText == lastCommittedText else {
-                    enterSafeCopy(after: TextTargetError.targetChanged)
-                    return
-                }
-                guard projection.activeSegmentText != lastActiveText else { return }
-                let delta = PastedTextDelta(
-                    previousText: lastActiveText,
-                    newText: projection.activeSegmentText
-                )
-                try target.replacePastedText(
-                    previousText: lastActiveText,
-                    with: projection.activeSegmentText
-                )
-                writeCount += 1
-                backspaceCount += delta.backspaceCount
-            } else {
-                let expectedCommittedText = lastCommittedText + lastActiveText
-                guard projection.committedText.hasPrefix(expectedCommittedText) else {
-                    enterSafeCopy(after: TextTargetError.targetChanged)
-                    return
-                }
-                if !projection.activeSegmentText.isEmpty {
-                    try target.paste(projection.activeSegmentText)
-                    writeCount += 1
-                }
+            guard let keyboardPacer else {
+                try applyKeyboardCandidate(projection.text)
+                return
             }
-
-            lastCommittedText = projection.committedText
-            lastActiveSegmentID = activeSegmentID
-            lastActiveText = projection.activeSegmentText
-            lastRenderedText = projection.text
+            let trigger: KeyboardCharacterPacer.Trigger = if projection.isStreamEnded {
+                .streamEnd
+            } else if projection.isFinal {
+                .segmentFinal
+            } else {
+                .partial
+            }
+            try keyboardPacer.accept(candidate: projection.text, trigger: trigger)
         } catch {
             enterSafeCopy(after: error)
         }
     }
 
-    private func applyKeyboardAppendOnly(_ projection: ASRProjection) {
-        guard projection.committedText.hasPrefix(lastAppendedText) else {
-            enterSafeCopy(after: TextTargetError.targetChanged)
+    private func applyKeyboardCandidate(_ candidateText: String) throws {
+        guard candidateText != lastSubmittedText else { return }
+
+        if candidateText.hasPrefix(lastSubmittedText) {
+            let suffix = String(candidateText.dropFirst(lastSubmittedText.count))
+            if !suffix.isEmpty {
+                try target.paste(suffix)
+                lastSubmittedText = candidateText
+                writeCount += 1
+            }
             return
         }
 
-        do {
-            let suffix = String(projection.committedText.dropFirst(lastAppendedText.count))
-            if !suffix.isEmpty {
-                try target.paste(suffix)
-                lastAppendedText = projection.committedText
-                writeCount += 1
-            }
-            lastRenderedText = projection.text
-        } catch {
-            enterSafeCopy(after: error)
+        let commonPrefix = sharedTextPrefix(lastSubmittedText, candidateText)
+        let previousTail = String(lastSubmittedText.dropFirst(commonPrefix.count))
+        maximumTrailingReplacementLength = max(
+            maximumTrailingReplacementLength,
+            previousTail.count
+        )
+        if previousTail.count > deepReplacementThreshold {
+            deepReplacementCount += 1
         }
+        let replacementTail = String(candidateText.dropFirst(commonPrefix.count))
+        try target.replaceTrailingText(previousTail, with: replacementTail)
+        writeCount += 1
+        lastSubmittedText = candidateText
+    }
+
+    private func installKeyboardPacerIfNeeded() {
+        guard mode == .keyboardLiveTail, keyboardPacing.isEnabled else { return }
+        keyboardPacer = KeyboardCharacterPacer(
+            configuration: keyboardPacing,
+            clock: pacingClock,
+            append: { [weak self] text in
+                guard let self else { throw TextTargetError.writeFailed }
+                try self.appendPacedText(text)
+            },
+            replaceTrailingText: { [weak self] previousText, text in
+                guard let self else { throw TextTargetError.writeFailed }
+                try self.replacePacedTrailingText(previousText, with: text)
+            },
+            onFailure: { [weak self] error in
+                self?.enterSafeCopy(after: error)
+            }
+        )
+        keyboardPacer?.beginSession()
+    }
+
+    private func appendPacedText(_ text: String) throws {
+        try target.paste(text)
+        lastSubmittedText.append(contentsOf: text)
+        writeCount += 1
+    }
+
+    private func replacePacedTrailingText(_ previousText: String, with text: String) throws {
+        guard lastSubmittedText.hasSuffix(previousText) else {
+            throw TextTargetError.targetChanged
+        }
+        try target.replaceTrailingText(previousText, with: text)
+        lastSubmittedText = String(lastSubmittedText.dropLast(previousText.count)) + text
+        writeCount += 1
     }
 
     private func enterSafeCopy(after error: Error) {
+        keyboardPacer?.cancel()
         mode = .safeCopy
         errorCount += 1
         degradationReason = error.localizedDescription
     }
 
     private func reset() {
+        keyboardPacer?.cancel()
+        keyboardPacer = nil
         snapshot = nil
         ownedRange = TextRange(location: 0, length: 0)
         lastDocumentText = ""
-        lastRenderedText = ""
-        lastCommittedText = ""
-        lastAppendedText = ""
-        lastActiveSegmentID = nil
-        lastActiveText = ""
+        lastProjectionText = ""
+        lastSubmittedText = ""
         writeCount = 0
         backspaceCount = 0
+        deepReplacementCount = 0
+        maximumTrailingReplacementLength = 0
         errorCount = 0
         degradationReason = nil
         mode = .inactive

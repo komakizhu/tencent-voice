@@ -173,4 +173,19 @@ final class ASRProjectionAccumulatorTests: XCTestCase {
         XCTAssertEqual(ended?.text, "最后一句")
         XCTAssertEqual(accumulator.renderedText, "最后一句")
     }
+
+    func testProjectionCarriesServerStablePrefixForTheActiveSegment() {
+        var accumulator = ASRProjectionAccumulator()
+
+        let projection = accumulator.apply(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 0,
+            segmentText: "这是一个正在变化的句子",
+            phase: .partial,
+            stablePrefixText: "这是一个"
+        ))
+
+        XCTAssertEqual(projection?.activeStablePrefixText, "这是一个")
+    }
 }

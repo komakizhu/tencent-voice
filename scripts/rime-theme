@@ -1,0 +1,234 @@
+#!/bin/zsh
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+用法：
+  scripts/rime-theme list
+  scripts/rime-theme current
+  scripts/rime-theme use <主题名> [--no-reload]
+  scripts/rime-theme next [--no-reload]
+
+默认操作当前用户的 ~/Library/Rime。也可以用 RIME_DIR 指定配置目录。
+例如：RIME_DIR=/path/to/Rime scripts/rime-theme use paper
+EOF
+}
+
+if (( $# == 0 )); then
+  usage >&2
+  exit 2
+fi
+
+command_name="$1"
+shift
+
+user_name="$(/usr/bin/id -un)"
+user_home="$(/usr/bin/dscl . -read "/Users/$user_name" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+if [[ -z "$user_home" ]]; then
+  user_home="/Users/$user_name"
+fi
+rime_dir="${RIME_DIR:-${user_home}/Library/Rime}"
+rime_dir="${rime_dir:A}"
+live_rime_dir="${user_home}/Library/Rime"
+live_rime_dir="${live_rime_dir:A}"
+config_file="${rime_dir}/squirrel.custom.yaml"
+if [[ -n "${SQUIRREL_BIN:-}" ]]; then
+  squirrel_bin="$SQUIRREL_BIN"
+elif [[ -x "${user_home}/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel" ]]; then
+  squirrel_bin="${user_home}/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel"
+else
+  squirrel_bin="/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel"
+fi
+
+if [[ ! -f "$config_file" ]]; then
+  print -u2 "找不到配置文件：$config_file"
+  print -u2 "请先将 squirrel.custom.yaml 放入该 Rime 目录，或设置 RIME_DIR。"
+  exit 1
+fi
+
+if [[ -L "$config_file" ]]; then
+  print -u2 "配置文件是符号链接，为避免误替换链接目标而停止：$config_file"
+  exit 1
+fi
+
+scheme_ids() {
+  /usr/bin/awk '
+    /^  "preset_color_schemes\/[A-Za-z0-9_-]+":[[:space:]]*$/ {
+      id = $0
+      sub(/^  "preset_color_schemes\//, "", id)
+      sub(/"\:[[:space:]]*$/, "", id)
+      print id
+      next
+    }
+    /^  preset_color_schemes:[[:space:]]*$/ { in_schemes = 1; next }
+    in_schemes && /^  [^[:space:]][^:]*:/ { in_schemes = 0 }
+    in_schemes && /^    [A-Za-z0-9_-]+:[[:space:]]*$/ {
+      id = $0
+      sub(/^    /, "", id)
+      sub(/:[[:space:]]*$/, "", id)
+      print id
+    }
+  ' "$config_file"
+}
+
+has_scheme() {
+  local wanted="$1"
+  scheme_ids | /usr/bin/awk -v wanted="$wanted" '$0 == wanted { found = 1 } END { exit(found ? 0 : 1) }'
+}
+
+light_scheme() {
+  /usr/bin/awk '
+    /^  style:[[:space:]]*$/ { in_style = 1; next }
+    in_style && /^  [^[:space:]][^:]*:/ { in_style = 0 }
+    in_style && /^    color_scheme:[[:space:]]*/ {
+      value = $0
+      sub(/^    color_scheme:[[:space:]]*/, "", value)
+      print value
+      exit
+    }
+  ' "$config_file"
+}
+
+dark_scheme() {
+  /usr/bin/awk '
+    /^  style:[[:space:]]*$/ { in_style = 1; next }
+    in_style && /^  [^[:space:]][^:]*:/ { in_style = 0 }
+    in_style && /^    color_scheme_dark:[[:space:]]*/ {
+      value = $0
+      sub(/^    color_scheme_dark:[[:space:]]*/, "", value)
+      print value
+      exit
+    }
+  ' "$config_file"
+}
+
+list_themes() {
+  local id
+  while IFS= read -r id; do
+    case "$id" in
+      *_dark) continue ;;
+    esac
+    if has_scheme "${id}_dark"; then
+      print "${id}  (暗色：${id}_dark)"
+    else
+      print "$id"
+    fi
+  done < <(scheme_ids)
+}
+
+reload_squirrel() {
+  if [[ "$1" == "--no-reload" ]]; then
+    return
+  fi
+  if [[ "$rime_dir" != "$live_rime_dir" ]]; then
+    print "已修改皮肤；指定目录不是当前用户的实时 Rime 目录，未自动重新部署。"
+    return
+  fi
+  if [[ -x "$squirrel_bin" ]]; then
+    "$squirrel_bin" --reload >/dev/null
+    print "已重新部署并切换皮肤。"
+  else
+    print "已修改皮肤；未找到鼠须管，请手动重新部署。"
+  fi
+}
+
+validate_reload_flag() {
+  if (( $# == 0 )) || [[ -z "$1" ]]; then
+    return
+  fi
+  if [[ "$1" != "--no-reload" ]]; then
+    print -u2 "不支持的选项：$1（只支持 --no-reload）"
+    exit 2
+  fi
+}
+
+set_scheme() {
+  local requested="$1"
+  local reload_flag="${2:---reload}"
+  local dark="$requested"
+  local file_mode
+
+  if ! has_scheme "$requested"; then
+    print -u2 "不存在主题：$requested"
+    print -u2 "可用主题："
+    list_themes >&2
+    exit 1
+  fi
+
+  if has_scheme "${requested}_dark"; then
+    dark="${requested}_dark"
+  fi
+
+  if [[ -z "$(light_scheme)" || -z "$(dark_scheme)" ]]; then
+    print -u2 "配置缺少 style/color_scheme 或 style/color_scheme_dark，无法安全切换。"
+    exit 1
+  fi
+
+  local temp_file
+  temp_file="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/rime-theme.XXXXXX")"
+  file_mode="$(/usr/bin/stat -f '%Lp' "$config_file")"
+  /usr/bin/awk -v light="$requested" -v dark="$dark" '
+    /^  style:[[:space:]]*$/ { in_style = 1 }
+    in_style && /^    color_scheme:[[:space:]]*/ {
+      print "    color_scheme: " light
+      next
+    }
+    in_style && /^    color_scheme_dark:[[:space:]]*/ {
+      print "    color_scheme_dark: " dark
+      next
+    }
+    in_style && /^  [^[:space:]][^:]*:/ && $0 !~ /^  style:/ { in_style = 0 }
+    { print }
+  ' "$config_file" > "$temp_file"
+
+  /bin/chmod "$file_mode" "$temp_file"
+  /bin/mv "$temp_file" "$config_file"
+  print "当前皮肤：$requested（暗色：$dark）"
+  reload_squirrel "$reload_flag"
+}
+
+case "$command_name" in
+  list)
+    (( $# == 0 )) || { usage >&2; exit 2; }
+    list_themes
+    ;;
+  current)
+    (( $# == 0 )) || { usage >&2; exit 2; }
+    print "浅色：$(light_scheme)"
+    print "深色：$(dark_scheme)"
+    ;;
+  use)
+    (( $# >= 1 && $# <= 2 )) || { usage >&2; exit 2; }
+    validate_reload_flag "${2:-}"
+    set_scheme "$1" "${2:---reload}"
+    ;;
+  next)
+    (( $# <= 1 )) || { usage >&2; exit 2; }
+    validate_reload_flag "${1:-}"
+    typeset -a themes=()
+    local_theme=""
+    while IFS= read -r id; do
+      case "$id" in
+        *_dark) continue ;;
+      esac
+      themes+=("$id")
+    done < <(scheme_ids)
+    if (( ${#themes[@]} == 0 )); then
+      print -u2 "没有找到可切换的主题。"
+      exit 1
+    fi
+    local_theme="$(light_scheme)"
+    next_index=1
+    for (( index = 1; index <= ${#themes[@]}; index++ )); do
+      if [[ "${themes[$index]}" == "$local_theme" ]]; then
+        next_index=$(( index % ${#themes[@]} + 1 ))
+        break
+      fi
+    done
+    set_scheme "${themes[$next_index]}" "${1:---reload}"
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

@@ -8,31 +8,43 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let secretKeyField = NSSecureTextField()
     private let enginePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let prepaidHoursPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let logCheckbox = NSButton(checkboxWithTitle: "保存文本日志", target: nil, action: nil)
+    private let logCheckbox = NSButton(checkboxWithTitle: "保存崩溃日志", target: nil, action: nil)
     private let shortcutLabel = NSTextField(labelWithString: "")
+    private let versionLabel = NSTextField(labelWithString: AppVersion.displayText)
     private let statusLabel = NSTextField(labelWithString: "凭证优先保存在本机 YAML")
+    private let testButton = NSButton(title: "测试连接", target: nil, action: nil)
+    private let permissionCheckButton = NSButton(title: "检查权限", target: nil, action: nil)
+    private let permissionRowsStack = NSStackView()
     private let onSave: (AppSettings, TencentCredentials) throws -> Void
+    private let onTestConnection: ((TencentCredentials, String) async throws -> Void)?
+    private let permissionChecker: PrivacyPermissionChecking
     private let onClose: () -> Void
     private var currentShortcut: Shortcut
     private var displayedEngineModelType: String
     private var prepaidQuotaHoursByModel: [String: Int]
     private var storedCredentials: TencentCredentials?
     private var localMonitor: Any?
+    private var testTask: Task<Void, Never>?
+    private var permissionStateLabels: [PrivacyPermission: NSTextField] = [:]
 
     init(
         settings: AppSettings,
         credentials: TencentCredentials?,
         onSave: @escaping (AppSettings, TencentCredentials) throws -> Void,
+        onTestConnection: ((TencentCredentials, String) async throws -> Void)? = nil,
+        permissionChecker: PrivacyPermissionChecking? = nil,
         onClose: @escaping () -> Void = {}
     ) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 360),
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 650),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
         window.title = "腾讯语音输入设置"
         self.onSave = onSave
+        self.onTestConnection = onTestConnection
+        self.permissionChecker = permissionChecker ?? SystemPrivacyPermissionChecker()
         self.onClose = onClose
         currentShortcut = settings.shortcut
         let selectedPreset = TencentEnginePreset(persistedModelType: settings.engineModelType)
@@ -48,8 +60,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         secretIDField.stringValue = credentials?.secretID ?? ""
         secretKeyField.stringValue = credentials?.secretKey ?? ""
         statusLabel.stringValue = credentials == nil
-            ? "凭证优先保存在本机 YAML（明文）"
-            : "已读取凭证；日常使用仅读本机 YAML"
+            ? "凭证保存在本机共享目录（明文）"
+            : "已读取本机共享凭证；两个 macOS 账户可共用"
         for preset in TencentEnginePreset.allCases {
             enginePopup.addItem(withTitle: preset.displayName)
             enginePopup.lastItem?.representedObject = preset.rawValue
@@ -63,6 +75,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         logCheckbox.state = settings.saveTextLogs ? .on : .off
         shortcutLabel.stringValue = ShortcutFormatter.string(for: currentShortcut)
         buildView()
+        refreshPermissionReport()
     }
 
     @available(*, unavailable)
@@ -70,6 +83,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         stopShortcutCapture()
+        testTask?.cancel()
+        testTask = nil
         onClose()
     }
 
@@ -80,9 +95,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             labeled("SecretId", view: secretIDField),
             labeled("SecretKey", view: secretKeyField),
             labeled("识别引擎", view: enginePopup),
-            labeled("已充值时长（当前模型）", view: prepaidHoursPopup)
+            labeled("已充值时长（当前模型）", view: prepaidHoursPopup),
+            testButton
         ])
         fields.orientation = .vertical
+        fields.alignment = .leading
         fields.spacing = 10
         fields.translatesAutoresizingMaskIntoConstraints = false
 
@@ -95,11 +112,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         let saveButton = NSButton(title: "保存", target: self, action: #selector(saveButtonPressed))
         saveButton.keyEquivalent = "\r"
-        let buttons = NSStackView(views: [statusLabel, NSView(), saveButton])
+        testButton.target = self
+        testButton.action = #selector(testConnectionPressed)
+        testButton.isEnabled = onTestConnection != nil
+        permissionCheckButton.target = self
+        permissionCheckButton.action = #selector(checkPermissionsPressed)
+        let buttons = NSStackView(views: [logCheckbox, statusLabel, NSView(), saveButton])
         buttons.alignment = .centerY
         buttons.spacing = 8
 
-        let content = NSStackView(views: [fields, shortcutRow, logCheckbox, buttons])
+        let permissionView = buildPermissionView()
+        let content = NSStackView(views: [versionLabel, fields, shortcutRow, permissionView, buttons])
         content.orientation = .vertical
         content.alignment = .leading
         content.spacing = 16
@@ -115,7 +138,79 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             buttons.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             buttons.trailingAnchor.constraint(equalTo: content.trailingAnchor)
         ])
+        versionLabel.textColor = .secondaryLabelColor
         statusLabel.textColor = .secondaryLabelColor
+    }
+
+    private func buildPermissionView() -> NSView {
+        let title = NSTextField(labelWithString: "系统权限（当前 macOS 账户）")
+        title.font = .boldSystemFont(ofSize: NSFont.systemFontSize)
+        let titleRow = NSStackView(views: [title, NSView(), permissionCheckButton])
+        titleRow.alignment = .centerY
+        titleRow.spacing = 8
+        titleRow.translatesAutoresizingMaskIntoConstraints = false
+        titleRow.widthAnchor.constraint(equalToConstant: 452).isActive = true
+
+        permissionRowsStack.orientation = .vertical
+        permissionRowsStack.alignment = .leading
+        permissionRowsStack.spacing = 6
+        permissionRowsStack.translatesAutoresizingMaskIntoConstraints = false
+
+        for permission in PrivacyPermission.allCases {
+            let name = NSTextField(labelWithString: "\(permission.title)：")
+            name.setContentHuggingPriority(.required, for: .horizontal)
+            name.widthAnchor.constraint(equalToConstant: 150).isActive = true
+
+            let state = NSTextField(labelWithString: "未检查")
+            state.setContentHuggingPriority(.required, for: .horizontal)
+            state.widthAnchor.constraint(equalToConstant: 82).isActive = true
+            permissionStateLabels[permission] = state
+
+            let openButton = NSButton(
+                title: "打开设置",
+                target: self,
+                action: #selector(openPermissionSettingsPressed(_:))
+            )
+            openButton.tag = permission.rawValue
+
+            let row = NSStackView(views: [name, state, NSView(), openButton])
+            row.alignment = .centerY
+            row.spacing = 6
+            row.translatesAutoresizingMaskIntoConstraints = false
+            row.widthAnchor.constraint(equalToConstant: 452).isActive = true
+            permissionRowsStack.addArrangedSubview(row)
+        }
+
+        let view = NSStackView(views: [titleRow, permissionRowsStack])
+        view.orientation = .vertical
+        view.alignment = .leading
+        view.spacing = 8
+        view.translatesAutoresizingMaskIntoConstraints = false
+        return view
+    }
+
+    @objc private func checkPermissionsPressed() {
+        refreshPermissionReport()
+        statusLabel.stringValue = "权限检查完成；缺失项可点击旁边的“打开设置”"
+    }
+
+    @objc private func openPermissionSettingsPressed(_ sender: NSButton) {
+        guard let permission = PrivacyPermission(rawValue: sender.tag) else { return }
+        if permissionChecker.openSettings(for: permission) {
+            statusLabel.stringValue = "已打开“\(permission.title)”设置；开启后回来点击“检查权限”"
+        } else {
+            statusLabel.stringValue = "无法自动打开系统设置，请手动进入“隐私与安全性”"
+        }
+    }
+
+    private func refreshPermissionReport() {
+        let report = permissionChecker.report()
+        for status in report.statuses {
+            permissionStateLabels[status.permission]?.stringValue = status.detail
+            permissionStateLabels[status.permission]?.textColor = status.isGranted
+                ? .systemGreen
+                : .systemRed
+        }
     }
 
     private func labeled(_ title: String, view: NSView) -> NSView {
@@ -153,15 +248,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     @objc private func saveButtonPressed() {
         persistSelectedPrepaidHours()
-        let appID = appIDField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let secretID = secretIDField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let secretKey = secretKeyField.stringValue.isEmpty
-            ? (storedCredentials?.secretKey ?? "")
-            : secretKeyField.stringValue
-        guard !appID.isEmpty, !secretID.isEmpty, !secretKey.isEmpty else {
-            statusLabel.stringValue = "请填写完整的 AppID、SecretId 和 SecretKey"
-            return
-        }
+        guard let credentials = credentialsFromFields() else { return }
 
         let settings = AppSettings(
             shortcut: currentShortcut,
@@ -171,13 +258,54 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             prepaidQuotaHoursByModel: prepaidQuotaHoursByModel
         )
         do {
-            let credentials = TencentCredentials(appID: appID, secretID: secretID, secretKey: secretKey)
             try onSave(settings, credentials)
             storedCredentials = credentials
-            statusLabel.stringValue = "已保存"
+            statusLabel.stringValue = "已保存到本机共享目录"
         } catch {
             statusLabel.stringValue = "保存失败：\(error.localizedDescription)"
         }
+    }
+
+    @objc private func testConnectionPressed() {
+        guard testTask == nil else { return }
+        guard let onTestConnection else {
+            statusLabel.stringValue = "当前版本不支持连接测试"
+            return
+        }
+        guard let credentials = credentialsFromFields() else { return }
+
+        let model = selectedEngineModelType
+        testButton.isEnabled = false
+        statusLabel.stringValue = "正在握手测试（不会录音）…"
+        testTask = Task { [weak self] in
+            defer {
+                self?.testButton.isEnabled = true
+                self?.testTask = nil
+            }
+            do {
+                try await onTestConnection(credentials, model)
+                guard !Task.isCancelled else { return }
+                self?.statusLabel.stringValue = "连接成功：凭证和当前引擎可用"
+            } catch {
+                guard !Task.isCancelled else { return }
+                self?.statusLabel.stringValue = "连接失败：\(error.localizedDescription)"
+            }
+            self?.testButton.isEnabled = true
+            self?.testTask = nil
+        }
+    }
+
+    private func credentialsFromFields() -> TencentCredentials? {
+        let appID = appIDField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let secretID = secretIDField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let secretKey = secretKeyField.stringValue.isEmpty
+            ? (storedCredentials?.secretKey ?? "")
+            : secretKeyField.stringValue
+        guard !appID.isEmpty, !secretID.isEmpty, !secretKey.isEmpty else {
+            statusLabel.stringValue = "请填写完整的 AppID、SecretId 和 SecretKey"
+            return nil
+        }
+        return TencentCredentials(appID: appID, secretID: secretID, secretKey: secretKey)
     }
 
     private func stopShortcutCapture() {

@@ -17,6 +17,8 @@ struct SessionLogEntry: Encodable, Sendable {
     let revision: UInt64?
     let writeCount: Int?
     let backspaceCount: Int?
+    let deepReplacementCount: Int?
+    let maximumTrailingReplacementLength: Int?
     let discardCount: Int?
     let errorCount: Int?
     let errorCode: Int?

@@ -1,0 +1,21 @@
+patch:
+  "translator/dictionary": rime_ice
+
+  # 语法模型核心配置
+  "grammar/language": wanxiang-lts-zh-hans
+  "grammar/collocation_max_length": 6
+  "grammar/collocation_min_length": 3
+
+  # 调整惩罚分：增大 non_collocation_penalty，减少乱联想
+  "grammar/collocation_penalty": -5
+  "grammar/non_collocation_penalty": -30
+  "grammar/weak_collocation_penalty": -50
+  "grammar/rear_penalty": -15
+
+  # 限制候选词数量，防止生僻词/预测词刷屏
+  "translator/max_homophones": 5
+  "translator/max_homographs": 5
+
+  # 关闭上下文建议：这是解决“sha”变成“是啊”的关键！
+  # 设为 false 后，它会更尊重你实际输入的拼音，减少玄学联想。
+  "translator/contextual_suggestions": true
