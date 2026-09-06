@@ -63,6 +63,7 @@ else
     APP_DIR="$PROJECT_DIR/dist/presets/TencentVoiceMVP-$BUNDLE_SHORT_VERSION-build$BUNDLE_BUILD-$PACING_PRESET.app"
 fi
 
+mkdir -p "$PROJECT_DIR/dist"
 DIST_ROOT="$(cd -P "$PROJECT_DIR/dist" && pwd)"
 APP_PARENT="$(dirname "$APP_DIR")"
 MISSING_PARENTS=()
