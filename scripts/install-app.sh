@@ -48,6 +48,8 @@ ditto --rsrc --acl "${built_app}" "${application_path}"
 
 # Normal launches never request TCC permissions. This explicit script opens
 # the system settings page instead; macOS requires the user to enable TCC.
-"${script_dir}/request-permissions.sh" all
+if [[ "${TVMVP_OPEN_PERMISSION_SETTINGS:-1}" == "1" ]]; then
+  "${script_dir}/request-permissions.sh" all
+fi
 open -g -a "${application_path}"
 print "${application_path}"

@@ -158,22 +158,27 @@ final class StatusMenuController: NSObject {
     }
 
     private func statusImage() -> NSImage {
-        for resource in [("statusbar-matched", "png"), ("AppIcon", "icns")] {
-            if let path = Bundle.main.path(forResource: resource.0, ofType: resource.1),
-               let image = NSImage(contentsOfFile: path) {
-                image.size = NSSize(width: 18, height: 18)
-                return image
-            }
+        if let path = Bundle.main.path(forResource: "statusbar-matched", ofType: "png"),
+           let image = NSImage(contentsOfFile: path) {
+            image.size = NSSize(width: 18, height: 18)
+            // Let macOS tint the transparent mask for light/dark menu bars.
+            image.isTemplate = true
+            return image
         }
 
         // Keep the menu usable when running directly from SwiftPM tests.
         let image = NSImage(size: NSSize(width: 18, height: 18))
         image.lockFocus()
+        NSColor.white.setStroke()
+        let bubble = NSBezierPath(roundedRect: NSRect(x: 0.7, y: 1.7, width: 16.6, height: 14.6), xRadius: 4.4, yRadius: 4.4)
+        bubble.lineWidth = 1.3
+        bubble.stroke()
         NSColor.white.setFill()
-        NSBezierPath(roundedRect: NSRect(x: 1, y: 1, width: 16, height: 16), xRadius: 4, yRadius: 4).fill()
-        NSColor(calibratedRed: 0.19, green: 0.20, blue: 0.23, alpha: 1).setFill()
-        NSBezierPath(roundedRect: NSRect(x: 3, y: 3, width: 12, height: 12), xRadius: 3, yRadius: 3).fill()
+        for (x, height) in [(4.6, 5.0), (7.2, 9.4), (9.8, 6.7), (12.4, 10.4)] {
+            NSBezierPath(roundedRect: NSRect(x: x, y: 4.3, width: 1.3, height: height), xRadius: 0.65, yRadius: 0.65).fill()
+        }
         image.unlockFocus()
+        image.isTemplate = true
         return image
     }
 }
