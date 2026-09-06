@@ -6,6 +6,8 @@
 	<string>腾讯语音输入 MVP</string>
 	<key>CFBundleExecutable</key>
 	<string>TencentVoiceMVP</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.tencent-voice-mvp</string>
 	<key>CFBundleName</key>
@@ -15,7 +17,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>33</string>
+	<string>37</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>

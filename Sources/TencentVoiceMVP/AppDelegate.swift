@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let sharedUsageStore: SharedUsageStore
     private let rimeThemeStore: RimeThemeStore
     private let rimeBackupRetentionStore: RimeBackupRetentionStore
+    private let permissionChecker: SystemPrivacyPermissionChecker
     private let rimeReviewCoordinator: RimeReviewSyncCoordinator?
     private var settingsWindowController: SettingsWindowController?
     private var rimeDictionaryWindowController: RimeDictionaryWindowController?
@@ -31,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let localUsageStore = LocalUsageStore()
         let sharedUsageStore = SharedUsageStore()
         let rimeThemeStore = RimeThemeStore()
+        let permissionChecker = SystemPrivacyPermissionChecker()
         let rimeBackupRetentionStore = RimeBackupRetentionStore(
             policy: RimeBackupSettings.loadPolicy()
         )
@@ -73,6 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.sharedUsageStore = sharedUsageStore
         self.rimeThemeStore = rimeThemeStore
         self.rimeBackupRetentionStore = rimeBackupRetentionStore
+        self.permissionChecker = permissionChecker
         self.rimeReviewCoordinator = rimeReviewCoordinator
         coordinator = SessionCoordinator(
             asr: TencentASRClient(),
@@ -235,6 +238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
                 try await TencentASRClient().testConnection(configuration: configuration)
             },
+            permissionChecker: permissionChecker,
             onClose: { [weak self] in
                 guard self != nil else { return }
                 NSApp.setActivationPolicy(.accessory)

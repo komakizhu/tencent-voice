@@ -314,15 +314,11 @@ final class SessionCoordinator: SessionCoordinating {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             return
-        case .denied, .restricted:
+        case .denied, .restricted, .notDetermined:
+            // Permission requests are intentionally owned by the explicit
+            // install/request script. Starting a recording must never trigger
+            // a new macOS prompt or re-request a permission the user denied.
             throw SessionError.microphoneDenied
-        case .notDetermined:
-            let granted = await withCheckedContinuation { continuation in
-                AVCaptureDevice.requestAccess(for: .audio) { granted in
-                    continuation.resume(returning: granted)
-                }
-            }
-            guard granted else { throw SessionError.microphoneDenied }
         @unknown default:
             throw SessionError.microphoneDenied
         }

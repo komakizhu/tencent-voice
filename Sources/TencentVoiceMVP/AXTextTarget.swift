@@ -241,12 +241,9 @@ final class AXTextTarget: TextTarget {
 
     private func requestInputPermissionsIfNeeded() throws {
         guard AXIsProcessTrusted() else {
-            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-            _ = AXIsProcessTrustedWithOptions(options)
             throw TextTargetError.accessibilityDenied
         }
         guard CGPreflightPostEventAccess() else {
-            _ = CGRequestPostEventAccess()
             throw TextTargetError.postEventDenied
         }
     }

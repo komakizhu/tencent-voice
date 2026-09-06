@@ -130,6 +130,8 @@ echo "Bundle build: $CURRENT_BUILD -> $NEXT_BUILD"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/$PRODUCT_NAME"
 cp "$PROJECT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
+cp "$PROJECT_DIR/Resources/brand-kit-graphite/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
+cp "$PROJECT_DIR/Resources/brand-kit-graphite/statusbar-matched.png" "$APP_DIR/Contents/Resources/statusbar-matched.png"
 plutil -replace CFBundleDisplayName -string "$DISPLAY_NAME" "$APP_DIR/Contents/Info.plist"
 if ! /usr/bin/security find-identity -v -p codesigning | rg -Fq "\"$SIGNING_IDENTITY\""; then
     echo "required signing identity not found: $SIGNING_IDENTITY" >&2

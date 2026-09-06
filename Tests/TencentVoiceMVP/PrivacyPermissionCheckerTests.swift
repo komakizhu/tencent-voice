@@ -48,4 +48,18 @@ final class PrivacyPermissionCheckerTests: XCTestCase {
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
         )
     }
+
+    func testReportDoesNotTreatUndecidedOrDeniedPermissionsAsGranted() {
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .notDetermined },
+            accessibilityStatus: { false },
+            postEventStatus: { false },
+            inputMonitoringStatus: { false }
+        )
+
+        let report = checker.report()
+
+        XCTAssertEqual(report.missing, PrivacyPermission.allCases)
+        XCTAssertFalse(report.allGranted)
+    }
 }

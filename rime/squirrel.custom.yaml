@@ -1,3 +1,5 @@
+# 皮肤配置版本：theme-1.0.0；版本记录见 rime/THEME_VERSION.md
+
 patch:
   style:
     color_scheme: blue_reverie

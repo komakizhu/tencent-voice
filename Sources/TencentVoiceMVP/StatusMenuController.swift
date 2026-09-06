@@ -18,7 +18,11 @@ final class StatusMenuController: NSObject {
         guard statusItem == nil else { return }
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.title = "语"
+        item.button?.title = ""
+        item.button?.image = statusImage()
+        item.button?.imageScaling = .scaleProportionallyDown
+        item.button?.setAccessibilityLabel("腾讯语音输入")
+        item.button?.toolTip = "腾讯语音输入"
 
         let menu = NSMenu()
         let usageView = UsageMenuItemView(text: "模型：计算中…\n用量：计算中…")
@@ -151,5 +155,25 @@ final class StatusMenuController: NSObject {
         onSelectRimeTheme = nil
         onManageRimeDictionary = nil
         onSyncRimeDictionary = nil
+    }
+
+    private func statusImage() -> NSImage {
+        for resource in [("statusbar-matched", "png"), ("AppIcon", "icns")] {
+            if let path = Bundle.main.path(forResource: resource.0, ofType: resource.1),
+               let image = NSImage(contentsOfFile: path) {
+                image.size = NSSize(width: 18, height: 18)
+                return image
+            }
+        }
+
+        // Keep the menu usable when running directly from SwiftPM tests.
+        let image = NSImage(size: NSSize(width: 18, height: 18))
+        image.lockFocus()
+        NSColor.white.setFill()
+        NSBezierPath(roundedRect: NSRect(x: 1, y: 1, width: 16, height: 16), xRadius: 4, yRadius: 4).fill()
+        NSColor(calibratedRed: 0.19, green: 0.20, blue: 0.23, alpha: 1).setFill()
+        NSBezierPath(roundedRect: NSRect(x: 3, y: 3, width: 12, height: 12), xRadius: 3, yRadius: 3).fill()
+        image.unlockFocus()
+        return image
     }
 }

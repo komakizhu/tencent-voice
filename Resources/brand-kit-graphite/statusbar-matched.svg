@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18" fill="none">
+  <title>Voice input matching status bar icon</title>
+  <desc>18 point miniature of the finalized 80 percent white-background app icon.</desc>
+  <rect width="1254" height="1254" fill="#FFFFFF"/>
+  <g transform="translate(627 627) scale(.8) translate(-627 -627)">
+    <path fill="#30343B" d="M627 68C322 68 74 315 74 620c0 111 33 214 89 301l-58 211c-9 34 27 62 59 46l191-96c83 44 175 69 272 69 305 0 553-247 553-553S932 68 627 68Z"/>
+    <g fill="#F2B84B">
+      <rect x="289" y="511" width="139" height="249" rx="69.5"/>
+      <rect x="484" y="366" width="139" height="454" rx="69.5"/>
+      <rect x="681" y="473" width="139" height="317" rx="69.5"/>
+    </g>
+    <rect x="882" y="383" width="70" height="498" rx="35" fill="#F7F7F2"/>
+  </g>
+</svg>
