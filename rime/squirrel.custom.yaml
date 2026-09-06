@@ -1,9 +1,9 @@
-# 皮肤配置版本：0.2.0-V2；版本记录见 rime/THEME_VERSION.md
+# 皮肤定稿版本：0.2.0-V3；德古拉白与全皮肤候选编号视觉优化
 
 patch:
   style:
-    color_scheme: blue_reverie
-    color_scheme_dark: blue_reverie_dark
+    color_scheme: dracula
+    color_scheme_dark: dracula_dark
     status_message_type: mix
     candidate_format: '[label]. [candidate] [comment]'
     candidate_list_layout: stacked
@@ -39,7 +39,7 @@ patch:
     hilited_text_color: '0xDEDDDD'
     candidate_text_color: '0x5E5E5E'
     hilited_candidate_text_color: '0xFFFFFF'
-    label_color: '0x888785'
+    label_color: '0x7D686F'
     hilited_candidate_label_color: '0xFFFFFF'
     comment_text_color: '0xDEDDDD'
     candidate_list_layout: linear
@@ -59,7 +59,7 @@ patch:
     hilited_text_color: '0xDEDDDD'
     candidate_text_color: '0xFFFFFF'
     hilited_candidate_text_color: '0xFFFFFF'
-    label_color: '0xEBEBEB'
+    label_color: '0xC6B9B8'
     hilited_candidate_label_color: '0xFFFFFF'
     comment_text_color: '0xDEDDDD'
     candidate_list_layout: linear
@@ -102,7 +102,7 @@ patch:
     candidate_text_color: '0x303030'
     hilited_candidate_text_color: '0xFFFFFF'
     hilited_candidate_back_color: '0x3C6BC9'
-    label_color: '0x76818A'
+    label_color: '0x7D686F'
     hilited_candidate_label_color: '0xFFFFFF'
     comment_text_color: '0x838A8F'
     hilited_comment_text_color: '0xE8EEF2'
@@ -141,7 +141,7 @@ patch:
     candidate_text_color: '0xD0D9DE'
     hilited_candidate_text_color: '0xFFFFFF'
     hilited_candidate_back_color: '0x528AC5'
-    label_color: '0xAFA69A'
+    label_color: '0xC6B9B8'
     hilited_candidate_label_color: '0xFFFFFF'
     comment_text_color: '0x9B9388'
     hilited_comment_text_color: '0xDCF1FF'
@@ -180,7 +180,7 @@ patch:
     candidate_text_color: '0x3B4631'
     hilited_candidate_text_color: '0xFFFFFF'
     hilited_candidate_back_color: '0x839B72'
-    label_color: '0x788171'
+    label_color: '0x7D686F'
     hilited_candidate_label_color: '0xFFFFFF'
     comment_text_color: '0x848B7E'
     hilited_comment_text_color: '0xF0F5ED'
@@ -219,7 +219,7 @@ patch:
     candidate_text_color: '0xE1E5DD'
     hilited_candidate_text_color: '0xFFFFFF'
     hilited_candidate_back_color: '0x629F4E'
-    label_color: '0x9BA294'
+    label_color: '0xC6B9B8'
     hilited_candidate_label_color: '0xFFFFFF'
     comment_text_color: '0x969C8F'
     hilited_comment_text_color: '0xE1E9DD'
@@ -258,7 +258,7 @@ patch:
     candidate_text_color: '0x837B65'
     hilited_candidate_text_color: '0xFFFFFF'
     hilited_candidate_back_color: '0xD28B26'
-    label_color: '0xA1A193'
+    label_color: '0x7D686F'
     hilited_candidate_label_color: '0xFFFFFF'
     comment_text_color: '0xA1A193'
     hilited_comment_text_color: '0xF8F1D9'
@@ -297,7 +297,7 @@ patch:
     candidate_text_color: '0xC8C8B8'
     hilited_candidate_text_color: '0x15110F'
     hilited_candidate_back_color: '0x98A12A'
-    label_color: '0x969483'
+    label_color: '0xC6B9B8'
     hilited_candidate_label_color: '0x15110F'
     comment_text_color: '0x969483'
     hilited_comment_text_color: '0xD9E8E8'
@@ -336,7 +336,7 @@ patch:
     candidate_text_color: '0x40342E'
     hilited_candidate_text_color: '0xFFFFFF'
     hilited_candidate_back_color: '0xAC815E'
-    label_color: '0xAC815E'
+    label_color: '0x7D686F'
     hilited_candidate_label_color: '0xFFFFFF'
     comment_text_color: '0x99877B'
     hilited_comment_text_color: '0xE9F0FA'
@@ -375,13 +375,13 @@ patch:
     candidate_text_color: '0xE9DED8'
     hilited_candidate_text_color: '0x15110F'
     hilited_candidate_back_color: '0xD0C088'
-    label_color: '0xD0C088'
+    label_color: '0xC6B9B8'
     hilited_candidate_label_color: '0x15110F'
     comment_text_color: '0xC0B1A8'
     hilited_comment_text_color: '0xE1F1F4'
 
   "preset_color_schemes/dracula":
-    name: "德古拉 / Dracula"
+    name: "德古拉白 / Dracula"
     author: local
     color_space: srgb
     candidate_list_layout: linear
@@ -407,14 +407,14 @@ patch:
     label_font_point: 12
     comment_font_face: Helvetica
     comment_font_point: 14
-    back_color: '0xF8F4ED'
+    back_color: '0xF8F5F3'
     border_color: '0xE5DED9'
     text_color: '0x362A28'
     hilited_text_color: '0x282A36'
     candidate_text_color: '0x362A28'
     hilited_candidate_text_color: '0xFFFFFF'
     hilited_candidate_back_color: '0xF993BD'
-    label_color: '0xA47262'
+    label_color: '0x7D686F'
     hilited_candidate_label_color: '0xFFFFFF'
     comment_text_color: '0xA47262'
     hilited_comment_text_color: '0xFFFFFF'
@@ -453,7 +453,7 @@ patch:
     candidate_text_color: '0xF2F8F8'
     hilited_candidate_text_color: '0x282A36'
     hilited_candidate_back_color: '0xC679FF'
-    label_color: '0xF993BD'
+    label_color: '0xC6B9B8'
     hilited_candidate_label_color: '0x282A36'
     comment_text_color: '0xC6B9B8'
     hilited_comment_text_color: '0xF8E8FF'
@@ -495,7 +495,7 @@ patch:
     hilited_candidate_text_color: '0x4A3224'
     # 中性深色磨砂叠层，避免高亮变成蓝色；真正的逐行高斯模糊超出 YAML 能力。
     hilited_candidate_back_color: '0xC0A6B0B8'
-    label_color: '0x9A7158'
+    label_color: '0x7D686F'
     hilited_candidate_label_color: '0x4A3224'
     comment_text_color: '0x8F8178'
     hilited_comment_text_color: '0x66584F'
@@ -535,7 +535,7 @@ patch:
     hilited_candidate_text_color: '0xFFFFFF'
     # 深色玻璃高亮使用深灰紫磨砂叠层，不使用蓝色块，也不放固定背景图形。
     hilited_candidate_back_color: '0xB074656C'
-    label_color: '0xC8B8D9'
+    label_color: '0xC6B9B8'
     hilited_candidate_label_color: '0xFFFFFF'
     comment_text_color: '0xB7AEBF'
     hilited_comment_text_color: '0xF2EAF8'
