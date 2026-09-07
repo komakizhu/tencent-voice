@@ -154,7 +154,7 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
             "腾讯凭证：\(credentialSummary)",
             "快捷键：\(settings.shortcut)",
             "识别引擎：\(settings.engineModelType)",
-            "持久化会话日志：\(settings.persistentSessionLogEnabled ? "已开启" : "未开启")",
+            "自动保存诊断日志：\(settings.persistentSessionLogEnabled ? "已开启" : "未开启")",
             "Safe Copy：\(settings.safeCopyEnabled ? "已开启（始终复制到剪贴板）" : "已关闭（发生输入错误时不复制）")",
             "日志目录：\(logDirectoryPath)",
             "",
@@ -171,11 +171,11 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
 
         lines += [
             "",
-            "【最近会话事件】",
-            "以下事件只包含状态、长度、计数和错误类型，不包含密钥、录音或识别正文。"
+            "【会话与诊断事件】",
+            "以下内容包含会话状态、错误代码和操作上下文，不包含密钥、录音或识别正文。"
         ]
         if events.isEmpty {
-            lines.append("没有可用的会话事件。请打开“故障诊断记录”后复现一次，再结束记录导出 JSON。")
+            lines.append("没有可用的日志事件。请开启“自动保存诊断日志”后复现一次，再点击“导出诊断报告”。")
         } else {
             for event in events {
                 lines.append(Self.render(event))
@@ -344,6 +344,7 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
     private static func render(_ event: SessionLogEntry) -> String {
         var fields = [
             Self.format(event.timestamp),
+            "kind=\(event.kind.rawValue)",
             "session=\(event.sessionID.uuidString)",
             "event=\(event.event)",
             "state=\(event.state ?? "-")",
@@ -366,6 +367,12 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
         if let failureCode = event.failureCode { fields.append("failureCode=\(failureCode)") }
         if let failureMessage = safeFailureMessage(for: event) {
             fields.append("failure=\(failureMessage)")
+        }
+        if !event.metadata.isEmpty {
+            let metadata = event.metadata.keys.sorted().map { key in
+                "\(key)=\(event.metadata[key] ?? "")"
+            }.joined(separator: ",")
+            fields.append("metadata=\(metadata)")
         }
         return fields.joined(separator: " | ")
     }
@@ -423,7 +430,7 @@ final class DiagnosticReportBuilder {
                 persistentSessionLogEnabled: settings.saveTextLogs,
                 safeCopyEnabled: settings.safeCopyEnabled
             ),
-            events: mergedEvents(includePersisted: settings.saveTextLogs),
+            events: mergedEvents(),
             logDirectoryPath: logger.persistenceDirectoryURL.path
         )
     }
@@ -442,9 +449,8 @@ final class DiagnosticReportBuilder {
         }
     }
 
-    private func mergedEvents(includePersisted: Bool) -> [SessionLogEntry] {
-        let persisted = includePersisted ? logger.recentPersistedEntries(limit: 120) : []
-        let candidates = persisted + logger.recentEntries(limit: 120)
+    private func mergedEvents() -> [SessionLogEntry] {
+        let candidates = logger.allPersistedEntries() + logger.recentEntries(limit: 300)
         var seen = Set<String>()
         let unique = candidates.filter { entry in
             let key: String
@@ -456,8 +462,7 @@ final class DiagnosticReportBuilder {
             }
             return seen.insert(key).inserted
         }
-        return unique.sorted { $0.timestamp < $1.timestamp }.suffix(160)
-            .map { $0 }
+        return unique.sorted { $0.timestamp < $1.timestamp }
     }
 }
 

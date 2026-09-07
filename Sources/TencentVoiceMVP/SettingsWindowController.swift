@@ -8,7 +8,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let secretKeyField = NSSecureTextField()
     private let enginePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let prepaidHoursPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let logCheckbox = NSButton(checkboxWithTitle: "保存崩溃日志", target: nil, action: nil)
+    private let logCheckbox = NSButton(checkboxWithTitle: "自动保存诊断日志", target: nil, action: nil)
     private let safeCopyCheckbox = NSButton(
         checkboxWithTitle: "Safe Copy（始终复制到剪贴板）",
         target: nil,
@@ -18,12 +18,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let versionLabel = NSTextField(labelWithString: AppVersion.displayText)
     private let statusLabel = NSTextField(labelWithString: "凭证优先保存在本机 YAML")
     private let testButton = NSButton(title: "测试连接", target: nil, action: nil)
-    private let diagnosticCheckbox = NSButton(checkboxWithTitle: "故障诊断记录", target: nil, action: nil)
+    private let exportDiagnosticLogButton = NSButton(title: "导出诊断报告", target: nil, action: nil)
     private let permissionCheckButton = NSButton(title: "检查权限", target: nil, action: nil)
     private let permissionRowsStack = NSStackView()
     private let onSave: (AppSettings, TencentCredentials) throws -> Void
     private let onTestConnection: ((TencentCredentials, String) async throws -> Void)?
-    private let onDiagnosticRecordingToggle: ((Bool) throws -> URL?)?
+    private let onExportDiagnosticLog: (() throws -> URL?)?
     private let onRecordDiagnosticAction: ((String, [String: String]) -> Void)?
     private let permissionChecker: PrivacyPermissionChecking
     private let onClose: () -> Void
@@ -40,8 +40,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         credentials: TencentCredentials?,
         onSave: @escaping (AppSettings, TencentCredentials) throws -> Void,
         onTestConnection: ((TencentCredentials, String) async throws -> Void)? = nil,
-        onDiagnosticRecordingToggle: ((Bool) throws -> URL?)? = nil,
-        diagnosticRecordingActive: Bool = false,
+        onExportDiagnosticLog: (() throws -> URL?)? = nil,
         onRecordDiagnosticAction: ((String, [String: String]) -> Void)? = nil,
         permissionChecker: PrivacyPermissionChecking? = nil,
         onClose: @escaping () -> Void = {}
@@ -55,7 +54,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.title = "腾讯语音输入设置"
         self.onSave = onSave
         self.onTestConnection = onTestConnection
-        self.onDiagnosticRecordingToggle = onDiagnosticRecordingToggle
+        self.onExportDiagnosticLog = onExportDiagnosticLog
         self.onRecordDiagnosticAction = onRecordDiagnosticAction
         self.permissionChecker = permissionChecker ?? SystemPrivacyPermissionChecker()
         self.onClose = onClose
@@ -87,7 +86,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         rebuildPrepaidHoursPopup()
         logCheckbox.state = settings.saveTextLogs ? .on : .off
         safeCopyCheckbox.state = settings.safeCopyEnabled ? .on : .off
-        diagnosticCheckbox.state = diagnosticRecordingActive ? .on : .off
         shortcutLabel.stringValue = ShortcutFormatter.string(for: currentShortcut)
         buildView()
         refreshPermissionReport()
@@ -105,15 +103,36 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func buildView() {
         guard let contentView = window?.contentView else { return }
+        let logRow = diagnosticLogRow()
         let fields = NSStackView(views: [
-            labeled("AppID", view: appIDField),
-            labeled("SecretId", view: secretIDField),
-            labeled("SecretKey", view: secretKeyField),
-            labeled("识别引擎", view: enginePopup),
-            labeled("已充值时长（当前模型）", view: prepaidHoursPopup),
+            labeled(
+                "AppID",
+                view: appIDField,
+                toolTip: "腾讯云账号的 AppID，用于识别你的腾讯云账号。"
+            ),
+            labeled(
+                "SecretId",
+                view: secretIDField,
+                toolTip: "腾讯云 API 凭证的 SecretId，与 SecretKey 配合调用语音识别。"
+            ),
+            labeled(
+                "SecretKey",
+                view: secretKeyField,
+                toolTip: "腾讯云 API 凭证的 SecretKey，只用于生成请求签名，不会写入诊断日志。"
+            ),
+            labeled(
+                "识别引擎",
+                view: enginePopup,
+                toolTip: "选择腾讯云实时语音识别模型；切换模型会使用该模型的独立用量额度。"
+            ),
+            labeled(
+                "已充值时长（当前模型）",
+                view: prepaidHoursPopup,
+                toolTip: "设置当前模型的已充值时长，用于计算菜单栏用量百分比；修改后点击“保存设置”。"
+            ),
             testButton,
-            safeCopyRow(),
-            diagnosticRow()
+            safeCopyCheckbox,
+            logRow
         ])
         fields.orientation = .vertical
         fields.alignment = .leading
@@ -121,26 +140,38 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         fields.translatesAutoresizingMaskIntoConstraints = false
 
         let shortcutButton = NSButton(title: "重新录制", target: self, action: #selector(captureShortcut))
+        shortcutLabel.toolTip = "当前用于开始或停止录音的全局快捷键。"
+        shortcutButton.toolTip = "录制新的全局快捷键；选择后点击“保存设置”生效。"
         let shortcutRow = NSStackView(views: [
             NSTextField(labelWithString: "快捷键"), shortcutLabel, shortcutButton
         ])
         shortcutRow.alignment = .centerY
         shortcutRow.spacing = 10
 
-        let saveButton = NSButton(title: "保存", target: self, action: #selector(saveButtonPressed))
+        let saveButton = NSButton(title: "保存设置", target: self, action: #selector(saveButtonPressed))
         saveButton.keyEquivalent = "\r"
         testButton.target = self
         testButton.action = #selector(testConnectionPressed)
         testButton.isEnabled = onTestConnection != nil
-        diagnosticCheckbox.target = self
-        diagnosticCheckbox.action = #selector(diagnosticRecordingToggled)
-        diagnosticCheckbox.isEnabled = onDiagnosticRecordingToggle != nil
-        diagnosticCheckbox.toolTip = "勾选开始记录；再次取消勾选后自动导出 JSON。不会记录密钥、录音或识别正文。"
+        testButton.toolTip = "使用当前填写的凭证和识别引擎发起握手测试；不会录音或输入文字。"
+        exportDiagnosticLogButton.target = self
+        exportDiagnosticLogButton.action = #selector(exportDiagnosticLogPressed)
+        exportDiagnosticLogButton.isEnabled = onExportDiagnosticLog != nil
+        exportDiagnosticLogButton.toolTip = "将自动保存的会话与诊断事件导出为诊断报告 JSON；不会导出密钥、录音或识别正文。"
+        safeCopyCheckbox.toolTip = "开启后始终把识别结果复制到剪贴板；关闭后只按正常方式输入。"
+        logCheckbox.toolTip = "开启后自动保存会话状态、错误代码和操作上下文；点击右侧“导出诊断报告”导出已保存内容。"
+        saveButton.toolTip = "保存腾讯云凭证和设置；日志开关、Safe Copy 与快捷键也在此生效。"
         permissionCheckButton.target = self
         permissionCheckButton.action = #selector(checkPermissionsPressed)
-        let buttons = NSStackView(views: [logCheckbox, statusLabel, NSView(), saveButton])
+        permissionCheckButton.toolTip = "重新读取当前 macOS 账户的权限状态。"
+        statusLabel.toolTip = "显示当前设置页操作、权限、连接测试、快捷键和导出结果。"
+        versionLabel.toolTip = "显示当前应用版本和构建号。"
+        let buttons = NSStackView(views: [statusLabel, NSView(), saveButton])
+        buttons.distribution = .fill
         buttons.alignment = .centerY
         buttons.spacing = 8
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        saveButton.setContentHuggingPriority(.required, for: .horizontal)
 
         let permissionView = buildPermissionView()
         let content = NSStackView(views: [versionLabel, fields, shortcutRow, permissionView, buttons])
@@ -156,8 +187,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             content.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -20),
             fields.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             fields.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            logRow.widthAnchor.constraint(equalTo: fields.widthAnchor),
             buttons.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            buttons.trailingAnchor.constraint(equalTo: content.trailingAnchor)
+            buttons.trailingAnchor.constraint(equalTo: permissionView.trailingAnchor)
         ])
         versionLabel.textColor = .secondaryLabelColor
         statusLabel.textColor = .secondaryLabelColor
@@ -166,6 +198,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private func buildPermissionView() -> NSView {
         let title = NSTextField(labelWithString: "系统权限（当前 macOS 账户）")
         title.font = .boldSystemFont(ofSize: NSFont.systemFontSize)
+        title.toolTip = "下面列出的权限用于录音、识别结果输入和全局快捷键。"
         let titleRow = NSStackView(views: [title, NSView(), permissionCheckButton])
         titleRow.alignment = .centerY
         titleRow.spacing = 8
@@ -179,10 +212,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         for permission in PrivacyPermission.allCases {
             let name = NSTextField(labelWithString: "\(permission.title)：")
+            name.toolTip = "\(permission.title)：\(permission.purpose)。"
             name.setContentHuggingPriority(.required, for: .horizontal)
             name.widthAnchor.constraint(equalToConstant: 150).isActive = true
 
             let state = NSTextField(labelWithString: "未检查")
+            state.toolTip = "当前\(permission.title)权限状态；若未允许，请点击右侧“打开设置”。"
             state.setContentHuggingPriority(.required, for: .horizontal)
             state.widthAnchor.constraint(equalToConstant: 82).isActive = true
             permissionStateLabels[permission] = state
@@ -193,6 +228,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 action: #selector(openPermissionSettingsPressed(_:))
             )
             openButton.tag = permission.rawValue
+            openButton.toolTip = "打开 macOS“隐私与安全性”中的\(permission.title)设置；用途：\(permission.purpose)。"
 
             let row = NSStackView(views: [name, state, NSView(), openButton])
             row.alignment = .centerY
@@ -210,33 +246,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return view
     }
 
-    private func diagnosticRow() -> NSView {
-        let description = NSTextField(
-            labelWithString: "勾选后记录故障与动作元数据；再次点击结束并自动导出桌面 JSON（不含密钥、录音和识别正文）"
-        )
-        description.textColor = .secondaryLabelColor
-        description.lineBreakMode = .byWordWrapping
-        description.maximumNumberOfLines = 2
-        description.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let row = NSStackView(views: [diagnosticCheckbox, description])
+    private func diagnosticLogRow() -> NSView {
+        let row = NSStackView(views: [logCheckbox, NSView(), exportDiagnosticLogButton])
         row.alignment = .centerY
-        row.spacing = 10
+        row.spacing = 8
         row.translatesAutoresizingMaskIntoConstraints = false
-        return row
-    }
-
-    private func safeCopyRow() -> NSView {
-        let description = NSTextField(
-            labelWithString: "适用于所有支持文本输入的应用；保存后生效；关闭时发生输入错误不会自动复制"
-        )
-        description.textColor = .secondaryLabelColor
-        description.lineBreakMode = .byWordWrapping
-        description.maximumNumberOfLines = 2
-        description.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let row = NSStackView(views: [safeCopyCheckbox, description])
-        row.alignment = .centerY
-        row.spacing = 10
-        row.translatesAutoresizingMaskIntoConstraints = false
+        exportDiagnosticLogButton.setContentHuggingPriority(.required, for: .horizontal)
         return row
     }
 
@@ -273,12 +288,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return report
     }
 
-    private func labeled(_ title: String, view: NSView) -> NSView {
+    private func labeled(_ title: String, view: NSView, toolTip: String) -> NSView {
         view.translatesAutoresizingMaskIntoConstraints = false
+        view.toolTip = toolTip
         if let field = view as? NSTextField {
             field.placeholderString = title
         }
         let label = NSTextField(labelWithString: title)
+        label.toolTip = toolTip
         label.setContentHuggingPriority(.required, for: .horizontal)
         let row = NSStackView(views: [label, view])
         row.spacing = 10
@@ -329,7 +346,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 "saveTextLogs": String(settings.saveTextLogs),
                 "safeCopyEnabled": String(settings.safeCopyEnabled)
             ])
-            statusLabel.stringValue = "已保存到本机共享目录"
+            statusLabel.stringValue = "设置已保存到本机共享目录"
         } catch {
             onRecordDiagnosticAction?("settings_save_failed", [
                 "errorCode": DiagnosticErrorFormatter.code(for: error),
@@ -379,28 +396,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    @objc private func diagnosticRecordingToggled() {
-        guard let onDiagnosticRecordingToggle else {
-            diagnosticCheckbox.state = .off
-            statusLabel.stringValue = "当前版本不支持故障诊断记录"
+    @objc private func exportDiagnosticLogPressed() {
+        guard let onExportDiagnosticLog else {
+            statusLabel.stringValue = "当前版本不支持导出诊断报告"
             return
         }
 
-        let starting = diagnosticCheckbox.state == .on
+        onRecordDiagnosticAction?("diagnostic_log_export_requested", [:])
         do {
-            let url = try onDiagnosticRecordingToggle(starting)
-            if starting {
-                statusLabel.stringValue = "故障诊断记录中；复现问题后再次点击结束"
-            } else if let url {
-                statusLabel.stringValue = "诊断已结束，JSON 已导出：\(url.lastPathComponent)"
+            if let url = try onExportDiagnosticLog() {
+                statusLabel.stringValue = "诊断报告已导出：\(url.lastPathComponent)"
             } else {
-                statusLabel.stringValue = "诊断记录已结束"
+                statusLabel.stringValue = "已取消导出"
             }
         } catch {
-            // Keep the checkbox on after an export failure so the user can
-            // retry without losing the in-memory trace.
-            diagnosticCheckbox.state = starting ? .off : .on
-            statusLabel.stringValue = "故障诊断操作失败：\(error.localizedDescription)"
+            statusLabel.stringValue = "诊断报告导出失败：\(error.localizedDescription)"
         }
     }
 

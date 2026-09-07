@@ -1,9 +1,15 @@
 import Foundation
 
 struct SessionLogEntry: Codable, Equatable, Sendable {
+    enum Kind: String, Codable, Sendable {
+        case session
+        case action
+    }
+
     let timestamp: Date
     let sessionID: UUID
     let eventID: UUID?
+    let kind: Kind
     let event: String
     let state: String?
     let injectionMode: String?
@@ -28,11 +34,45 @@ struct SessionLogEntry: Codable, Equatable, Sendable {
     let errorCode: Int?
     let failureCode: String?
     let failureMessage: String?
+    let metadata: [String: String]
+
+    private enum CodingKeys: String, CodingKey {
+        case timestamp
+        case sessionID
+        case eventID
+        case kind
+        case event
+        case state
+        case injectionMode
+        case targetApplicationName
+        case targetApplicationBundleIdentifier
+        case targetApplicationProcessID
+        case sequence
+        case sliceType
+        case wireFinal
+        case segmentID
+        case segmentPhase
+        case committedLength
+        case activeLength
+        case renderedLength
+        case revision
+        case writeCount
+        case backspaceCount
+        case deepReplacementCount
+        case maximumTrailingReplacementLength
+        case discardCount
+        case errorCount
+        case errorCode
+        case failureCode
+        case failureMessage
+        case metadata
+    }
 
     init(
         timestamp: Date = Date(),
         sessionID: UUID = UUID(),
         eventID: UUID? = UUID(),
+        kind: Kind = .session,
         event: String,
         state: String? = nil,
         injectionMode: String? = nil,
@@ -56,11 +96,13 @@ struct SessionLogEntry: Codable, Equatable, Sendable {
         errorCount: Int? = nil,
         errorCode: Int? = nil,
         failureCode: String? = nil,
-        failureMessage: String? = nil
+        failureMessage: String? = nil,
+        metadata: [String: String] = [:]
     ) {
         self.timestamp = timestamp
         self.sessionID = sessionID
         self.eventID = eventID
+        self.kind = kind
         self.event = event
         self.state = state
         self.injectionMode = injectionMode
@@ -84,7 +126,54 @@ struct SessionLogEntry: Codable, Equatable, Sendable {
         self.errorCount = errorCount
         self.errorCode = errorCode
         self.failureCode = failureCode
-        self.failureMessage = failureMessage
+        self.failureMessage = failureMessage.map {
+            DiagnosticLogSanitizer.value($0, forKey: "failureMessage")
+        }
+        self.metadata = DiagnosticLogSanitizer.fields(metadata)
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        timestamp = try container.decode(Date.self, forKey: .timestamp)
+        sessionID = try container.decode(UUID.self, forKey: .sessionID)
+        eventID = try container.decodeIfPresent(UUID.self, forKey: .eventID)
+        let rawKind = try container.decodeIfPresent(String.self, forKey: .kind) ?? Kind.session.rawValue
+        kind = Kind(rawValue: rawKind) ?? .session
+        event = try container.decode(String.self, forKey: .event)
+        state = try container.decodeIfPresent(String.self, forKey: .state)
+        injectionMode = try container.decodeIfPresent(String.self, forKey: .injectionMode)
+        targetApplicationName = try container.decodeIfPresent(String.self, forKey: .targetApplicationName)
+        targetApplicationBundleIdentifier = try container.decodeIfPresent(
+            String.self,
+            forKey: .targetApplicationBundleIdentifier
+        )
+        targetApplicationProcessID = try container.decodeIfPresent(Int32.self, forKey: .targetApplicationProcessID)
+        sequence = try container.decodeIfPresent(Int.self, forKey: .sequence)
+        sliceType = try container.decodeIfPresent(Int.self, forKey: .sliceType)
+        wireFinal = try container.decodeIfPresent(Bool.self, forKey: .wireFinal)
+        segmentID = try container.decodeIfPresent(Int.self, forKey: .segmentID)
+        segmentPhase = try container.decodeIfPresent(String.self, forKey: .segmentPhase)
+        committedLength = try container.decodeIfPresent(Int.self, forKey: .committedLength)
+        activeLength = try container.decodeIfPresent(Int.self, forKey: .activeLength)
+        renderedLength = try container.decodeIfPresent(Int.self, forKey: .renderedLength)
+        revision = try container.decodeIfPresent(UInt64.self, forKey: .revision)
+        writeCount = try container.decodeIfPresent(Int.self, forKey: .writeCount)
+        backspaceCount = try container.decodeIfPresent(Int.self, forKey: .backspaceCount)
+        deepReplacementCount = try container.decodeIfPresent(Int.self, forKey: .deepReplacementCount)
+        maximumTrailingReplacementLength = try container.decodeIfPresent(
+            Int.self,
+            forKey: .maximumTrailingReplacementLength
+        )
+        discardCount = try container.decodeIfPresent(Int.self, forKey: .discardCount)
+        errorCount = try container.decodeIfPresent(Int.self, forKey: .errorCount)
+        errorCode = try container.decodeIfPresent(Int.self, forKey: .errorCode)
+        failureCode = try container.decodeIfPresent(String.self, forKey: .failureCode)
+        failureMessage = try container.decodeIfPresent(String.self, forKey: .failureMessage).map {
+            DiagnosticLogSanitizer.value($0, forKey: "failureMessage")
+        }
+        metadata = DiagnosticLogSanitizer.fields(
+            try container.decodeIfPresent([String: String].self, forKey: .metadata) ?? [:]
+        )
     }
 }
 
@@ -93,41 +182,21 @@ final class SessionLogger {
     private let enabled: () -> Bool
     private let fileManager = FileManager.default
     private let applicationSupportDirectoryURL: URL
-    private let diagnosticExportDirectoryURL: URL?
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var inMemoryEntries: [SessionLogEntry] = []
-    private var diagnosticRecorder: DiagnosticSessionRecorder?
+    private let diagnosticActionSessionID = UUID()
     private let inMemoryLimit = 300
 
     init(
         enabled: @escaping () -> Bool,
-        applicationSupportDirectoryURL: URL? = nil,
-        diagnosticExportDirectoryURL: URL? = nil
+        applicationSupportDirectoryURL: URL? = nil
     ) {
         self.enabled = enabled
         self.applicationSupportDirectoryURL = applicationSupportDirectoryURL
             ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        self.diagnosticExportDirectoryURL = diagnosticExportDirectoryURL
-        encoder.dateEncodingStrategy = .custom { date, encoder in
-            var container = encoder.singleValueContainer()
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            try container.encode(formatter.string(from: date))
-        }
-        decoder.dateDecodingStrategy = .custom { decoder in
-            let container = try decoder.singleValueContainer()
-            let value = try container.decode(String.self)
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            guard let date = formatter.date(from: value) else {
-                throw DecodingError.dataCorruptedError(
-                    in: container,
-                    debugDescription: "Invalid ISO-8601 timestamp"
-                )
-            }
-            return date
-        }
+        DiagnosticJSON.configureDateEncoding(for: encoder)
+        DiagnosticJSON.configureDateDecoding(for: decoder)
     }
 
     func append(_ entry: SessionLogEntry) throws {
@@ -135,7 +204,6 @@ final class SessionLogger {
         if inMemoryEntries.count > inMemoryLimit {
             inMemoryEntries.removeFirst(inMemoryEntries.count - inMemoryLimit)
         }
-        diagnosticRecorder?.recordSessionEntry(entry)
         guard enabled() else { return }
         let directory = applicationSupportDirectoryURL
             .appendingPathComponent("TencentVoiceMVP/sessions", isDirectory: true)
@@ -161,7 +229,15 @@ final class SessionLogger {
     }
 
     func recentPersistedEntries(limit: Int = 120) -> [SessionLogEntry] {
-        guard limit > 0 else { return [] }
+        persistedEntries(limit: limit)
+    }
+
+    func allPersistedEntries() -> [SessionLogEntry] {
+        persistedEntries(limit: nil)
+    }
+
+    private func persistedEntries(limit: Int?) -> [SessionLogEntry] {
+        if let limit, limit <= 0 { return [] }
         let directory = applicationSupportDirectoryURL
             .appendingPathComponent("TencentVoiceMVP/sessions", isDirectory: true)
         guard let urls = try? fileManager.contentsOfDirectory(
@@ -187,7 +263,7 @@ final class SessionLogger {
                 guard let lineData = line.data(using: .utf8),
                       let entry = try? decoder.decode(SessionLogEntry.self, from: lineData) else { continue }
                 entries.append(entry)
-                if entries.count >= limit { return Array(entries.reversed()) }
+                if let limit, entries.count >= limit { return Array(entries.reversed()) }
             }
         }
         return Array(entries.reversed())
@@ -198,63 +274,19 @@ final class SessionLogger {
             .appendingPathComponent("TencentVoiceMVP/sessions", isDirectory: true)
     }
 
-    var isDiagnosticRecording: Bool {
-        diagnosticRecorder?.isRecording == true
-    }
-
-    func startDiagnosticRecording(appInfo: DiagnosticAppInfo? = nil) throws {
-        guard diagnosticRecorder?.isRecording != true else {
-            throw DiagnosticRecordingError.alreadyRecording
-        }
-        let recorder = DiagnosticSessionRecorder(
-            exportDirectoryURL: diagnosticExportDirectoryURL,
-            journalURL: diagnosticJournalURL
-        )
-        try recorder.start(appInfo: appInfo ?? AppRuntimeInspector.inspect())
-        diagnosticRecorder = recorder
-    }
-
     func recordDiagnosticAction(
         _ name: String,
         sessionID: UUID? = nil,
         fields: [String: String] = [:]
     ) {
-        diagnosticRecorder?.recordAction(
-            name: name,
-            sessionID: sessionID,
-            fields: fields
+        let metadata = DiagnosticLogSanitizer.fields(fields)
+        let entry = SessionLogEntry(
+            sessionID: sessionID ?? diagnosticActionSessionID,
+            kind: .action,
+            event: name,
+            failureCode: metadata["errorCode"],
+            metadata: metadata
         )
-    }
-
-    func stopDiagnosticRecordingAndExport(appInfo: DiagnosticAppInfo? = nil) throws -> URL {
-        guard let diagnosticRecorder else {
-            throw DiagnosticRecordingError.notRecording
-        }
-        let url = try diagnosticRecorder.stopAndExport(
-            appInfo: appInfo ?? AppRuntimeInspector.inspect()
-        )
-        self.diagnosticRecorder = nil
-        return url
-    }
-
-    @discardableResult
-    func recoverInterruptedDiagnosticRecording(
-        appInfo: DiagnosticAppInfo? = nil
-    ) throws -> URL? {
-        guard fileManager.fileExists(atPath: diagnosticJournalURL.path) else {
-            return nil
-        }
-        let recorder = DiagnosticSessionRecorder(
-            exportDirectoryURL: diagnosticExportDirectoryURL,
-            journalURL: diagnosticJournalURL
-        )
-        return try recorder.recoverInterruptedRecording(
-            appInfo: appInfo ?? AppRuntimeInspector.inspect()
-        )
-    }
-
-    private var diagnosticJournalURL: URL {
-        applicationSupportDirectoryURL
-            .appendingPathComponent("TencentVoiceMVP/diagnostics/active.json")
+        try? append(entry)
     }
 }
