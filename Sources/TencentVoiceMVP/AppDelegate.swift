@@ -149,6 +149,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         migrateLocalUsageIfNeeded()
         updateLocalUsageDisplay()
         startLocalUsageMonitor()
+        if UserDefaults.standard.bool(forKey: "resumePermissionSetup") {
+            UserDefaults.standard.removeObject(forKey: "resumePermissionSetup")
+            showSettings()
+            settingsWindowController?.resumePermissionSetup()
+        }
     }
 
     private func installMainMenu() {

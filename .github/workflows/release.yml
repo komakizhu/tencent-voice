@@ -28,6 +28,7 @@ jobs:
         env:
           CODESIGN_IDENTITY: "-"
           TVMVP_DISPLAY_NAME: Rime Voice
+          TVMVP_PUBLIC_RELEASE: "1"
         run: ./scripts/build-app.sh
 
       - name: Verify app bundle

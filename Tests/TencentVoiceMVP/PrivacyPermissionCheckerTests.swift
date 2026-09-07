@@ -49,6 +49,38 @@ final class PrivacyPermissionCheckerTests: XCTestCase {
         )
     }
 
+    func testPermissionActionsUseInjectedResetAndSettingsActions() {
+        var resetCount = 0
+        var openCount = 0
+        var requestedPermission: PrivacyPermission?
+        var requestResult = false
+        let checker = SystemPrivacyPermissionChecker(
+            openSettings: { permission in
+                XCTAssertEqual(permission, .microphone)
+                openCount += 1
+                return true
+            },
+            requestPermission: { permission, completion in
+                requestedPermission = permission
+                completion(true)
+            },
+            resetPermissions: {
+                resetCount += 1
+                return true
+            }
+        )
+
+        XCTAssertTrue(checker.resetPermissions())
+        XCTAssertTrue(checker.openSettings(for: .microphone))
+        checker.requestPermission(for: .inputMonitoring) { granted in
+            requestResult = granted
+        }
+        XCTAssertEqual(resetCount, 1)
+        XCTAssertEqual(openCount, 1)
+        XCTAssertEqual(requestedPermission, .inputMonitoring)
+        XCTAssertTrue(requestResult)
+    }
+
     func testReportDoesNotTreatUndecidedOrDeniedPermissionsAsGranted() {
         let checker = SystemPrivacyPermissionChecker(
             microphoneStatus: { .notDetermined },

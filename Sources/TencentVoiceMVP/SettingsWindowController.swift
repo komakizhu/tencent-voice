@@ -148,7 +148,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let statusLabel = NSTextField(labelWithString: "凭证优先保存在本机 YAML")
     private let testButton = NSButton(title: "测试连接", target: nil, action: nil)
     private let exportDiagnosticLogButton = NSButton(title: "导出诊断报告", target: nil, action: nil)
-    private let permissionCheckButton = NSButton(title: "检查权限", target: nil, action: nil)
+    private let permissionResetButton = NSButton(title: "重置并重新授权", target: nil, action: nil)
     private let permissionRowsStack = NSStackView()
     private let logDirectoryURL: URL
     private let diagnosticDirectoryURL: URL
@@ -166,6 +166,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var localMonitor: Any?
     private var testTask: Task<Void, Never>?
     private var permissionStateLabels: [PrivacyPermission: NSTextField] = [:]
+    private var permissionRefreshPending = false
+    private var permissionGuideWindowController: PermissionSetupGuideWindowController?
+    private let onPermissionResetRestart: (() -> Void)?
 
     init(
         settings: AppSettings,
@@ -178,6 +181,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         logDirectoryURL: URL? = nil,
         diagnosticDirectoryURL: URL? = nil,
         onOpenDirectory: ((URL) -> Bool)? = nil,
+        onPermissionResetRestart: (() -> Void)? = nil,
         onClose: @escaping () -> Void = {}
     ) {
         let window = NSWindow(
@@ -197,6 +201,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             ?? FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0]
         self.onOpenDirectory = onOpenDirectory
         self.onClose = onClose
+        self.onPermissionResetRestart = onPermissionResetRestart
         currentShortcut = settings.shortcut
         let selectedPreset = TencentEnginePreset(persistedModelType: settings.engineModelType)
         displayedEngineModelType = selectedPreset.rawValue
@@ -234,10 +239,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func windowWillClose(_ notification: Notification) {
+        permissionGuideWindowController?.close()
+        permissionGuideWindowController = nil
         stopShortcutCapture()
         testTask?.cancel()
         testTask = nil
         onClose()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        guard permissionRefreshPending else { return }
+        permissionRefreshPending = false
+        let report = refreshPermissionReport()
+        if report.allGranted {
+            statusLabel.stringValue = "权限已全部恢复，可以开始录音。"
+        } else {
+            statusLabel.stringValue = "仍缺少：\(report.missing.map(\.title).joined(separator: "、"))；请继续开启后回到这里。"
+        }
     }
 
     private func buildView() {
@@ -301,9 +319,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         safeCopyCheckbox.toolTip = "开启后始终把识别结果复制到剪贴板；关闭后只按正常方式输入。"
         logCheckbox.toolTip = "开启后自动保存会话状态、错误代码和操作上下文；点击右侧“导出诊断报告”导出已保存内容。"
         saveButton.toolTip = "保存腾讯云凭证和设置；日志开关、Safe Copy 与快捷键也在此生效。"
-        permissionCheckButton.target = self
-        permissionCheckButton.action = #selector(checkPermissionsPressed)
-        permissionCheckButton.toolTip = "重新读取当前 macOS 账户的权限状态。"
+        permissionResetButton.target = self
+        permissionResetButton.action = #selector(resetPermissionsPressed)
+        permissionResetButton.toolTip = "清除 Rime Voice 的全部 macOS 权限记录，打开隐私设置，从头重新授权。"
         statusLabel.toolTip = "显示当前设置页操作、权限、连接测试、快捷键和导出结果。"
         versionLabel.toolTip = "显示当前应用版本和构建号。"
         let buttons = NSStackView(views: [statusLabel, NSView(), saveButton])
@@ -342,7 +360,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let title = NSTextField(labelWithString: "系统权限（当前 macOS 账户）")
         title.font = .boldSystemFont(ofSize: NSFont.systemFontSize)
         title.toolTip = "下面列出的权限用于录音、识别结果输入和全局快捷键。"
-        let titleRow = NSStackView(views: [title, NSView(), permissionCheckButton])
+        let titleRow = NSStackView(views: [title, NSView(), permissionResetButton])
         titleRow.alignment = .centerY
         titleRow.spacing = 8
         titleRow.translatesAutoresizingMaskIntoConstraints = false
@@ -464,13 +482,67 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return "~" + String(path.dropFirst(home.count))
     }
 
-    @objc private func checkPermissionsPressed() {
-        let report = refreshPermissionReport()
-        onRecordDiagnosticAction?("permissions_checked", [
-            "missingCount": String(report.missing.count),
-            "grantedCount": String(report.statuses.filter { $0.isGranted }.count)
+    @objc private func resetPermissionsPressed() {
+        let didReset = permissionChecker.resetPermissions()
+        onRecordDiagnosticAction?("permissions_reset_requested", [
+            "succeeded": String(didReset)
         ])
-        statusLabel.stringValue = "权限检查完成；缺失项可点击旁边的“打开设置”"
+        guard didReset else {
+            let report = refreshPermissionReport()
+            statusLabel.stringValue = report.allGranted
+                ? "无法重置权限；当前权限仍可用。"
+                : "无法自动重置权限，请退出应用后重试。"
+            return
+        }
+
+        // A fresh process is required after TCC reset: permission APIs may cache results.
+        if let onPermissionResetRestart {
+            onPermissionResetRestart()
+            return
+        }
+        if !Self.relaunchForPermissionSetup() {
+            statusLabel.stringValue = "授权记录已重置，但自动重启失败。请退出后重新打开 Rime Voice。"
+        }
+    }
+
+    static func relaunchForPermissionSetup() -> Bool {
+        UserDefaults.standard.set(true, forKey: "resumePermissionSetup")
+        let relaunch = Process()
+        relaunch.executableURL = URL(fileURLWithPath: "/bin/sh")
+        relaunch.arguments = ["-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open -g \"$2\"", "rime-voice-relaunch", String(ProcessInfo.processInfo.processIdentifier), Bundle.main.bundlePath]
+        do {
+            try relaunch.run()
+            NSApp.terminate(nil)
+            return true
+        } catch {
+            UserDefaults.standard.removeObject(forKey: "resumePermissionSetup")
+            return false
+        }
+    }
+
+    func resumePermissionSetup() {
+        permissionRefreshPending = true
+        for permission in PrivacyPermission.allCases {
+            permissionStateLabels[permission]?.stringValue = "待重新授权"
+            permissionStateLabels[permission]?.textColor = .systemRed
+        }
+
+        permissionGuideWindowController?.close()
+        permissionGuideWindowController = PermissionSetupGuideWindowController(
+            permissionChecker: permissionChecker,
+            onFinished: { [weak self] in
+                guard let self else { return }
+                permissionGuideWindowController = nil
+                permissionRefreshPending = false
+                let report = refreshPermissionReport()
+                statusLabel.stringValue = report.allGranted
+                    ? "权限已全部恢复，可以开始录音。"
+                    : "权限向导已结束；仍缺少：\(report.missing.map(\.title).joined(separator: "、"))。"
+            }
+        )
+        permissionGuideWindowController?.showWindow(nil)
+        permissionGuideWindowController?.window?.center()
+        statusLabel.stringValue = "已重新启动并检测授权。已生效的步骤会自动通过。"
     }
 
     @objc private func openPermissionSettingsPressed(_ sender: NSButton) {
@@ -479,7 +551,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             "permission": String(permission.rawValue)
         ])
         if permissionChecker.openSettings(for: permission) {
-            statusLabel.stringValue = "已打开“\(permission.title)”设置；开启后回来点击“检查权限”"
+            permissionRefreshPending = true
+            statusLabel.stringValue = "已打开“\(permission.title)”设置；开启后回到这里会自动刷新状态。"
         } else {
             statusLabel.stringValue = "无法自动打开系统设置，请手动进入“隐私与安全性”"
         }

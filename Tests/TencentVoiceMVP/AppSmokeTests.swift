@@ -134,7 +134,7 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertEqual(Set(labelPositions).count, 1)
 
         let removedTexts = [
-            "操作：点击“打开设置”→打开对应项目中的本应用开关→回到这里点击“检查权限”。",
+            "操作：点击“打开设置”→打开对应项目中的本应用开关→回到这里点击“重置并重新授权”。",
             "系统权限完整，可以录音并把识别结果输入到当前应用。",
             "适用于所有支持文本输入的应用；保存后生效；关闭时发生输入错误不会自动复制",
             "勾选后点击“保存设置”生效；开启后自动保存会话状态、错误代码和操作上下文；点击“另存为…”导出全部已保存内容（不含密钥、录音和识别正文）"
@@ -164,7 +164,7 @@ final class AppSmokeTests: XCTestCase {
             "重新录制",
             "导出诊断报告",
             "保存设置",
-            "检查权限"
+            "重置并重新授权"
         ]
         for title in requiredTooltipTitles {
             let matchingControls = controls.filter { $0.title == title }
@@ -180,15 +180,15 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertTrue(permissionButtons.allSatisfy { !($0.toolTip ?? "").isEmpty })
 
         let permissionTitle = labels.first { $0.stringValue == "系统权限（当前 macOS 账户）" }
-        let permissionCheckButton = flatten(contentView)
+        let permissionResetButton = flatten(contentView)
             .compactMap { $0 as? NSButton }
-            .first { $0.title == "检查权限" }
-        guard let permissionTitle, let permissionCheckButton else {
-            XCTFail("系统权限标题或检查权限按钮不存在")
+            .first { $0.title == "重置并重新授权" }
+        guard let permissionTitle, let permissionResetButton else {
+            XCTFail("系统权限标题或重置并重新授权按钮不存在")
             return
         }
         let titleFrame = permissionTitle.convert(permissionTitle.bounds, to: contentView)
-        let buttonFrame = permissionCheckButton.convert(permissionCheckButton.bounds, to: contentView)
+        let buttonFrame = permissionResetButton.convert(permissionResetButton.bounds, to: contentView)
         XCTAssertEqual(titleFrame.midY, buttonFrame.midY, accuracy: 1)
         XCTAssertGreaterThan(buttonFrame.minX, titleFrame.maxX)
 
@@ -218,8 +218,8 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertEqual(exportFrame.midY, logFrame.midY, accuracy: 1)
         XCTAssertGreaterThan(exportFrame.minX, logFrame.maxX)
         XCTAssertLessThan(saveFrame.minY, exportFrame.minY)
-        let permissionCheckFrame = permissionCheckButton.convert(permissionCheckButton.bounds, to: contentView)
-        XCTAssertEqual(saveFrame.maxX, permissionCheckFrame.maxX, accuracy: 1)
+        let permissionResetFrame = permissionResetButton.convert(permissionResetButton.bounds, to: contentView)
+        XCTAssertEqual(saveFrame.maxX, permissionResetFrame.maxX, accuracy: 1)
 
         XCTAssertEqual(saveButton.accessibilityLabel(), "保存设置")
         XCTAssertFalse(controls.contains { $0.title == "打开共享目录" })
@@ -240,6 +240,124 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertTrue(helperTexts.allSatisfy { text in
             !labels.contains { $0.stringValue == text }
         })
+    }
+
+    func testPermissionResetButtonPresentsStepByStepGuide() throws {
+        var resetCount = 0
+        var restartCount = 0
+        var openCount = 0
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .authorized },
+            accessibilityStatus: { true },
+            postEventStatus: { true },
+            inputMonitoringStatus: { true },
+            openSettings: { _ in
+                openCount += 1
+                return true
+            },
+            resetPermissions: {
+                resetCount += 1
+                return true
+            }
+        )
+        let controller = SettingsWindowController(
+            settings: AppSettings(),
+            credentials: nil,
+            onSave: { _, _ in },
+            permissionChecker: checker,
+            onPermissionResetRestart: { restartCount += 1 }
+        )
+
+        let button = try XCTUnwrap(
+            flatten(controller.window?.contentView)
+                .compactMap { $0 as? NSButton }
+                .first { $0.title == "重置并重新授权" }
+        )
+        button.performClick(nil)
+
+        XCTAssertEqual(resetCount, 1)
+        XCTAssertEqual(openCount, 0)
+        XCTAssertEqual(restartCount, 1)
+    }
+
+    func testPermissionSetupGuideAdvancesOnePermissionAtATime() throws {
+        var granted = Set<PrivacyPermission>()
+        var openedPermissions: [PrivacyPermission] = []
+        var requestedPermissions: [PrivacyPermission] = []
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { granted.contains(.microphone) ? .authorized : .notDetermined },
+            accessibilityStatus: { granted.contains(.accessibility) },
+            postEventStatus: { granted.contains(.postEvent) },
+            inputMonitoringStatus: { granted.contains(.inputMonitoring) },
+            openSettings: { permission in
+                openedPermissions.append(permission)
+                return true
+            },
+            requestPermission: { permission, completion in
+                requestedPermissions.append(permission)
+                completion(false)
+            },
+            resetPermissions: { true }
+        )
+        let guide = PermissionSetupGuideWindowController(permissionChecker: checker)
+
+        let openButton = try XCTUnwrap(
+            flatten(guide.window?.contentView)
+                .compactMap { $0 as? NSButton }
+                .first { $0.title == "打开麦克风设置" }
+        )
+        let nextButton = try XCTUnwrap(
+            flatten(guide.window?.contentView)
+                .compactMap { $0 as? NSButton }
+                .first { $0.title == "我已开启，检查下一步" }
+        )
+        openButton.performClick(nil)
+        XCTAssertEqual(openedPermissions, [.microphone])
+
+        nextButton.performClick(nil)
+        XCTAssertNotNil(
+            flatten(guide.window?.contentView)
+                .compactMap { $0 as? NSTextField }
+                .first { $0.stringValue == "开启麦克风" },
+        )
+
+        granted.insert(.microphone)
+        nextButton.performClick(nil)
+        XCTAssertTrue(
+            flatten(guide.window?.contentView)
+                .compactMap { $0 as? NSTextField }
+                .contains { $0.stringValue == "开启辅助功能" }
+        )
+        granted.insert(.accessibility)
+        guide.windowDidBecomeKey(Notification(name: NSWindow.didBecomeKeyNotification))
+        XCTAssertEqual(requestedPermissions, [.microphone, .accessibility, .postEvent])
+        guide.windowDidBecomeKey(Notification(name: NSWindow.didBecomeKeyNotification))
+        XCTAssertEqual(requestedPermissions, [.microphone, .accessibility, .postEvent])
+        XCTAssertTrue(flatten(guide.window?.contentView).compactMap { $0 as? NSTextField }
+            .contains { $0.stringValue.contains("辅助功能已允许；发送键盘事件尚未生效") })
+        nextButton.performClick(nil)
+        XCTAssertTrue(flatten(guide.window?.contentView).compactMap { $0 as? NSTextField }
+            .contains { $0.stringValue == "开启辅助功能" })
+        granted.insert(.postEvent)
+        guide.windowDidBecomeKey(Notification(name: NSWindow.didBecomeKeyNotification))
+        try XCTUnwrap(
+            flatten(guide.window?.contentView)
+                .compactMap { $0 as? NSButton }
+                .first { $0.title == "进入下一步" }
+        ).performClick(nil)
+        granted.insert(.inputMonitoring)
+        guide.windowDidBecomeKey(Notification(name: NSWindow.didBecomeKeyNotification))
+        try XCTUnwrap(
+            flatten(guide.window?.contentView)
+                .compactMap { $0 as? NSButton }
+                .first { $0.title == "进入下一步" }
+        ).performClick(nil)
+
+        XCTAssertTrue(
+            flatten(guide.window?.contentView)
+                .compactMap { $0 as? NSTextField }
+                .contains { $0.stringValue == "权限已全部开启" }
+        )
     }
 
     func testSettingsWindowOpensConfiguredLogDirectory() throws {

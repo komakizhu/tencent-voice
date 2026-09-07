@@ -5,9 +5,19 @@ PROJECT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PRODUCT_NAME="TencentVoiceMVP"
 SIGNING_IDENTITY="${CODESIGN_IDENTITY:-OneKeyIFlyVoice Local Code Signing v4}"
 PACING_PRESET="${TVMVP_PACING_PRESET:-balanced}"
+PUBLIC_RELEASE="${TVMVP_PUBLIC_RELEASE:-0}"
 INFO_PLIST="$PROJECT_DIR/Resources/Info.plist"
 BUNDLE_SHORT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST")"
 BUNDLE_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO_PLIST")"
+
+case "$PUBLIC_RELEASE" in
+0|1)
+    ;;
+*)
+    echo "TVMVP_PUBLIC_RELEASE must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
 
 SWIFT_DEFINITIONS=()
 case "$PACING_PRESET" in
@@ -134,6 +144,11 @@ cp "$PROJECT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$PROJECT_DIR/Resources/brand-kit-graphite/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 cp "$PROJECT_DIR/Resources/brand-kit-graphite/statusbar-matched.png" "$APP_DIR/Contents/Resources/statusbar-matched.png"
 plutil -replace CFBundleDisplayName -string "$DISPLAY_NAME" "$APP_DIR/Contents/Info.plist"
+if [[ "$PUBLIC_RELEASE" == "1" ]]; then
+    plutil -replace RimeVoiceShowBuild -bool false "$APP_DIR/Contents/Info.plist"
+else
+    plutil -replace RimeVoiceShowBuild -bool true "$APP_DIR/Contents/Info.plist"
+fi
 if [[ "$SIGNING_IDENTITY" == "-" ]]; then
     codesign --force --deep --sign - "$APP_DIR" >/dev/null
 else
