@@ -22,6 +22,11 @@ final class ManualRimeEntryForm: NSView {
 
         translatesAutoresizingMaskIntoConstraints = true
         let fields = [wordField, codeField, frequencyField]
+        let toolTips = [
+            "要添加到 Rime 词库的长期记忆词条。",
+            "词条对应的全拼编码，例如“nihao”；这是必填项。",
+            "词条的初始频率；可留空，默认使用 1。"
+        ]
         for (index, field) in fields.enumerated() {
             field.placeholderString = index == 0
                 ? "词条（必填）"
@@ -33,10 +38,12 @@ final class ManualRimeEntryForm: NSView {
             field.isBordered = true
             field.bezelStyle = .roundedBezel
             field.drawsBackground = true
+            field.toolTip = toolTips[index]
             field.translatesAutoresizingMaskIntoConstraints = true
             field.autoresizingMask = [.width]
 
             let label = labels[index]
+            label.toolTip = toolTips[index]
             label.translatesAutoresizingMaskIntoConstraints = true
             label.autoresizingMask = [.maxXMargin]
             addSubview(label)

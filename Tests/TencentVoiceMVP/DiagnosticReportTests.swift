@@ -108,7 +108,7 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertTrue(report.renderedText().contains("完全退出后重新打开"))
     }
 
-    func testBuilderOnlyReadsPersistedEventsWhenPersistentLoggingIsEnabled() throws {
+    func testBuilderIncludesPersistedEventsInTheUnifiedExport() throws {
         let testDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("TencentVoiceMVP-DiagnosticReportTests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: testDirectory) }
@@ -144,7 +144,8 @@ final class DiagnosticReportTests: XCTestCase {
             logger: reader,
             appInfo: appInfo()
         ).build()
-        XCTAssertTrue(disabledReport.events.isEmpty)
+        XCTAssertEqual(disabledReport.events.count, 1)
+        XCTAssertEqual(disabledReport.events.first?.eventID, entry.eventID)
 
         settingsStore.save(AppSettings(saveTextLogs: true))
         let enabledReport = DiagnosticReportBuilder(
@@ -157,6 +158,49 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertEqual(enabledReport.events.count, 1)
         XCTAssertEqual(enabledReport.events.first?.eventID, entry.eventID)
         XCTAssertEqual(enabledReport.events.first?.failureCode, entry.failureCode)
+    }
+
+    func testBuilderExportsAllPersistedEventsWithoutARecentEventCap() throws {
+        let testDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVP-DiagnosticReportTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: testDirectory) }
+
+        let logger = SessionLogger(
+            enabled: { true },
+            applicationSupportDirectoryURL: testDirectory
+        )
+        for index in 0..<161 {
+            try logger.append(SessionLogEntry(
+                timestamp: Date(timeIntervalSince1970: 1_700_000_000 + Double(index)),
+                event: "session_event",
+                sequence: index
+            ))
+        }
+
+        let settingsStore = UserDefaultsSettingsStore(
+            suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"
+        )
+        let credentialStore = InMemoryCredentialStore(
+            TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+        )
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .authorized },
+            accessibilityStatus: { true },
+            postEventStatus: { true },
+            inputMonitoringStatus: { true }
+        )
+
+        let report = DiagnosticReportBuilder(
+            permissionChecker: checker,
+            credentialStore: credentialStore,
+            settingsStore: settingsStore,
+            logger: logger,
+            appInfo: appInfo()
+        ).build()
+
+        XCTAssertEqual(report.events.count, 161)
+        XCTAssertEqual(report.events.first?.sequence, 0)
+        XCTAssertEqual(report.events.last?.sequence, 160)
     }
 
     func testReportHidesUnrecognizedFailureMessages() {
@@ -310,6 +354,77 @@ final class DiagnosticReportTests: XCTestCase {
 
         XCTAssertEqual(logger.recentEntries(), [entry])
         XCTAssertTrue(logger.recentPersistedEntries().isEmpty)
+    }
+
+    func testLoggerPersistsDiagnosticActionsIntoTheUnifiedExportLog() throws {
+        let testDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVP-DiagnosticReportTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: testDirectory) }
+
+        let logger = SessionLogger(
+            enabled: { true },
+            applicationSupportDirectoryURL: testDirectory
+        )
+        logger.recordDiagnosticAction(
+            "connection_test_finished",
+            fields: [
+                "engineModelType": "16k_zh",
+                "errorCode": "text_target_changed",
+                "errorMessage": "SecretKey=must-not-be-exported"
+            ]
+        )
+
+        let entries = logger.recentPersistedEntries(limit: 10)
+        let action = try XCTUnwrap(entries.first)
+        XCTAssertEqual(action.kind, .action)
+        XCTAssertEqual(action.event, "connection_test_finished")
+        XCTAssertEqual(action.metadata["engineModelType"], "16k_zh")
+        XCTAssertEqual(action.metadata["errorCode"], "text_target_changed")
+        XCTAssertEqual(action.metadata["errorMessage"], "已隐藏")
+    }
+
+    func testUnifiedLogSanitizesFailureMessagesBeforeExport() throws {
+        let testDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVP-DiagnosticReportTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: testDirectory) }
+
+        let logger = SessionLogger(
+            enabled: { true },
+            applicationSupportDirectoryURL: testDirectory
+        )
+        try logger.append(SessionLogEntry(
+            event: "error",
+            failureCode: "text_target_changed",
+            failureMessage: "SecretKey=must-not-be-exported"
+        ))
+
+        let data = try XCTUnwrap(
+            FileManager.default.contentsOfDirectory(
+                at: testDirectory.appendingPathComponent("TencentVoiceMVP/sessions", isDirectory: true),
+                includingPropertiesForKeys: nil
+            ).first.flatMap { try? Data(contentsOf: $0) }
+        )
+        let json = String(decoding: data, as: UTF8.self)
+        XCTAssertFalse(json.contains("SecretKey=must-not-be-exported"))
+        XCTAssertTrue(json.contains("text_target_changed"))
+    }
+
+    func testLegacySessionEntriesDecodeAsSessionEvents() throws {
+        let sessionID = UUID()
+        let data = Data("""
+        {
+          "timestamp": "2026-09-07T05:00:00.000Z",
+          "sessionID": "\(sessionID.uuidString)",
+          "event": "started",
+          "state": "listening"
+        }
+        """.utf8)
+
+        let entry = try DiagnosticJSON.decoder().decode(SessionLogEntry.self, from: data)
+
+        XCTAssertEqual(entry.sessionID, sessionID)
+        XCTAssertEqual(entry.kind, .session)
+        XCTAssertEqual(entry.metadata, [:])
     }
 
     private func appInfo() -> DiagnosticAppInfo {

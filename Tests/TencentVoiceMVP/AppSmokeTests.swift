@@ -109,27 +109,51 @@ final class AppSmokeTests: XCTestCase {
 
         let removedTexts = [
             "操作：点击“打开设置”→打开对应项目中的本应用开关→回到这里点击“检查权限”。",
-            "系统权限完整，可以录音并把识别结果输入到当前应用。"
+            "系统权限完整，可以录音并把识别结果输入到当前应用。",
+            "适用于所有支持文本输入的应用；保存后生效；关闭时发生输入错误不会自动复制",
+            "勾选后点击“保存设置”生效；开启后自动保存会话状态、错误代码和操作上下文；点击“另存为…”导出全部已保存内容（不含密钥、录音和识别正文）"
         ] + PrivacyPermission.allCases.map(\.purpose)
         XCTAssertTrue(removedTexts.allSatisfy { text in
             !labels.contains { $0.stringValue == text }
         })
-        let buttons = flatten(contentView).compactMap { $0 as? NSButton }
-        XCTAssertTrue(buttons.contains { $0.title == "保存会话日志" })
-        XCTAssertFalse(buttons.contains { $0.title == "保存崩溃日志" })
-        XCTAssertFalse(buttons.contains { $0.title == "保存文本日志" })
-        XCTAssertTrue(
-            flatten(contentView)
-                .compactMap { $0 as? NSButton }
-                .contains { $0.title == "故障诊断记录" }
-        )
-        XCTAssertTrue(
-            flatten(contentView)
-                .compactMap { $0 as? NSButton }
-                .contains { $0.title == "Safe Copy（始终复制到剪贴板）" }
-        )
+        let credentialFields = ["AppID", "SecretId", "SecretKey"].compactMap { title in
+            labels.first { $0.placeholderString == title }
+        }
+        XCTAssertEqual(credentialFields.count, 3)
+        XCTAssertTrue(credentialFields.allSatisfy { !($0.toolTip ?? "").isEmpty })
 
-        let permissionTitle = labels.first { $0.stringValue == "系统权限" }
+        let popups = flatten(contentView).compactMap { $0 as? NSPopUpButton }
+        XCTAssertEqual(popups.count, 2)
+        XCTAssertTrue(popups.allSatisfy { !($0.toolTip ?? "").isEmpty })
+
+        let controls = flatten(contentView).compactMap { $0 as? NSButton }
+        XCTAssertTrue(controls.contains { $0.title == "自动保存诊断日志" })
+        XCTAssertFalse(controls.contains { $0.title == "保存崩溃日志" })
+        XCTAssertFalse(controls.contains { $0.title == "故障诊断记录" })
+        XCTAssertTrue(controls.contains { $0.title == "Safe Copy（始终复制到剪贴板）" })
+        let requiredTooltipTitles = [
+            "测试连接",
+            "Safe Copy（始终复制到剪贴板）",
+            "自动保存诊断日志",
+            "重新录制",
+            "导出诊断报告",
+            "保存设置",
+            "检查权限"
+        ]
+        for title in requiredTooltipTitles {
+            let matchingControls = controls.filter { $0.title == title }
+            XCTAssertFalse(matchingControls.isEmpty, "找不到控件：\(title)")
+            XCTAssertTrue(
+                matchingControls.allSatisfy { !($0.toolTip ?? "").isEmpty },
+                "控件缺少悬浮说明：\(title)"
+            )
+        }
+
+        let permissionButtons = controls.filter { $0.title == "打开设置" }
+        XCTAssertEqual(permissionButtons.count, PrivacyPermission.allCases.count)
+        XCTAssertTrue(permissionButtons.allSatisfy { !($0.toolTip ?? "").isEmpty })
+
+        let permissionTitle = labels.first { $0.stringValue == "系统权限（当前 macOS 账户）" }
         let permissionCheckButton = flatten(contentView)
             .compactMap { $0 as? NSButton }
             .first { $0.title == "检查权限" }
@@ -148,24 +172,33 @@ final class AppSmokeTests: XCTestCase {
         let shortcutLabel = labels.first { $0.stringValue == "快捷键" }
         let logCheckbox = flatten(contentView)
             .compactMap { $0 as? NSButton }
-            .first { $0.title == "保存会话日志" }
+            .first { $0.title == "自动保存诊断日志" }
         let saveButton = flatten(contentView)
             .compactMap { $0 as? NSButton }
             .first { $0.title == "保存设置" }
-        guard let testConnectionButton, let shortcutLabel, let logCheckbox, let saveButton else {
+        let exportButton = flatten(contentView)
+            .compactMap { $0 as? NSButton }
+            .first { $0.title == "导出诊断报告" }
+        guard let testConnectionButton, let shortcutLabel, let logCheckbox, let exportButton, let saveButton else {
             XCTFail("设置页操作控件不存在")
             return
         }
         let testFrame = testConnectionButton.convert(testConnectionButton.bounds, to: contentView)
         let shortcutFrame = shortcutLabel.convert(shortcutLabel.bounds, to: contentView)
-        let logFrame = logCheckbox.convert(logCheckbox.bounds, to: contentView)
+        let exportFrame = exportButton.convert(exportButton.bounds, to: contentView)
+        let saveFrame = saveButton.convert(saveButton.bounds, to: contentView)
         XCTAssertGreaterThan(testFrame.minY, shortcutFrame.maxY)
-        XCTAssertGreaterThan(logFrame.width, 0)
-        XCTAssertEqual(saveButton.accessibilityLabel(), "保存设置")
+        let logFrame = logCheckbox.convert(logCheckbox.bounds, to: contentView)
+        XCTAssertEqual(exportFrame.midY, logFrame.midY, accuracy: 1)
+        XCTAssertGreaterThan(exportFrame.minX, logFrame.maxX)
+        XCTAssertLessThan(saveFrame.minY, exportFrame.minY)
+        let permissionCheckFrame = permissionCheckButton.convert(permissionCheckButton.bounds, to: contentView)
+        XCTAssertEqual(saveFrame.maxX, permissionCheckFrame.maxX, accuracy: 1)
 
-        XCTAssertFalse(buttons.contains { $0.title == "打开共享目录" })
-        XCTAssertTrue(buttons.contains { $0.title == "打开日志目录" })
-        XCTAssertTrue(buttons.contains { $0.title == "打开诊断目录" })
+        XCTAssertEqual(saveButton.accessibilityLabel(), "保存设置")
+        XCTAssertFalse(controls.contains { $0.title == "打开共享目录" })
+        XCTAssertTrue(controls.contains { $0.title == "打开日志目录" })
+        XCTAssertTrue(controls.contains { $0.title == "打开诊断目录" })
         XCTAssertFalse(labels.contains { $0.stringValue == "凭证共享目录" })
         XCTAssertTrue(labels.contains { $0.stringValue == "会话日志目录" })
         XCTAssertTrue(labels.contains { $0.stringValue == "诊断报告目录" })
@@ -176,9 +209,7 @@ final class AppSmokeTests: XCTestCase {
             "临时记录一次复现过程；结束后导出脱敏 JSON。与“保存会话日志”不同，它会记录更完整的设置、权限和操作上下文",
             "设置保存在当前账户；腾讯凭证和用量使用本机共享目录，日志不会写入共享目录",
             "尚未读取凭证；填写后点击“保存设置”",
-            "已读取凭证；点击“保存设置”后更新",
-            "凭证优先保存在本机 YAML",
-            "系统权限（当前 macOS 账户）"
+            "已读取凭证；点击“保存设置”后更新"
         ]
         XCTAssertTrue(helperTexts.allSatisfy { text in
             !labels.contains { $0.stringValue == text }
@@ -247,37 +278,33 @@ final class AppSmokeTests: XCTestCase {
         )
     }
 
-    func testSettingsDiagnosticCheckboxStartsAndStopsRecording() throws {
+    func testSettingsDiagnosticLogCanBeExportedWithoutTogglingRecording() throws {
         let checker = SystemPrivacyPermissionChecker(
             microphoneStatus: { .authorized },
             accessibilityStatus: { true },
             postEventStatus: { true },
             inputMonitoringStatus: { true }
         )
-        var requestedStates: [Bool] = []
+        var exportCount = 0
         let controller = SettingsWindowController(
             settings: AppSettings(),
             credentials: nil,
             onSave: { _, _ in },
-            onDiagnosticRecordingToggle: { isStarting in
-                requestedStates.append(isStarting)
-                return isStarting
-                    ? nil
-                    : URL(fileURLWithPath: "/tmp/TencentVoiceMVP-Diagnostic.json")
+            onExportDiagnosticLog: {
+                exportCount += 1
+                return URL(fileURLWithPath: "/tmp/TencentVoiceMVP-Diagnostic.json")
             },
             permissionChecker: checker
         )
-        let checkbox = try XCTUnwrap(
+        let button = try XCTUnwrap(
             flatten(controller.window?.contentView)
                 .compactMap { $0 as? NSButton }
-                .first { $0.title == "故障诊断记录" }
+                .first { $0.title == "导出诊断报告" }
         )
 
-        checkbox.performClick(nil)
-        checkbox.performClick(nil)
+        button.performClick(nil)
 
-        XCTAssertEqual(requestedStates, [true, false])
-        XCTAssertEqual(checkbox.state, .off)
+        XCTAssertEqual(exportCount, 1)
     }
 
     func testManualRimeEntryFormShowsAllEditableFields() {
@@ -297,6 +324,7 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertGreaterThan(form.wordField.frame.height, 0)
         XCTAssertGreaterThan(form.codeField.frame.height, 0)
         XCTAssertGreaterThan(form.frequencyField.frame.height, 0)
+        XCTAssertTrue([form.wordField, form.codeField, form.frequencyField].allSatisfy { !($0.toolTip ?? "").isEmpty })
     }
 
     func testRimeFilterSliderShowsFiveSmallTickLabels() {

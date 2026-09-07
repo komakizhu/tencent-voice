@@ -1,5 +1,6 @@
 import AppKit
 import RimeSyncCore
+import UniformTypeIdentifiers
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -146,7 +147,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         refreshRimeThemes()
         registerHotkey()
-        recoverInterruptedDiagnosticRecordingIfNeeded()
         localUsageStore.migrateLegacyUnscopedUsage(to: TencentEnginePreset.standard.rawValue)
         _ = try? sharedUsageStore.recoverAbandonedSessions()
         migrateLocalUsageIfNeeded()
@@ -190,10 +190,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeyManager.unregister()
         endTrackedUsageSession()
         coordinator.cancel()
-        if sessionLogger.isDiagnosticRecording {
-            sessionLogger.recordDiagnosticAction("application_terminating")
-            _ = try? sessionLogger.stopDiagnosticRecordingAndExport()
-        }
         menu.uninstall()
     }
 
@@ -276,11 +272,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
                 try await TencentASRClient().testConnection(configuration: configuration)
             },
-            onDiagnosticRecordingToggle: { [weak self] isStarting in
-                guard let self else { throw DiagnosticRecordingError.unavailable }
-                return try self.toggleDiagnosticRecording(isStarting)
+            onExportDiagnosticLog: { [weak self] in
+                guard let self else { throw DiagnosticLogExportError.unavailable }
+                return try self.exportDiagnosticLog()
             },
-            diagnosticRecordingActive: sessionLogger.isDiagnosticRecording,
             onRecordDiagnosticAction: { [weak self] name, fields in
                 self?.sessionLogger.recordDiagnosticAction(name, fields: fields)
             },
@@ -301,62 +296,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.window?.orderFrontRegardless()
     }
 
-    private func buildDiagnosticReport() -> String {
-        DiagnosticReportBuilder(
+    private func exportDiagnosticLog() throws -> URL? {
+        let report = DiagnosticReportBuilder(
             permissionChecker: permissionChecker,
             credentialStore: credentialStore,
             settingsStore: settingsStore,
             logger: sessionLogger
-        ).build().renderedText()
+        ).build()
+
+        let panel = NSSavePanel()
+        panel.title = "导出诊断报告"
+        panel.message = "导出会话状态、错误代码和操作上下文；不会导出密钥、录音或识别文字。"
+        panel.nameFieldStringValue = defaultDiagnosticLogFilename()
+        panel.allowedContentTypes = [.json]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+
+        let data = try DiagnosticJSON.encoder().encode(report)
+        try data.write(to: url, options: .atomic)
+        return url
     }
 
-    private func toggleDiagnosticRecording(_ start: Bool) throws -> URL? {
-        if start {
-            try sessionLogger.startDiagnosticRecording()
-            recordDiagnosticContextSnapshot(phase: "start")
-            sessionLogger.recordDiagnosticAction("diagnostic_recording_started")
-            return nil
-        }
-
-        recordDiagnosticContextSnapshot(phase: "stop")
-        sessionLogger.recordDiagnosticAction("diagnostic_recording_stopping")
-        return try sessionLogger.stopDiagnosticRecordingAndExport()
-    }
-
-    private func recoverInterruptedDiagnosticRecordingIfNeeded() {
-        do {
-            guard let url = try sessionLogger.recoverInterruptedDiagnosticRecording() else { return }
-            menu.update(status: "已恢复故障诊断 JSON：\(url.lastPathComponent)")
-        } catch {
-            // A corrupt or unwritable diagnostic journal must never prevent the
-            // main application from launching.
-        }
-    }
-
-    private func recordDiagnosticContextSnapshot(phase: String) {
-        let settings = settingsStore.load()
-        let permissions = permissionChecker.report()
-        var fields: [String: String] = [
-            "phase": phase,
-            "shortcut": ShortcutFormatter.string(for: settings.shortcut),
-            "engineModelType": settings.engineModelType,
-            "saveTextLogs": String(settings.saveTextLogs),
-            "safeCopyEnabled": String(settings.safeCopyEnabled),
-            "permissionMissingCount": String(permissions.missing.count)
-        ]
-        for permission in PrivacyPermission.allCases {
-            fields["permission_\(permission.rawValue)_granted"] = String(
-                permissions.status(for: permission)?.isGranted ?? false
-            )
-        }
-        do {
-            fields["authConfigured"] = String(try credentialStore.load() != nil)
-            fields["authReadable"] = "true"
-        } catch {
-            fields["authConfigured"] = "false"
-            fields["authReadable"] = "false"
-        }
-        sessionLogger.recordDiagnosticAction("diagnostic_context_snapshot", fields: fields)
+    private func defaultDiagnosticLogFilename() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return "TencentVoiceMVP-Diagnostic-\(formatter.string(from: Date())).json"
     }
 
     private func refreshRimeThemes() {
