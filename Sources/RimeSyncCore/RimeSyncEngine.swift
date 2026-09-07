@@ -25,6 +25,9 @@ public struct SyncConfiguration: Sendable {
     public var nodeDirectory: URL {
         sharedConfigRoot.appendingPathComponent("nodes", isDirectory: true).appendingPathComponent(nodeID, isDirectory: true)
     }
+    public var baselineDirectory: URL {
+        sharedConfigRoot.appendingPathComponent("baselines", isDirectory: true).appendingPathComponent(nodeID, isDirectory: true)
+    }
     public var manifestURL: URL { sharedConfigRoot.appendingPathComponent("manifest.json") }
     public var conflictRoot: URL { sharedConfigRoot.appendingPathComponent("conflicts", isDirectory: true) }
     public var backupRoot: URL { sharedRoot.appendingPathComponent("backups", isDirectory: true) }
@@ -62,7 +65,16 @@ public struct SyncReport: Equatable, Sendable {
 public protocol RimeSyncEngine {
     func status() throws -> SyncReport
     func sync(dryRun: Bool) throws -> SyncReport
+    func sync(paths: Set<String>, dryRun: Bool) throws -> SyncReport
     func restore(backupID: String) throws
+}
+
+public extension RimeSyncEngine {
+    /// A whole-configuration-only engine must not silently widen a scoped
+    /// request into a full synchronization.
+    func sync(paths: Set<String>, dryRun: Bool) throws -> SyncReport {
+        throw RimeSyncError.unsupportedOperation("当前同步引擎不支持按文件范围同步")
+    }
 }
 
 public struct CommandResult: Equatable, Sendable {
@@ -577,12 +589,23 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
     }
 
     public func sync(dryRun: Bool = false) throws -> SyncReport {
-        if dryRun { return try status() }
+        try performSync(paths: nil, dryRun: dryRun)
+    }
+
+    public func sync(paths: Set<String>, dryRun: Bool) throws -> SyncReport {
+        if let invalidPath = paths.first(where: { !RimeResourcePolicy.isAllowed(relativePath: $0) }) {
+            throw RimeSyncError.invalidRelativePath(invalidPath)
+        }
+        return try performSync(paths: paths, dryRun: dryRun)
+    }
+
+    private func performSync(paths: Set<String>?, dryRun: Bool) throws -> SyncReport {
+        if dryRun { return try report(for: makePlan(paths: paths), backupID: "", userDictionarySyncSucceeded: false) }
         let lock = DirectoryLock(lockURL: configuration.lockURL, fileManager: fileManager)
         return try lock.withLock {
             try SharedDirectoryLayout.prepare(sharedRoot: configuration.sharedRoot, nodeIDs: [configuration.nodeID], fileManager: fileManager)
             let backupID = try backupManager.createBackup(configuration: configuration, retention: retentionStore.current)
-            let plan = try makePlan()
+            let plan = try makePlan(paths: paths)
             try execute(plan: plan, conflictID: backupID)
             try plan.manifest.saving(to: configuration.manifestURL, fileManager: fileManager)
             try SharedDirectoryLayout.makeGroupWritable(configuration.manifestURL, fileManager: fileManager)
@@ -624,7 +647,9 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
         enum Action {
             case publish(FileRecord)
             case pull(FileRecord)
-            case conflict(local: FileRecord?, shared: FileRecord?)
+            case merge(record: FileRecord, data: Data)
+            case baseline(FileRecord)
+            case conflict(local: FileRecord?, shared: FileRecord?, baseline: FileRecord?)
         }
 
         let path: String
@@ -634,21 +659,29 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
     private struct SyncPlan {
         var items: [PlanItem]
         var manifest: RimeManifest
-        var requiresReload: Bool { !items.isEmpty }
+        var requiresReload: Bool {
+            items.contains { item in
+                if case .baseline = item.action { return false }
+                return true
+            }
+        }
     }
 
-    private func makePlan() throws -> SyncPlan {
+    private func makePlan(paths allowedPaths: Set<String>? = nil) throws -> SyncPlan {
         let localRecords = try Dictionary(uniqueKeysWithValues: RimeFileInventory(root: configuration.localRimeDirectory, fileManager: fileManager).scan(owner: configuration.nodeID).map { ($0.relativePath, $0) })
         var manifest = try RimeManifest.loading(from: configuration.manifestURL, fileManager: fileManager)
         var nodeRecords = manifest.nodes[configuration.nodeID] ?? [:]
         let paths = Set(localRecords.keys)
             .union(manifest.records.keys)
             .union(nodeRecords.keys)
-            .filter { RimeResourcePolicy.isAllowed(relativePath: $0) }
+            .filter { path in
+                RimeResourcePolicy.isAllowed(relativePath: path)
+                    && (allowedPaths == nil || allowedPaths?.contains(path) == true)
+            }
             .sorted()
         // Older prototypes may have put the generated managed dictionary in
         // the ordinary manifest. Remove that stale bookkeeping so it cannot
-        // be pulled back into the account by a later LWW run.
+        // be pulled back into the account by a later ordinary sync.
         manifest.records.removeValue(forKey: RimeManagedDictionary.fileName)
         for node in manifest.nodes.keys {
             manifest.nodes[node]?.removeValue(forKey: RimeManagedDictionary.fileName)
@@ -661,11 +694,14 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
             let baseline = nodeRecords[path]
             let local = localRecords[path] ?? missingRecord(path: path, baseline: baseline)
             let shared = manifest.records[path]
-            let decision = LastWriterWinsResolver.resolve(local: local, shared: shared, baseline: baseline)
+            let decision = ThreeWayMergeResolver.resolve(local: local, shared: shared, baseline: baseline)
 
             switch decision {
             case .unchanged:
-                if local != nil { nodeRecords[path] = local }
+                if let local {
+                    nodeRecords[path] = local
+                    items.append(PlanItem(path: path, action: .baseline(local)))
+                }
             case .local:
                 guard let local else { continue }
                 items.append(PlanItem(path: path, action: .publish(local)))
@@ -675,8 +711,19 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
                 guard let shared else { continue }
                 items.append(PlanItem(path: path, action: .pull(shared)))
                 nodeRecords[path] = shared
+            case .merge:
+                guard let baseline, let local, let shared,
+                      let merged = makeMergedResource(baseline: baseline, local: local, shared: shared) else {
+                    items.append(PlanItem(path: path, action: .conflict(local: local, shared: shared, baseline: baseline)))
+                    manifest.pausedPaths.insert(path)
+                    if let local { nodeRecords[path] = local }
+                    continue
+                }
+                items.append(PlanItem(path: path, action: .merge(record: merged.record, data: merged.data)))
+                manifest.records[path] = merged.record
+                nodeRecords[path] = merged.record
             case .conflict:
-                items.append(PlanItem(path: path, action: .conflict(local: local, shared: shared)))
+                items.append(PlanItem(path: path, action: .conflict(local: local, shared: shared, baseline: baseline)))
                 manifest.pausedPaths.insert(path)
                 if let local { nodeRecords[path] = local }
             }
@@ -703,6 +750,7 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
                 let source = try AtomicFileStore.safeURL(root: configuration.localRimeDirectory, relativePath: item.path)
                 let destination = try AtomicFileStore.safeURL(root: configuration.nodeDirectory, relativePath: item.path)
                 try apply(record: record, source: source, destination: destination)
+                try updateBaseline(record: record, source: source)
             case let .pull(record):
                 let source = try AtomicFileStore.safeURL(
                     root: configuration.sharedConfigRoot.appendingPathComponent("nodes", isDirectory: true).appendingPathComponent(record.owner, isDirectory: true),
@@ -710,10 +758,98 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
                 )
                 let destination = try AtomicFileStore.safeURL(root: configuration.localRimeDirectory, relativePath: item.path)
                 try apply(record: record, source: source, destination: destination)
-            case let .conflict(local, shared):
-                try saveConflict(path: item.path, local: local, shared: shared, conflictID: conflictID)
+                try updateBaseline(record: record, source: source)
+            case let .merge(record, data):
+                let localDestination = try AtomicFileStore.safeURL(root: configuration.localRimeDirectory, relativePath: item.path)
+                let nodeDestination = try AtomicFileStore.safeURL(root: configuration.nodeDirectory, relativePath: item.path)
+                try AtomicFileStore.write(data, to: localDestination, fileManager: fileManager)
+                try AtomicFileStore.write(data, to: nodeDestination, fileManager: fileManager)
+                try writeBaseline(data, for: record)
+            case let .baseline(record):
+                let source = try AtomicFileStore.safeURL(root: configuration.localRimeDirectory, relativePath: item.path)
+                try updateBaseline(record: record, source: source)
+            case let .conflict(local, shared, baseline):
+                try saveConflict(path: item.path, local: local, shared: shared, baseline: baseline, conflictID: conflictID)
             }
         }
+    }
+
+    private func makeMergedResource(
+        baseline: FileRecord,
+        local: FileRecord,
+        shared: FileRecord
+    ) -> (record: FileRecord, data: Data)? {
+        guard baseline.state == .present, local.state == .present, shared.state == .present,
+              let baseData = try? baselineData(for: baseline),
+              let localData = try? localData(for: local),
+              let sharedData = try? sharedData(for: shared),
+              let baseText = String(data: baseData, encoding: .utf8),
+              let localText = String(data: localData, encoding: .utf8),
+              let sharedText = String(data: sharedData, encoding: .utf8) else {
+            return nil
+        }
+        guard case let .merged(text) = RimeTextMerger.merge(base: baseText, local: localText, shared: sharedText) else {
+            return nil
+        }
+        let data = Data(text.utf8)
+        let latestTimestamp = max(local.modifiedNanoseconds, shared.modifiedNanoseconds)
+        let nextTimestamp = latestTimestamp == Int64.max ? latestTimestamp : latestTimestamp + 1
+        let modifiedNanoseconds = max(nowNanoseconds(), nextTimestamp)
+        return (
+            FileRecord.present(
+                path: local.relativePath,
+                modifiedNanoseconds: modifiedNanoseconds,
+                byteCount: Int64(data.count),
+                sha256: RimeSnapshotParser.digest(data),
+                owner: configuration.nodeID
+            ),
+            data
+        )
+    }
+
+    private func localData(for record: FileRecord) throws -> Data {
+        let url = try AtomicFileStore.safeURL(root: configuration.localRimeDirectory, relativePath: record.relativePath)
+        return try Data(contentsOf: url)
+    }
+
+    private func baselineData(for record: FileRecord) throws -> Data {
+        let baselineURL = try AtomicFileStore.safeURL(root: configuration.baselineDirectory, relativePath: record.relativePath)
+        if fileManager.fileExists(atPath: baselineURL.path) {
+            return try Data(contentsOf: baselineURL)
+        }
+        // Compatibility for nodes created before baseline snapshots existed.
+        // It is safe only when the baseline belongs to this node; another
+        // node's current file may already have advanced past the baseline.
+        guard record.owner == configuration.nodeID else {
+            throw RimeSyncError.unsupportedOperation("缺少共同基线：\(record.relativePath)")
+        }
+        let nodeURL = try AtomicFileStore.safeURL(root: configuration.nodeDirectory, relativePath: record.relativePath)
+        return try Data(contentsOf: nodeURL)
+    }
+
+    private func sharedData(for record: FileRecord) throws -> Data {
+        let root = configuration.sharedConfigRoot
+            .appendingPathComponent("nodes", isDirectory: true)
+            .appendingPathComponent(record.owner, isDirectory: true)
+        let url = try AtomicFileStore.safeURL(root: root, relativePath: record.relativePath)
+        return try Data(contentsOf: url)
+    }
+
+    private func writeBaseline(_ data: Data, for record: FileRecord) throws {
+        let destination = try AtomicFileStore.safeURL(root: configuration.baselineDirectory, relativePath: record.relativePath)
+        try AtomicFileStore.write(data, to: destination, fileManager: fileManager)
+        try SharedDirectoryLayout.makeGroupWritable(destination, fileManager: fileManager)
+    }
+
+    private func updateBaseline(record: FileRecord, source: URL) throws {
+        guard record.state == .present else {
+            let baselineURL = try AtomicFileStore.safeURL(root: configuration.baselineDirectory, relativePath: record.relativePath)
+            if fileManager.fileExists(atPath: baselineURL.path) {
+                try fileManager.removeItem(at: baselineURL)
+            }
+            return
+        }
+        try writeBaseline(try Data(contentsOf: source), for: record)
     }
 
     private func apply(record: FileRecord, source: URL, destination: URL) throws {
@@ -730,7 +866,13 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
         }
     }
 
-    private func saveConflict(path: String, local: FileRecord?, shared: FileRecord?, conflictID: String) throws {
+    private func saveConflict(
+        path: String,
+        local: FileRecord?,
+        shared: FileRecord?,
+        baseline: FileRecord?,
+        conflictID: String
+    ) throws {
         let directory = configuration.conflictRoot.appendingPathComponent(conflictID, isDirectory: true)
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         let name = path.replacingOccurrences(of: "/", with: "__")
@@ -746,13 +888,22 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
             let data = try JSONEncoder.rimeEncoder.encode(shared)
             try AtomicFileStore.write(data, to: directory.appendingPathComponent("\(name).shared.json"), fileManager: fileManager)
         }
+        if let baseline {
+            let data = try JSONEncoder.rimeEncoder.encode(baseline)
+            try AtomicFileStore.write(data, to: directory.appendingPathComponent("\(name).baseline.json"), fileManager: fileManager)
+        }
     }
 
     private func report(for plan: SyncPlan, backupID: String, userDictionarySyncSucceeded: Bool) -> SyncReport {
-        let changed = plan.items.map(\.path)
+        let changed = plan.items.compactMap { item -> String? in
+            if case .baseline = item.action { return nil }
+            return item.path
+        }
         let deleted = plan.items.compactMap { item -> String? in
             switch item.action {
             case let .publish(record), let .pull(record): return record.state == .tombstone ? item.path : nil
+            case let .merge(record, _): return record.state == .tombstone ? item.path : nil
+            case .baseline: return nil
             case .conflict: return nil
             }
         }

@@ -64,6 +64,8 @@ public struct FileRecord: Codable, Equatable, Hashable, Sendable {
 }
 
 public enum RimeResourcePolicy {
+    public static let skinConfigurationPath = "squirrel.custom.yaml"
+
     private static let excludedTopLevelNames: Set<String> = [
         "build", "trash", "sync", "weasel.yaml", "installation.yaml", "user.yaml"
     ]
@@ -83,7 +85,7 @@ public enum RimeResourcePolicy {
         guard !path.hasSuffix(".userdb.txt") else { return false }
         guard !path.hasSuffix(".log") else { return false }
         // This file is generated from the shared audit state.  Letting the
-        // ordinary last-writer-wins sync manage it would race with the audit
+        // ordinary configuration sync manage it would race with the audit
         // coordinator and could silently resurrect a rejected entry.
         guard path != "rime_managed.dict.yaml" else { return false }
 
@@ -218,22 +220,32 @@ public enum SyncDecision: Equatable, Sendable {
     case unchanged
     case local
     case shared
+    case merge
     case conflict
 }
 
-public enum LastWriterWinsResolver {
+public enum ThreeWayMergeResolver {
     public static func resolve(local: FileRecord?, shared: FileRecord?, baseline: FileRecord?) -> SyncDecision {
         guard let local, let shared else {
             return local == nil && shared == nil ? .unchanged : (local == nil ? .shared : .local)
         }
-        if local.contentIdentity == shared.contentIdentity { return .unchanged }
-
         let localChanged = baseline.map { $0.contentIdentity != local.contentIdentity } ?? true
         let sharedChanged = baseline.map { $0.contentIdentity != shared.contentIdentity } ?? true
+        if local.contentIdentity == shared.contentIdentity {
+            if localChanged && sharedChanged && local.modifiedNanoseconds == shared.modifiedNanoseconds {
+                return .conflict
+            }
+            return .unchanged
+        }
         if localChanged && !sharedChanged { return .local }
         if sharedChanged && !localChanged { return .shared }
-        if local.modifiedNanoseconds > shared.modifiedNanoseconds { return .local }
-        if shared.modifiedNanoseconds > local.modifiedNanoseconds { return .shared }
+        guard baseline != nil else { return .conflict }
+        if local.modifiedNanoseconds != shared.modifiedNanoseconds {
+            return .merge
+        }
         return .conflict
     }
 }
+
+/// Compatibility name for clients built against the earlier resolver API.
+public typealias LastWriterWinsResolver = ThreeWayMergeResolver

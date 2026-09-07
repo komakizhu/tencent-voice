@@ -12,7 +12,12 @@ final class StatusMenuController: NSObject {
     private var onSelectRimeTheme: ((String) -> Void)?
     private var onManageRimeDictionary: (() -> Void)?
     private var onSyncRimeDictionary: (() -> Void)?
+    private var onSyncRimeSkin: (() -> Void)?
+    private var onSyncRimeConfiguration: (() -> Void)?
+    private var onSyncAllConfiguration: (() -> Void)?
+    private var rimeSyncMenuItems: [NSMenuItem] = []
     private(set) var statusText = "就绪"
+    private(set) var installedMenu: NSMenu?
 
     func install() {
         guard statusItem == nil else { return }
@@ -24,6 +29,11 @@ final class StatusMenuController: NSObject {
         item.button?.setAccessibilityLabel("腾讯语音输入")
         item.button?.toolTip = "腾讯语音输入"
 
+        item.menu = makeMenu()
+        statusItem = item
+    }
+
+    func makeMenu() -> NSMenu {
         let menu = NSMenu()
         let usageView = UsageMenuItemView(text: "模型：计算中…\n用量：计算中…")
         let usage = NSMenuItem()
@@ -42,6 +52,19 @@ final class StatusMenuController: NSObject {
         syncDictionary.target = self
         Self.applyLocalShortcut(to: syncDictionary, keyEquivalent: "s")
         menu.addItem(syncDictionary)
+        let syncSkin = NSMenuItem(title: "同步 Rime 皮肤", action: #selector(syncRimeSkinPressed), keyEquivalent: "")
+        syncSkin.target = self
+        syncSkin.toolTip = "只同步 squirrel.custom.yaml 皮肤配置"
+        menu.addItem(syncSkin)
+        let syncRimeConfiguration = NSMenuItem(title: "同步 Rime 所有配置", action: #selector(syncRimeConfigurationPressed), keyEquivalent: "")
+        syncRimeConfiguration.target = self
+        syncRimeConfiguration.toolTip = "同步 Rime 的 YAML、Lua、OpenCC 和皮肤配置，不同步实时用户词库"
+        menu.addItem(syncRimeConfiguration)
+        menu.addItem(.separator())
+        let syncAllConfiguration = NSMenuItem(title: "一键同步所有配置", action: #selector(syncAllConfigurationPressed), keyEquivalent: "")
+        syncAllConfiguration.target = self
+        syncAllConfiguration.toolTip = "同步全部 Rime 稳定配置；实时用户词库仍使用“同步 Rime 词库”"
+        menu.addItem(syncAllConfiguration)
         let settings = NSMenuItem(title: "设置…", action: #selector(settingsPressed), keyEquivalent: ",")
         settings.target = self
         let record = NSMenuItem(title: "开始录音", action: #selector(toggleRecordingPressed), keyEquivalent: "")
@@ -49,13 +72,13 @@ final class StatusMenuController: NSObject {
         menu.addItem(settings)
         menu.addItem(record)
         menu.addItem(NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-        item.menu = menu
-
-        statusItem = item
+        installedMenu = menu
         usageMenuItemView = usageView
         settingsMenuItem = settings
         recordMenuItem = record
         rimeThemeMenuItem = rimeTheme
+        rimeSyncMenuItems = [syncDictionary, syncSkin, syncRimeConfiguration, syncAllConfiguration]
+        return menu
     }
 
     static func applyLocalShortcut(to item: NSMenuItem, keyEquivalent: String) {
@@ -82,18 +105,28 @@ final class StatusMenuController: NSObject {
         usageMenuItemView?.text = usage
     }
 
+    func update(rimeSyncInProgress: Bool) {
+        rimeSyncMenuItems.forEach { $0.isEnabled = !rimeSyncInProgress }
+    }
+
     func configure(
         onSettings: @escaping () -> Void,
         onToggleRecording: @escaping () -> Void,
         onSelectRimeTheme: @escaping (String) -> Void,
         onManageRimeDictionary: @escaping () -> Void,
-        onSyncRimeDictionary: @escaping () -> Void
+        onSyncRimeDictionary: @escaping () -> Void,
+        onSyncRimeSkin: @escaping () -> Void,
+        onSyncRimeConfiguration: @escaping () -> Void,
+        onSyncAllConfiguration: @escaping () -> Void
     ) {
         self.onSettings = onSettings
         self.onToggleRecording = onToggleRecording
         self.onSelectRimeTheme = onSelectRimeTheme
         self.onManageRimeDictionary = onManageRimeDictionary
         self.onSyncRimeDictionary = onSyncRimeDictionary
+        self.onSyncRimeSkin = onSyncRimeSkin
+        self.onSyncRimeConfiguration = onSyncRimeConfiguration
+        self.onSyncAllConfiguration = onSyncAllConfiguration
     }
 
     func update(rimeThemes snapshot: RimeThemeSnapshot) {
@@ -142,10 +175,23 @@ final class StatusMenuController: NSObject {
         onSyncRimeDictionary?()
     }
 
+    @objc private func syncRimeSkinPressed() {
+        onSyncRimeSkin?()
+    }
+
+    @objc private func syncRimeConfigurationPressed() {
+        onSyncRimeConfiguration?()
+    }
+
+    @objc private func syncAllConfigurationPressed() {
+        onSyncAllConfiguration?()
+    }
+
     func uninstall() {
         guard let statusItem else { return }
         NSStatusBar.system.removeStatusItem(statusItem)
         self.statusItem = nil
+        installedMenu = nil
         usageMenuItemView = nil
         settingsMenuItem = nil
         recordMenuItem = nil
@@ -155,6 +201,10 @@ final class StatusMenuController: NSObject {
         onSelectRimeTheme = nil
         onManageRimeDictionary = nil
         onSyncRimeDictionary = nil
+        onSyncRimeSkin = nil
+        onSyncRimeConfiguration = nil
+        onSyncAllConfiguration = nil
+        rimeSyncMenuItems = []
     }
 
     private func statusImage() -> NSImage {

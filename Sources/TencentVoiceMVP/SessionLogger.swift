@@ -93,7 +93,7 @@ final class SessionLogger {
     private let enabled: () -> Bool
     private let fileManager = FileManager.default
     private let applicationSupportDirectoryURL: URL
-    private let diagnosticExportDirectoryURL: URL?
+    private let configuredDiagnosticExportDirectoryURL: URL?
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var inMemoryEntries: [SessionLogEntry] = []
@@ -108,7 +108,7 @@ final class SessionLogger {
         self.enabled = enabled
         self.applicationSupportDirectoryURL = applicationSupportDirectoryURL
             ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        self.diagnosticExportDirectoryURL = diagnosticExportDirectoryURL
+        self.configuredDiagnosticExportDirectoryURL = diagnosticExportDirectoryURL
         encoder.dateEncodingStrategy = .custom { date, encoder in
             var container = encoder.singleValueContainer()
             let formatter = ISO8601DateFormatter()
@@ -198,6 +198,18 @@ final class SessionLogger {
             .appendingPathComponent("TencentVoiceMVP/sessions", isDirectory: true)
     }
 
+    var diagnosticExportDirectoryURL: URL {
+        configuredDiagnosticExportDirectoryURL
+            ?? DiagnosticSessionRecorder.defaultExportDirectoryURL()
+    }
+
+    static var defaultPersistenceDirectoryURL: URL {
+        let applicationSupport = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return applicationSupport
+            .appendingPathComponent("TencentVoiceMVP/sessions", isDirectory: true)
+    }
+
     var isDiagnosticRecording: Bool {
         diagnosticRecorder?.isRecording == true
     }
@@ -207,7 +219,7 @@ final class SessionLogger {
             throw DiagnosticRecordingError.alreadyRecording
         }
         let recorder = DiagnosticSessionRecorder(
-            exportDirectoryURL: diagnosticExportDirectoryURL,
+            exportDirectoryURL: configuredDiagnosticExportDirectoryURL,
             journalURL: diagnosticJournalURL
         )
         try recorder.start(appInfo: appInfo ?? AppRuntimeInspector.inspect())

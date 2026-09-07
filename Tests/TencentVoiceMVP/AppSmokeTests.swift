@@ -9,6 +9,41 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertEqual(controller.statusText, "就绪")
     }
 
+    func testStatusMenuContainsSeparateRimeSyncActions() {
+        let controller = StatusMenuController()
+        let menu = controller.makeMenu()
+
+        let titles = menu.items.map(\.title)
+        let syncTitles = titles.filter {
+            ["同步 Rime 词库", "同步 Rime 皮肤", "同步 Rime 所有配置", "一键同步所有配置"].contains($0)
+        }
+
+        XCTAssertEqual(
+            syncTitles,
+            ["同步 Rime 词库", "同步 Rime 皮肤", "同步 Rime 所有配置", "一键同步所有配置"]
+        )
+    }
+
+    func testStatusMenuDisablesAllRimeSyncActionsWhileBusy() {
+        let controller = StatusMenuController()
+        let menu = controller.makeMenu()
+        let titles = ["同步 Rime 词库", "同步 Rime 皮肤", "同步 Rime 所有配置", "一键同步所有配置"]
+
+        controller.update(rimeSyncInProgress: true)
+        XCTAssertTrue(
+            titles.allSatisfy { title in
+                menu.items.first { $0.title == title }?.isEnabled == false
+            }
+        )
+
+        controller.update(rimeSyncInProgress: false)
+        XCTAssertTrue(
+            titles.allSatisfy { title in
+                menu.items.first { $0.title == title }?.isEnabled == true
+            }
+        )
+    }
+
     func testRimeDictionaryMenuItemsUseLocalCommandShortcuts() {
         let dictionary = NSMenuItem()
         let syncDictionary = NSMenuItem()
@@ -79,8 +114,10 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertTrue(removedTexts.allSatisfy { text in
             !labels.contains { $0.stringValue == text }
         })
-        XCTAssertTrue(labels.contains { $0.stringValue == "保存崩溃日志" })
-        XCTAssertFalse(labels.contains { $0.stringValue == "保存文本日志" })
+        let buttons = flatten(contentView).compactMap { $0 as? NSButton }
+        XCTAssertTrue(buttons.contains { $0.title == "保存会话日志" })
+        XCTAssertFalse(buttons.contains { $0.title == "保存崩溃日志" })
+        XCTAssertFalse(buttons.contains { $0.title == "保存文本日志" })
         XCTAssertTrue(
             flatten(contentView)
                 .compactMap { $0 as? NSButton }
@@ -92,7 +129,7 @@ final class AppSmokeTests: XCTestCase {
                 .contains { $0.title == "Safe Copy（始终复制到剪贴板）" }
         )
 
-        let permissionTitle = labels.first { $0.stringValue == "系统权限（当前 macOS 账户）" }
+        let permissionTitle = labels.first { $0.stringValue == "系统权限" }
         let permissionCheckButton = flatten(contentView)
             .compactMap { $0 as? NSButton }
             .first { $0.title == "检查权限" }
@@ -111,10 +148,10 @@ final class AppSmokeTests: XCTestCase {
         let shortcutLabel = labels.first { $0.stringValue == "快捷键" }
         let logCheckbox = flatten(contentView)
             .compactMap { $0 as? NSButton }
-            .first { $0.title == "保存崩溃日志" }
+            .first { $0.title == "保存会话日志" }
         let saveButton = flatten(contentView)
             .compactMap { $0 as? NSButton }
-            .first { $0.title == "保存" }
+            .first { $0.title == "保存设置" }
         guard let testConnectionButton, let shortcutLabel, let logCheckbox, let saveButton else {
             XCTFail("设置页操作控件不存在")
             return
@@ -122,10 +159,92 @@ final class AppSmokeTests: XCTestCase {
         let testFrame = testConnectionButton.convert(testConnectionButton.bounds, to: contentView)
         let shortcutFrame = shortcutLabel.convert(shortcutLabel.bounds, to: contentView)
         let logFrame = logCheckbox.convert(logCheckbox.bounds, to: contentView)
-        let saveFrame = saveButton.convert(saveButton.bounds, to: contentView)
         XCTAssertGreaterThan(testFrame.minY, shortcutFrame.maxY)
-        XCTAssertEqual(logFrame.midY, saveFrame.midY, accuracy: 1)
-        XCTAssertLessThan(logFrame.minX, saveFrame.minX)
+        XCTAssertGreaterThan(logFrame.width, 0)
+        XCTAssertEqual(saveButton.accessibilityLabel(), "保存设置")
+
+        XCTAssertFalse(buttons.contains { $0.title == "打开共享目录" })
+        XCTAssertTrue(buttons.contains { $0.title == "打开日志目录" })
+        XCTAssertTrue(buttons.contains { $0.title == "打开诊断目录" })
+        XCTAssertFalse(labels.contains { $0.stringValue == "凭证共享目录" })
+        XCTAssertTrue(labels.contains { $0.stringValue == "会话日志目录" })
+        XCTAssertTrue(labels.contains { $0.stringValue == "诊断报告目录" })
+
+        let helperTexts = [
+            "适用于所有支持文本输入的应用；保存后生效；关闭时发生输入错误不会自动复制",
+            "持续保存会话状态、长度、计数和错误类型；不保存录音、识别正文或密钥",
+            "临时记录一次复现过程；结束后导出脱敏 JSON。与“保存会话日志”不同，它会记录更完整的设置、权限和操作上下文",
+            "设置保存在当前账户；腾讯凭证和用量使用本机共享目录，日志不会写入共享目录",
+            "尚未读取凭证；填写后点击“保存设置”",
+            "已读取凭证；点击“保存设置”后更新",
+            "凭证优先保存在本机 YAML",
+            "系统权限（当前 macOS 账户）"
+        ]
+        XCTAssertTrue(helperTexts.allSatisfy { text in
+            !labels.contains { $0.stringValue == text }
+        })
+    }
+
+    func testSettingsWindowOpensConfiguredLogDirectory() throws {
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .authorized },
+            accessibilityStatus: { true },
+            postEventStatus: { true },
+            inputMonitoringStatus: { true }
+        )
+        let logDirectory = URL(fileURLWithPath: "/tmp/TencentVoiceMVP-test-sessions")
+        var openedURL: URL?
+        let controller = SettingsWindowController(
+            settings: AppSettings(),
+            credentials: nil,
+            onSave: { _, _ in },
+            permissionChecker: checker,
+            logDirectoryURL: logDirectory,
+            onOpenDirectory: { url in
+                openedURL = url
+                return true
+            }
+        )
+        let openButton = try XCTUnwrap(
+            flatten(controller.window?.contentView)
+                .compactMap { $0 as? NSButton }
+                .first { $0.title == "打开日志目录" }
+        )
+
+        openButton.performClick(nil)
+
+        XCTAssertEqual(openedURL, logDirectory)
+    }
+
+    func testSettingsButtonShowsSavedStatus() throws {
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .authorized },
+            accessibilityStatus: { true },
+            postEventStatus: { true },
+            inputMonitoringStatus: { true }
+        )
+        var savedSettings: AppSettings?
+        let controller = SettingsWindowController(
+            settings: AppSettings(),
+            credentials: TencentCredentials(appID: "app", secretID: "id", secretKey: "key"),
+            onSave: { settings, _ in savedSettings = settings },
+            permissionChecker: checker
+        )
+        let contentView = try XCTUnwrap(controller.window?.contentView)
+        let saveButton = try XCTUnwrap(
+            flatten(contentView)
+                .compactMap { $0 as? NSButton }
+                .first { $0.title == "保存设置" }
+        )
+
+        saveButton.performClick(nil)
+
+        XCTAssertEqual(savedSettings, AppSettings())
+        XCTAssertTrue(
+            flatten(contentView)
+                .compactMap { $0 as? NSTextField }
+                .contains { $0.stringValue == "设置已保存" }
+        )
     }
 
     func testSettingsDiagnosticCheckboxStartsAndStopsRecording() throws {

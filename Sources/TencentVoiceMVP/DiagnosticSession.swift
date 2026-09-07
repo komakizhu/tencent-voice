@@ -156,7 +156,7 @@ final class DiagnosticSessionRecorder {
         fileManager: FileManager = .default
     ) {
         self.fileManager = fileManager
-        self.exportDirectoryURL = exportDirectoryURL ?? Self.defaultExportDirectory(fileManager: fileManager)
+        self.exportDirectoryURL = exportDirectoryURL ?? Self.defaultExportDirectoryURL(fileManager: fileManager)
         self.journalURL = journalURL
     }
 
@@ -397,7 +397,7 @@ final class DiagnosticSessionRecorder {
         return url
     }
 
-    private static func defaultExportDirectory(fileManager: FileManager) -> URL {
+    static func defaultExportDirectoryURL(fileManager: FileManager = .default) -> URL {
         fileManager.urls(for: .desktopDirectory, in: .userDomainMask).first
             ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Desktop", isDirectory: true)
     }

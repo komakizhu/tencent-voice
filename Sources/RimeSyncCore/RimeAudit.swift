@@ -1450,6 +1450,17 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
         return try refreshAuditFromPublishedSnapshots()
     }
 
+    /// Synchronize stable Rime resources without touching live userdb data.
+    /// Passing a path set limits the operation to those resources; nil means
+    /// all resources allowed by the ordinary sync policy.
+    @discardableResult
+    public func syncConfiguration(paths: Set<String>? = nil) throws -> SyncReport {
+        if let paths {
+            return try ordinarySync.sync(paths: paths, dryRun: false)
+        }
+        return try ordinarySync.sync(dryRun: false)
+    }
+
     /// Rebuild the audit cache from snapshots that already exist in the
     /// shared directory.  This intentionally does not stop Squirrel, invoke
     /// `--sync`, create a runtime backup, or run ordinary resource sync.
