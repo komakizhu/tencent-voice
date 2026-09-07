@@ -14,7 +14,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let rimeThemeStore: RimeThemeStore
     private let rimeBackupRetentionStore: RimeBackupRetentionStore
     private let permissionChecker: SystemPrivacyPermissionChecker
-    private let rimeReviewCoordinator: RimeReviewSyncCoordinator?
+    private var rimeReviewCoordinator: RimeReviewSyncCoordinator?
+    private let rimeConfigurationCoordinator: RimeReviewSyncCoordinator
+    private let rimeLocalDirectory: URL
+    private let rimeInstallationID: String
     private var settingsWindowController: SettingsWindowController?
     private var rimeDictionaryWindowController: RimeDictionaryWindowController?
     private var usageMonitorTask: Task<Void, Never>?
@@ -42,33 +45,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .appendingPathComponent("Library/Rime", isDirectory: true)
         let sharedRimeRoot = URL(fileURLWithPath: "/Users/Shared/RimeSync", isDirectory: true)
         let installationURL = localRimeDirectory.appendingPathComponent("installation.yaml")
-        var rimeReviewCoordinator: RimeReviewSyncCoordinator?
-        let installationID: String?
+        let configuredInstallationID: String?
         do {
-            installationID = try RimeInstallationFile.loading(from: installationURL)?.installationID
+            configuredInstallationID = try RimeInstallationFile.loading(from: installationURL)?.installationID
         } catch {
-            installationID = nil
+            configuredInstallationID = nil
         }
-        if let installationID {
-            let rimeMaintenance = SquirrelMaintenance()
-            let rimeConfiguration = SyncConfiguration(
-                localRimeDirectory: localRimeDirectory,
-                sharedRoot: sharedRimeRoot,
-                installationID: installationID
-            )
-            let ordinaryRimeSync = DefaultRimeSyncEngine(
-                configuration: rimeConfiguration,
-                maintenance: rimeMaintenance,
-                retentionStore: rimeBackupRetentionStore
-            )
-            rimeReviewCoordinator = RimeReviewSyncCoordinator(
-                configuration: rimeConfiguration,
-                maintenance: rimeMaintenance,
-                reloader: rimeMaintenance,
-                ordinarySync: ordinaryRimeSync,
-                retentionStore: rimeBackupRetentionStore
-            )
-        }
+        let rimeInstallationID = configuredInstallationID ?? Self.defaultRimeInstallationID()
+        let rimeMaintenance = SquirrelMaintenance()
+        let rimeConfiguration = SyncConfiguration(
+            localRimeDirectory: localRimeDirectory,
+            sharedRoot: sharedRimeRoot,
+            installationID: rimeInstallationID
+        )
+        let ordinaryRimeSync = DefaultRimeSyncEngine(
+            configuration: rimeConfiguration,
+            maintenance: rimeMaintenance,
+            retentionStore: rimeBackupRetentionStore
+        )
+        let rimeConfigurationCoordinator = RimeReviewSyncCoordinator(
+            configuration: rimeConfiguration,
+            maintenance: rimeMaintenance,
+            reloader: rimeMaintenance,
+            ordinarySync: ordinaryRimeSync,
+            retentionStore: rimeBackupRetentionStore
+        )
+        let rimeReviewCoordinator = configuredInstallationID == nil ? nil : rimeConfigurationCoordinator
         self.settingsStore = settingsStore
         self.credentialStore = credentialStore
         self.hotkeyManager = hotkeyManager
@@ -79,6 +81,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.rimeBackupRetentionStore = rimeBackupRetentionStore
         self.permissionChecker = permissionChecker
         self.rimeReviewCoordinator = rimeReviewCoordinator
+        self.rimeConfigurationCoordinator = rimeConfigurationCoordinator
+        self.rimeLocalDirectory = localRimeDirectory
+        self.rimeInstallationID = rimeInstallationID
         self.sessionLogger = sessionLogger
         coordinator = SessionCoordinator(
             asr: TencentASRClient(),
@@ -128,6 +133,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             onSyncRimeDictionary: { [weak self] in
                 self?.syncRimeDictionary()
+            },
+            onSyncRimeSkin: { [weak self] in
+                self?.syncRimeSkin()
+            },
+            onSyncRimeConfiguration: { [weak self] in
+                self?.syncRimeConfiguration()
+            },
+            onSyncAllConfiguration: { [weak self] in
+                self?.syncAllConfiguration()
             }
         )
         refreshRimeThemes()
@@ -271,6 +285,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.sessionLogger.recordDiagnosticAction(name, fields: fields)
             },
             permissionChecker: permissionChecker,
+            logDirectoryURL: sessionLogger.persistenceDirectoryURL,
+            diagnosticDirectoryURL: sessionLogger.diagnosticExportDirectoryURL,
             onClose: { [weak self] in
                 guard self != nil else { return }
                 NSApp.setActivationPolicy(.accessory)
@@ -390,19 +406,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func syncRimeDictionary() {
-        guard let rimeReviewCoordinator else {
+        guard rimeSyncTask == nil else { return }
+        do {
+            try prepareRimeDirectoryForConfigurationSync()
+        } catch {
+            menu.update(status: "Rime 词库同步失败：\(error.localizedDescription)")
+            return
+        }
+        guard let coordinator = rimeReviewCoordinator else {
             menu.update(status: "Rime 词库同步不可用")
             return
         }
-        guard rimeSyncTask == nil else { return }
 
+        menu.update(rimeSyncInProgress: true)
         menu.update(status: "正在同步 Rime 词库…")
         rimeSyncTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            defer { rimeSyncTask = nil }
+            defer {
+                rimeSyncTask = nil
+                menu.update(rimeSyncInProgress: false)
+            }
             let result: Result<RimeUserDictionarySyncReport, Error> = await Task.detached(priority: .userInitiated) {
                 do {
-                    return .success(try rimeReviewCoordinator.syncUserDictionary())
+                    return .success(try coordinator.syncUserDictionary())
                 } catch {
                     return .failure(error)
                 }
@@ -415,6 +441,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 menu.update(status: "Rime 词库同步失败：\(error.localizedDescription)")
             }
         }
+    }
+
+    private func syncRimeSkin() {
+        syncRimeConfiguration(
+            paths: [RimeResourcePolicy.skinConfigurationPath],
+            progress: "正在同步 Rime 皮肤…",
+            success: "Rime 皮肤同步完成"
+        )
+    }
+
+    private func syncRimeConfiguration() {
+        syncRimeConfiguration(
+            paths: nil,
+            progress: "正在同步 Rime 所有配置…",
+            success: "Rime 所有配置同步完成"
+        )
+    }
+
+    private func syncAllConfiguration() {
+        syncRimeConfiguration(
+            paths: nil,
+            progress: "正在一键同步所有配置…",
+            success: "一键同步所有配置完成"
+        )
+    }
+
+    private func syncRimeConfiguration(
+        paths: Set<String>?,
+        progress: String,
+        success: String
+    ) {
+        guard rimeSyncTask == nil else { return }
+        do {
+            try prepareRimeDirectoryForConfigurationSync()
+        } catch {
+            menu.update(status: "Rime 配置同步失败：\(error.localizedDescription)")
+            return
+        }
+
+        menu.update(rimeSyncInProgress: true)
+        menu.update(status: progress)
+        let coordinator = rimeConfigurationCoordinator
+        rimeSyncTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                rimeSyncTask = nil
+                menu.update(rimeSyncInProgress: false)
+            }
+            let result: Result<SyncReport, Error> = await Task.detached(priority: .userInitiated) {
+                do {
+                    return .success(try coordinator.syncConfiguration(paths: paths))
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+            switch result {
+            case let .success(report):
+                let changedCount = report.changedFiles.count + report.deletedFiles.count
+                let conflictMessage = report.conflicts.isEmpty
+                    ? ""
+                    : " · \(report.conflicts.count) 个文件冲突，已暂停"
+                menu.update(status: "\(success) · \(changedCount) 项变更\(conflictMessage)")
+                refreshRimeThemes()
+            case let .failure(error):
+                menu.update(status: "Rime 配置同步失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func prepareRimeDirectoryForConfigurationSync() throws {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: rimeLocalDirectory, withIntermediateDirectories: true)
+        // Once the local directory is bootstrapped, dictionary operations can
+        // use the same coordinator as configuration synchronization.
+        rimeReviewCoordinator = rimeConfigurationCoordinator
+        let installationURL = rimeLocalDirectory.appendingPathComponent("installation.yaml")
+        guard !fileManager.fileExists(atPath: installationURL.path) else { return }
+        try RimeInstallationFile.updating(
+            existingURL: installationURL,
+            installationID: rimeInstallationID,
+            syncDirectory: URL(fileURLWithPath: "/Users/Shared/RimeSync/rime-userdata", isDirectory: true)
+        )
+    }
+
+    private static func defaultRimeInstallationID() -> String {
+        let user = NSUserName().unicodeScalars.map { scalar -> String in
+            let value = scalar.value
+            let isASCIIAlphaNumeric = (value >= 48 && value <= 57)
+                || (value >= 65 && value <= 90)
+                || (value >= 97 && value <= 122)
+            return isASCIIAlphaNumeric || value == 45 || value == 95 ? String(scalar) : "-"
+        }.joined()
+        let normalized = user.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return "\(normalized.isEmpty ? "local" : normalized)-main"
     }
 
     private func toggleRecording() async {

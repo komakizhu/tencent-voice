@@ -12,10 +12,13 @@ public enum SharedDirectoryLayout {
             sharedRoot.appendingPathComponent("legacy-userdata", isDirectory: true),
             sharedRoot.appendingPathComponent("config", isDirectory: true),
             sharedRoot.appendingPathComponent("config/nodes", isDirectory: true),
+            sharedRoot.appendingPathComponent("config/baselines", isDirectory: true),
             sharedRoot.appendingPathComponent("config/conflicts", isDirectory: true),
             sharedRoot.appendingPathComponent("backups", isDirectory: true)
         ] + nodeIDs.map {
             sharedRoot.appendingPathComponent("config/nodes", isDirectory: true).appendingPathComponent($0, isDirectory: true)
+        } + nodeIDs.map {
+            sharedRoot.appendingPathComponent("config/baselines", isDirectory: true).appendingPathComponent($0, isDirectory: true)
         }
         for directory in directories {
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
