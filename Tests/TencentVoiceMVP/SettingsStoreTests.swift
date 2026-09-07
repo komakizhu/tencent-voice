@@ -82,6 +82,7 @@ final class SettingsStoreTests: XCTestCase {
             engineModelType: "16k_zh_en_2.0",
             saveTextLogs: true,
             safeCopyEnabled: true,
+            hideMenuBarIcon: true,
             prepaidQuotaHoursByModel: ["16k_zh_en_2.0": 60]
         )
         store.save(settings)
@@ -100,6 +101,7 @@ final class SettingsStoreTests: XCTestCase {
         let settings = try JSONDecoder().decode(AppSettings.self, from: data)
         XCTAssertTrue(settings.prepaidQuotaHoursByModel.isEmpty)
         XCTAssertFalse(settings.safeCopyEnabled)
+        XCTAssertFalse(settings.hideMenuBarIcon)
     }
 }
 

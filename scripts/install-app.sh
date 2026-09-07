@@ -15,7 +15,7 @@ case "${application_path}" in
     ;;
 esac
 
-TVMVP_OUTPUT_APP="${built_app}" TVMVP_PACING_PRESET=balanced "${script_dir}/build-app.sh"
+TVMVP_OUTPUT_APP="${built_app}" TVMVP_PACING_PRESET=balanced TVMVP_PUBLIC_RELEASE=0 "${script_dir}/build-app.sh"
 
 case "${built_app}" in
   "${project_root}/dist/Rime Voice.app") ;;

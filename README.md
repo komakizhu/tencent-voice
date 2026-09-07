@@ -6,11 +6,11 @@
 
 1. 在腾讯云开通实时语音识别，准备 AppID、SecretId、SecretKey。
 2. 运行 `./scripts/install-app.sh`。它会构建并覆盖 `/Applications/Rime Voice.app`，并通过脚本打开 macOS 隐私设置页面。
-3. 在 macOS 系统设置中手动开启麦克风、辅助功能、发送键盘事件和输入监控，再回到菜单栏“设置…”点击“检查权限”。也可以单独运行 `./scripts/request-permissions.sh microphone` 等命令打开指定页面。
+3. 在 macOS 系统设置中手动开启麦克风、辅助功能、发送键盘事件和输入监控。若更换 App 后权限状态失效，在菜单栏“设置…”点击“重置并重新授权”，应用会清除旧权限记录并打开逐步授权向导；向导会依次打开每个对应设置页，完成当前开关后点击“进入下一步”。如果 macOS 要求输入当前账户密码，输入即可，但权限开关仍需确认已打开。也可以单独运行 `./scripts/request-permissions.sh microphone` 等命令打开指定页面。
 4. 之后直接打开 `/Applications/Rime Voice.app` 即可；普通启动和点击“开始录音”都只检查权限，不会再次主动申请。
 5. 默认点击 Command+0 开始录音，再点击 Command+0 停止；设置中可以重新录制快捷键。
 
-当前 `main` 版本为 0.2.2，构建号以 `Resources/Info.plist` 为准。
+当前 `main` 版本为 0.2.3，构建号以 `Resources/Info.plist` 为准。
 
 应用对外名称为 Rime Voice；为保持已有系统权限、凭证和日志数据兼容，内部可执行文件、Bundle ID 和历史数据目录仍沿用旧标识。
 
@@ -34,6 +34,8 @@ swift test
 codesign --verify --deep --strict "dist/Rime Voice.app"
 ```
 
+本地构建默认在设置页显示版本号和 Build 号；公开发布由 GitHub Actions 使用 `TVMVP_PUBLIC_RELEASE=1` 构建，设置页只显示版本号。安装脚本明确使用本地构建模式。
+
 这是个人本地 macOS 应用，没有 Windows 兼容目标，也没有自动上传或发布流程。
 
 ## Rime 双账户迁移与同步
@@ -50,4 +52,4 @@ codesign --verify --deep --strict "dist/Rime Voice.app"
 
 构建脚本默认使用本机的 `OneKeyIFlyVoice Local Code Signing v4` 签名证书，避免每次重建后 macOS 把应用识别成新的程序。也可以通过 `CODESIGN_IDENTITY` 环境变量指定其他已安装的签名证书。
 
-权限准备由 `scripts/request-permissions.sh` 负责，应用日常运行和点击“开始录音”都只检查权限，不会触发新的系统权限弹窗。macOS 不允许普通脚本静默授予 TCC 权限，因此脚本负责打开准确的设置页，授权仍需在“系统设置 → 隐私与安全性”中手动完成；已经拒绝的权限不会被应用反复重新申请。
+权限准备由 `scripts/request-permissions.sh` 负责，应用日常运行和点击“开始录音”都只检查权限，不会触发新的系统权限弹窗。设置页的“重置并重新授权”会调用 macOS `tccutil reset All` 清除 Rime Voice 的旧 TCC 记录，再打开逐步授权向导；向导会按麦克风、辅助功能、发送键盘事件、输入监控逐项引导，回到向导后会校验当前步骤再进入下一步。macOS 不允许普通脚本或密码静默授予 TCC 权限，因此每一项开关仍需用户在系统设置中确认。

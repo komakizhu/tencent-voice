@@ -7,6 +7,7 @@ final class BuildConfigurationTests: XCTestCase {
         XCTAssertEqual(AppSettings().shortcut, .defaultCommand0)
         XCTAssertFalse(AppSettings().saveTextLogs)
         XCTAssertFalse(AppSettings().safeCopyEnabled)
+        XCTAssertFalse(AppSettings().hideMenuBarIcon)
     }
 
     func testPacingPreviewPresetsStayWithinTheLiveSafetyBounds() {

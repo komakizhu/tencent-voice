@@ -6,9 +6,11 @@ final class StatusMenuController: NSObject {
     private var usageMenuItemView: UsageMenuItemView?
     private var settingsMenuItem: NSMenuItem?
     private var recordMenuItem: NSMenuItem?
+    private var autoStartMenuItem: NSMenuItem?
     private var rimeThemeMenuItem: NSMenuItem?
     private var onSettings: (() -> Void)?
     private var onToggleRecording: (() -> Void)?
+    private var onToggleAutoStart: (() -> Void)?
     private var onSelectRimeTheme: ((String) -> Void)?
     private var onManageRimeDictionary: (() -> Void)?
     private var onSyncRimeDictionary: (() -> Void)?
@@ -33,6 +35,14 @@ final class StatusMenuController: NSObject {
 
         item.menu = makeMenu()
         statusItem = item
+    }
+
+    func setVisible(_ visible: Bool) {
+        if visible {
+            install()
+        } else {
+            removeStatusItem()
+        }
     }
 
     func makeMenu() -> NSMenu {
@@ -73,13 +83,18 @@ final class StatusMenuController: NSObject {
         settings.target = self
         let record = NSMenuItem(title: "开始录音", action: #selector(toggleRecordingPressed), keyEquivalent: "")
         record.target = self
+        let autoStart = NSMenuItem(title: "开机自动启动", action: #selector(autoStartPressed), keyEquivalent: "")
+        autoStart.target = self
+        autoStart.toolTip = "登录 macOS 账户后自动启动 Rime Voice。"
         menu.addItem(settings)
         menu.addItem(record)
+        menu.addItem(autoStart)
         menu.addItem(NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         installedMenu = menu
         usageMenuItemView = usageView
         settingsMenuItem = settings
         recordMenuItem = record
+        autoStartMenuItem = autoStart
         rimeThemeMenuItem = rimeTheme
         rimeSyncMenuItems = [syncDictionary, syncSkin, syncAllConfiguration]
         syncStatusMenuItem = syncStatus
@@ -115,6 +130,10 @@ final class StatusMenuController: NSObject {
         recordMenuItem?.keyEquivalentModifierMask = ShortcutFormatter.menuModifierFlags(for: shortcut)
     }
 
+    func update(autoStartEnabled: Bool) {
+        autoStartMenuItem?.state = autoStartEnabled ? .on : .off
+    }
+
     func update(usage: String) {
         usageMenuItemView?.text = usage
         if let width = usageMenuItemView?.frame.width {
@@ -129,6 +148,7 @@ final class StatusMenuController: NSObject {
     func configure(
         onSettings: @escaping () -> Void,
         onToggleRecording: @escaping () -> Void,
+        onToggleAutoStart: @escaping () -> Void,
         onSelectRimeTheme: @escaping (String) -> Void,
         onManageRimeDictionary: @escaping () -> Void,
         onSyncRimeDictionary: @escaping () -> Void,
@@ -137,6 +157,7 @@ final class StatusMenuController: NSObject {
     ) {
         self.onSettings = onSettings
         self.onToggleRecording = onToggleRecording
+        self.onToggleAutoStart = onToggleAutoStart
         self.onSelectRimeTheme = onSelectRimeTheme
         self.onManageRimeDictionary = onManageRimeDictionary
         self.onSyncRimeDictionary = onSyncRimeDictionary
@@ -177,6 +198,10 @@ final class StatusMenuController: NSObject {
         onToggleRecording?()
     }
 
+    @objc private func autoStartPressed() {
+        onToggleAutoStart?()
+    }
+
     @objc private func rimeThemePressed(_ sender: NSMenuItem) {
         guard let themeID = sender.representedObject as? String else { return }
         onSelectRimeTheme?(themeID)
@@ -199,23 +224,30 @@ final class StatusMenuController: NSObject {
     }
 
     func uninstall() {
-        guard let statusItem else { return }
-        NSStatusBar.system.removeStatusItem(statusItem)
-        self.statusItem = nil
-        installedMenu = nil
-        usageMenuItemView = nil
-        settingsMenuItem = nil
-        recordMenuItem = nil
-        rimeThemeMenuItem = nil
-        syncStatusMenuItem = nil
-        syncStatusMenuItemView = nil
+        removeStatusItem()
         onSettings = nil
         onToggleRecording = nil
+        onToggleAutoStart = nil
         onSelectRimeTheme = nil
         onManageRimeDictionary = nil
         onSyncRimeDictionary = nil
         onSyncRimeSkin = nil
         onSyncAllConfiguration = nil
+    }
+
+    private func removeStatusItem() {
+        if let statusItem {
+            NSStatusBar.system.removeStatusItem(statusItem)
+        }
+        self.statusItem = nil
+        installedMenu = nil
+        usageMenuItemView = nil
+        settingsMenuItem = nil
+        recordMenuItem = nil
+        autoStartMenuItem = nil
+        rimeThemeMenuItem = nil
+        syncStatusMenuItem = nil
+        syncStatusMenuItemView = nil
         rimeSyncMenuItems = []
     }
 

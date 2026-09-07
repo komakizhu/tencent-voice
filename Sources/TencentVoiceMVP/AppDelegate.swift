@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let credentialStore: PersistentCredentialStore
     private let hotkeyManager: CarbonHotkeyManager
     private let menu: StatusMenuController
+    private let loginItemManager: LoginItemManager
     private let coordinator: SessionCoordinator
     private let sessionLogger: SessionLogger
     private let localUsageStore: LocalUsageStore
@@ -34,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         let hotkeyManager = CarbonHotkeyManager()
         let menu = StatusMenuController()
+        let loginItemManager = LoginItemManager()
         let localUsageStore = LocalUsageStore()
         let sharedUsageStore = SharedUsageStore()
         let rimeThemeStore = RimeThemeStore()
@@ -76,6 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.credentialStore = credentialStore
         self.hotkeyManager = hotkeyManager
         self.menu = menu
+        self.loginItemManager = loginItemManager
         self.localUsageStore = localUsageStore
         self.sharedUsageStore = sharedUsageStore
         self.rimeThemeStore = rimeThemeStore
@@ -117,14 +120,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let launchSettings = settingsStore.load()
+        NSApp.setActivationPolicy(launchSettings.hideMenuBarIcon ? .regular : .accessory)
         installMainMenu()
-        menu.install()
+        if !launchSettings.hideMenuBarIcon {
+            menu.install()
+        }
         menu.configure(
             onSettings: { [weak self] in self?.showSettings() },
             onToggleRecording: { [weak self] in
                 Task { @MainActor [weak self] in
                     await self?.toggleRecording()
                 }
+            },
+            onToggleAutoStart: { [weak self] in
+                self?.toggleAutoStart()
             },
             onSelectRimeTheme: { [weak self] themeID in
                 self?.selectRimeTheme(themeID)
@@ -142,6 +152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.syncAllConfiguration()
             }
         )
+        menu.update(autoStartEnabled: loginItemManager.isEnabled)
         refreshRimeThemes()
         registerHotkey()
         localUsageStore.migrateLegacyUnscopedUsage(to: TencentEnginePreset.standard.rawValue)
@@ -149,11 +160,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         migrateLocalUsageIfNeeded()
         updateLocalUsageDisplay()
         startLocalUsageMonitor()
+        if UserDefaults.standard.bool(forKey: "resumePermissionSetup") {
+            UserDefaults.standard.removeObject(forKey: "resumePermissionSetup")
+            showSettings()
+            settingsWindowController?.resumePermissionSetup()
+        }
     }
 
     private func installMainMenu() {
         let mainMenu = NSMenu()
         let appMenu = NSMenu()
+        let settingsItem = NSMenuItem(
+            title: "设置…",
+            action: #selector(settingsMenuPressed),
+            keyEquivalent: ","
+        )
+        settingsItem.target = self
+        appMenu.addItem(settingsItem)
+        appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         let appItem = NSMenuItem()
         appItem.submenu = appMenu
@@ -177,6 +201,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowItem.submenu = windowMenu
         mainMenu.addItem(windowItem)
         NSApp.mainMenu = mainMenu
+    }
+
+    @objc private func settingsMenuPressed() {
+        showSettings()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -253,8 +281,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     },
                     onRelease: {}
                 )
-                menu.update(shortcut: newSettings.shortcut)
                 settingsStore.save(newSettings)
+                menu.setVisible(!newSettings.hideMenuBarIcon)
+                if !newSettings.hideMenuBarIcon {
+                    menu.update(autoStartEnabled: loginItemManager.isEnabled)
+                    refreshRimeThemes()
+                }
+                menu.update(shortcut: newSettings.shortcut)
                 migrateLocalUsageIfNeeded()
                 menu.update(status: "就绪 · \(ShortcutFormatter.string(for: newSettings.shortcut))")
                 updateLocalUsageDisplay()
@@ -280,8 +313,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             logDirectoryURL: sessionLogger.persistenceDirectoryURL,
             diagnosticDirectoryURL: sessionLogger.diagnosticExportDirectoryURL,
             onClose: { [weak self] in
-                guard self != nil else { return }
-                NSApp.setActivationPolicy(.accessory)
+                guard let self else { return }
+                let hideMenuBarIcon = self.settingsStore.load().hideMenuBarIcon
+                NSApp.setActivationPolicy(hideMenuBarIcon ? .regular : .accessory)
             }
         )
         settingsWindowController = controller
@@ -291,6 +325,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.window?.center()
         controller.window?.makeKeyAndOrderFront(nil)
         controller.window?.orderFrontRegardless()
+    }
+
+    private func toggleAutoStart() {
+        let shouldEnable = !loginItemManager.isEnabled
+        do {
+            try loginItemManager.setEnabled(shouldEnable)
+            menu.update(autoStartEnabled: loginItemManager.isEnabled)
+            sessionLogger.recordDiagnosticAction("auto_start_updated", fields: [
+                "enabled": String(loginItemManager.isEnabled),
+                "status": String(describing: loginItemManager.status)
+            ])
+
+            if shouldEnable, loginItemManager.status == .requiresApproval {
+                let alert = NSAlert()
+                alert.alertStyle = .informational
+                alert.messageText = "请允许 Rime Voice 开机自动启动"
+                alert.informativeText = "请打开“系统设置 → 通用 → 登录项”，允许 Rime Voice 在登录时启动。"
+                alert.runModal()
+            }
+        } catch {
+            menu.update(autoStartEnabled: loginItemManager.isEnabled)
+            sessionLogger.recordDiagnosticAction("auto_start_update_failed", fields: [
+                "enabled": String(shouldEnable),
+                "errorCode": DiagnosticErrorFormatter.code(for: error),
+                "errorMessage": DiagnosticErrorFormatter.message(for: error)
+            ])
+
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = shouldEnable ? "无法开启开机自动启动" : "无法关闭开机自动启动"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
     }
 
     private func exportDiagnosticLog() throws -> URL? {

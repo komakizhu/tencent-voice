@@ -7,6 +7,9 @@ enum AppVersion {
 
     static func displayText(for info: [String: Any]) -> String {
         let version = info["CFBundleShortVersionString"] as? String ?? "未知"
+        guard (info["RimeVoiceShowBuild"] as? Bool) != false else {
+            return "当前版本：\(version)"
+        }
         guard let build = info["CFBundleVersion"] as? String, !build.isEmpty else {
             return "当前版本：\(version)"
         }

@@ -71,7 +71,7 @@ struct PrivacyPermissionReport: Codable, Equatable, Sendable {
             return "系统权限完整，可以录音并把识别结果输入到当前应用。"
         }
         let missingNames = missing.map(\.title).joined(separator: "、")
-        return "还缺少：\(missingNames)。点击对应的“打开设置”，按下面的文字说明开启后，再点击“重新检查”。"
+        return "还缺少：\(missingNames)。点击“重置并重新授权”清除旧记录并重新开启，或点击对应的“打开设置”进行单项授权；回到此窗口后会自动刷新。"
     }
 }
 
@@ -80,6 +80,12 @@ protocol PrivacyPermissionChecking: AnyObject {
     func report() -> PrivacyPermissionReport
     @discardableResult
     func openSettings(for permission: PrivacyPermission) -> Bool
+    func requestPermission(
+        for permission: PrivacyPermission,
+        completion: @escaping (Bool) -> Void
+    )
+    @discardableResult
+    func resetPermissions() -> Bool
 }
 
 @MainActor
@@ -88,6 +94,9 @@ final class SystemPrivacyPermissionChecker: PrivacyPermissionChecking {
     private let accessibilityStatus: () -> Bool
     private let postEventStatus: () -> Bool
     private let inputMonitoringStatus: () -> Bool
+    private let openSettingsAction: (PrivacyPermission) -> Bool
+    private let requestPermissionAction: (PrivacyPermission, @escaping (Bool) -> Void) -> Void
+    private let resetPermissionsAction: () -> Bool
 
     init(
         microphoneStatus: @escaping () -> AVAuthorizationStatus = {
@@ -101,12 +110,32 @@ final class SystemPrivacyPermissionChecker: PrivacyPermissionChecking {
         },
         inputMonitoringStatus: @escaping () -> Bool = {
             CGPreflightListenEventAccess()
-        }
+        },
+        openSettings: ((PrivacyPermission) -> Bool)? = nil,
+        requestPermission: ((PrivacyPermission, @escaping (Bool) -> Void) -> Void)? = nil,
+        resetPermissions: (() -> Bool)? = nil
     ) {
         self.microphoneStatus = microphoneStatus
         self.accessibilityStatus = accessibilityStatus
         self.postEventStatus = postEventStatus
         self.inputMonitoringStatus = inputMonitoringStatus
+        openSettingsAction = openSettings ?? { permission in
+            Self.openSystemSettings(for: permission)
+        }
+        requestPermissionAction = requestPermission ?? { permission, completion in
+            switch permission {
+            case .microphone:
+                AVCaptureDevice.requestAccess(for: .audio, completionHandler: completion)
+            case .accessibility:
+                let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+                completion(AXIsProcessTrustedWithOptions(options))
+            case .postEvent:
+                completion(CGRequestPostEventAccess())
+            case .inputMonitoring:
+                completion(CGRequestListenEventAccess())
+            }
+        }
+        resetPermissionsAction = resetPermissions ?? Self.resetSystemPermissions
     }
 
     func report() -> PrivacyPermissionReport {
@@ -140,8 +169,40 @@ final class SystemPrivacyPermissionChecker: PrivacyPermissionChecking {
 
     @discardableResult
     func openSettings(for permission: PrivacyPermission) -> Bool {
-        guard let url = permission.settingsURL else { return false }
+        openSettingsAction(permission)
+    }
+
+    func requestPermission(
+        for permission: PrivacyPermission,
+        completion: @escaping (Bool) -> Void
+    ) {
+        requestPermissionAction(permission, completion)
+    }
+
+    @discardableResult
+    func resetPermissions() -> Bool {
+        resetPermissionsAction()
+    }
+
+    private static func openSystemSettings(for permission: PrivacyPermission) -> Bool {
+        guard let url = permission.settingsURL else {
+            return false
+        }
         return NSWorkspace.shared.open(url)
+    }
+
+    private static func resetSystemPermissions() -> Bool {
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return false }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        process.arguments = ["reset", "All", bundleIdentifier]
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
     }
 
     private func microphoneDetail(_ status: AVAuthorizationStatus) -> String {
