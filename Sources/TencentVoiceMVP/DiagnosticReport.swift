@@ -155,7 +155,7 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
             "快捷键：\(settings.shortcut)",
             "识别引擎：\(settings.engineModelType)",
             "自动保存诊断日志：\(settings.persistentSessionLogEnabled ? "已开启" : "未开启")",
-            "Safe Copy：\(settings.safeCopyEnabled ? "已开启（始终复制到剪贴板）" : "已关闭（发生输入错误时不复制）")",
+            "Safe Copy：\(settings.safeCopyEnabled ? "已开启（正常输入并复制到剪贴板）" : "已关闭（发生输入错误时不复制）")",
             "日志目录：\(logDirectoryPath)",
             "",
             "【诊断判断】"

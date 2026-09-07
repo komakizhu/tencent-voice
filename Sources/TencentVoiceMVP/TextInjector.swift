@@ -62,13 +62,6 @@ final class TextInjector {
 
     func begin() throws {
         resetForBegin()
-        if safeCopyEnabled {
-            mode = .safeCopy
-            degradationCode = "safe_copy_manual"
-            degradationReason = DiagnosticErrorFormatter.canonicalMessage(for: "safe_copy_manual")
-            return
-        }
-
         do {
             let captured = try target.capture()
             snapshot = captured
@@ -132,14 +125,11 @@ final class TextInjector {
             } catch {
                 enterSafeCopy(after: error)
             }
-            if mode == .safeCopy {
-                try copyIfNeeded(completionText)
-            }
-        case .safeCopy:
-            try copyIfNeeded(completionText)
-        case .ax, .inactive, .disabledAfterError:
+        case .safeCopy, .ax, .inactive, .disabledAfterError:
             break
         }
+
+        try copyOnFinishIfNeeded(completionText)
     }
 
     func finishImmediately(finalText: String) throws {
@@ -156,14 +146,11 @@ final class TextInjector {
             } catch {
                 enterSafeCopy(after: error)
             }
-            if mode == .safeCopy {
-                try copyIfNeeded(completionText)
-            }
-        case .safeCopy:
-            try copyIfNeeded(completionText)
-        case .ax, .inactive, .disabledAfterError:
+        case .safeCopy, .ax, .inactive, .disabledAfterError:
             break
         }
+
+        try copyOnFinishIfNeeded(completionText)
     }
 
     func cancel() {
@@ -173,6 +160,11 @@ final class TextInjector {
     private func copyIfNeeded(_ text: String) throws {
         guard !text.isEmpty else { return }
         try target.copyToClipboard(text)
+    }
+
+    private func copyOnFinishIfNeeded(_ text: String) throws {
+        guard safeCopyEnabled, mode != .inactive, mode != .disabledAfterError else { return }
+        try copyIfNeeded(text)
     }
 
     private func applyAX(_ projection: ASRProjection) {

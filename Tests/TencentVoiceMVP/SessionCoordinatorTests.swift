@@ -529,7 +529,7 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(target.text, "原文")
     }
 
-    func testEnabledSafeCopyIsWiredThroughSettingsStore() async throws {
+    func testEnabledSafeCopyWritesThroughAndCopiesThroughSettingsStore() async throws {
         let settingsStore = UserDefaultsSettingsStore(
             suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"
         )
@@ -547,7 +547,7 @@ final class SessionCoordinatorTests: XCTestCase {
         await settleCoordinator()
         try await coordinator.end()
 
-        XCTAssertEqual(target.text, "原文")
+        XCTAssertEqual(target.text, "原文安全复制结果")
         XCTAssertEqual(target.copiedText, "安全复制结果")
     }
 }
