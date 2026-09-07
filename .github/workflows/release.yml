@@ -1,0 +1,75 @@
+name: Release Rime Voice
+
+on:
+  push:
+    tags:
+      - 'v*-macos'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and validate macOS app
+    runs-on: macos-14
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Run tests
+        run: swift test
+
+      - name: Build app
+        env:
+          CODESIGN_IDENTITY: "-"
+          TVMVP_DISPLAY_NAME: Rime Voice
+        run: ./scripts/build-app.sh
+
+      - name: Verify app bundle
+        run: |
+          codesign --verify --deep --strict "dist/Rime Voice.app"
+          test -x "dist/Rime Voice.app/Contents/MacOS/TencentVoiceMVP"
+
+      - name: Package release assets
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          archive="dist/Rime-Voice-${TAG_NAME}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "dist/Rime Voice.app" "$archive"
+          shasum -a 256 "$archive" > "${archive}.sha256"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: rime-voice-release-assets
+          path: |
+            dist/Rime-Voice-*.zip
+            dist/Rime-Voice-*.zip.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: ${{ success() && startsWith(github.ref, 'refs/tags/') }}
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: rime-voice-release-assets
+          path: release-assets
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          mapfile -d '' assets < <(find release-assets -type f -print0)
+          test "${#assets[@]}" -gt 0
+          gh release create "$TAG_NAME" "${assets[@]}" \
+            --verify-tag \
+            --generate-notes \
+            --title "Rime Voice ${TAG_NAME}"
