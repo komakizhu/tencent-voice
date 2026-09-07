@@ -10,7 +10,7 @@
 4. 之后直接打开 `/Applications/TencentVoiceMVP.app` 即可；普通启动和点击“开始录音”都只检查权限，不会再次主动申请。
 5. 默认点击 Command+0 开始录音，再点击 Command+0 停止；设置中可以重新录制快捷键。
 
-当前 `main` 版本为 0.2.1，构建号以 `Resources/Info.plist` 为准。
+当前 `main` 版本为 0.2.2，构建号以 `Resources/Info.plist` 为准。
 
 设置页的“测试连接”按钮会使用当前填写的 AppID、SecretId、SecretKey 和识别引擎执行一次腾讯 ASR WebSocket 握手。握手成功才会提示连接可用；这个测试不会录音、不会写入文本，也不会计入用量。
 
@@ -38,7 +38,7 @@ codesign --verify --deep --strict dist/TencentVoiceMVP.app
 
 本仓库同时包含仅面向 macOS 的 `RimeSync` Swift 命令行工具，以及 TencentVoiceMVP 菜单栏中的“Rime 词库管理”。命令行工具负责稳定配置的双向同步；菜单栏模块负责生成 `rime_ice` 快照、逐条审核、手动添加和维护独立的 `rime_managed.dict.yaml`，不会调用绕过审核的原生远端合并。使用方式、备份、冲突暂停和回滚说明见 [docs/rime/rime-sync.md](docs/rime/rime-sync.md)。
 
-状态栏菜单还提供“同步 Rime 皮肤”“同步 Rime 所有配置”和“一键同步所有配置”。前者只同步 `squirrel.custom.yaml`；后两者同步 YAML、Lua、OpenCC 和皮肤等稳定 Rime 资源，不直接共享两个账户的实时 `.userdb`。实时用户词库仍通过单独的“同步 Rime 词库”处理；TencentVoice 的权限、快捷键和账户级应用设置也不会被一键覆盖。
+状态栏菜单还提供“同步 Rime 皮肤”和“一键同步所有配置”。前者只同步 `squirrel.custom.yaml`；后者同步 YAML、Lua、OpenCC 和皮肤等稳定 Rime 资源，不直接共享两个账户的实时 `.userdb`。实时用户词库仍通过单独的“同步 Rime 词库”处理；TencentVoice 的权限、快捷键和账户级应用设置也不会被一键覆盖。
 
 同一个稳定配置文件在两个账户同时修改时，工具会以两边上一次同步共同看到的版本为基线做三方增量合并；不同片段会合并，同一片段重叠、没有共同基线或时间完全相同则暂停为冲突，不会直接用较晚版本覆盖。实时词库由 Squirrel 的原生同步按词条处理。
 

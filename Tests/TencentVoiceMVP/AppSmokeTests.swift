@@ -9,25 +9,51 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertEqual(controller.statusText, "就绪")
     }
 
-    func testStatusMenuContainsSeparateRimeSyncActions() {
+    func testStatusMenuDisplaysSyncProgress() {
+        let controller = StatusMenuController()
+        let menu = controller.makeMenu()
+
+        let statusItem = menu.items.first { $0.title == "同步状态：就绪" }
+        let usageView = menu.items.compactMap { $0.view as? UsageMenuItemView }.first
+        let syncStatusView = menu.items.compactMap { $0.view as? SyncStatusMenuItemView }.first
+        XCTAssertNotNil(statusItem)
+        XCTAssertFalse(statusItem?.isEnabled ?? true)
+        XCTAssertNotNil(usageView)
+        XCTAssertNotNil(syncStatusView)
+        XCTAssertEqual(syncStatusView?.frame.width, usageView?.frame.width)
+
+        controller.update(syncStatus: "Rime 配置同步 2/3：合并并写入配置，这是一条需要自动换行的状态…")
+        XCTAssertEqual(statusItem?.title, "同步状态：Rime 配置同步 2/3：合并并写入配置，这是一条需要自动换行的状态…")
+        XCTAssertEqual(syncStatusView?.text, "同步状态：Rime 配置同步 2/3：合并并写入配置，这是一条需要自动换行的状态…")
+        XCTAssertEqual(syncStatusView?.frame.width, usageView?.frame.width)
+        XCTAssertGreaterThan(syncStatusView?.frame.height ?? 0, SyncStatusMenuItemView.lineHeight)
+
+        controller.update(usage: "模型：16k_zh_en_2.0\n用量：1h 36min / 60h（3%）")
+        XCTAssertEqual(syncStatusView?.frame.width, usageView?.frame.width)
+        XCTAssertEqual(controller.statusText, "就绪")
+        XCTAssertEqual(menu.items.first { $0.title == "开始录音" }?.title, "开始录音")
+    }
+
+    func testStatusMenuContainsRimeSyncActions() {
         let controller = StatusMenuController()
         let menu = controller.makeMenu()
 
         let titles = menu.items.map(\.title)
         let syncTitles = titles.filter {
-            ["同步 Rime 词库", "同步 Rime 皮肤", "同步 Rime 所有配置", "一键同步所有配置"].contains($0)
+            ["同步 Rime 词库", "同步 Rime 皮肤", "一键同步所有配置"].contains($0)
         }
 
         XCTAssertEqual(
             syncTitles,
-            ["同步 Rime 词库", "同步 Rime 皮肤", "同步 Rime 所有配置", "一键同步所有配置"]
+            ["同步 Rime 词库", "同步 Rime 皮肤", "一键同步所有配置"]
         )
+        XCTAssertFalse(titles.contains("同步 Rime 所有配置"))
     }
 
     func testStatusMenuDisablesAllRimeSyncActionsWhileBusy() {
         let controller = StatusMenuController()
         let menu = controller.makeMenu()
-        let titles = ["同步 Rime 词库", "同步 Rime 皮肤", "同步 Rime 所有配置", "一键同步所有配置"]
+        let titles = ["同步 Rime 词库", "同步 Rime 皮肤", "一键同步所有配置"]
 
         controller.update(rimeSyncInProgress: true)
         XCTAssertTrue(

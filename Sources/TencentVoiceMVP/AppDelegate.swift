@@ -138,9 +138,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onSyncRimeSkin: { [weak self] in
                 self?.syncRimeSkin()
             },
-            onSyncRimeConfiguration: { [weak self] in
-                self?.syncRimeConfiguration()
-            },
             onSyncAllConfiguration: { [weak self] in
                 self?.syncAllConfiguration()
             }
@@ -372,19 +369,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func syncRimeDictionary() {
         guard rimeSyncTask == nil else { return }
+        menu.update(syncStatus: "Rime 词库同步 1/3：准备目录…")
         do {
             try prepareRimeDirectoryForConfigurationSync()
         } catch {
-            menu.update(status: "Rime 词库同步失败：\(error.localizedDescription)")
+            menu.update(syncStatus: "Rime 词库同步失败：\(error.localizedDescription)")
             return
         }
         guard let coordinator = rimeReviewCoordinator else {
-            menu.update(status: "Rime 词库同步不可用")
+            menu.update(syncStatus: "Rime 词库同步不可用")
             return
         }
 
         menu.update(rimeSyncInProgress: true)
-        menu.update(status: "正在同步 Rime 词库…")
+        menu.update(syncStatus: "Rime 词库同步 2/3：同步词库并生成快照…")
         rimeSyncTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
@@ -400,10 +398,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }.value
             switch result {
             case let .success(report):
-                menu.update(status: "Rime 词库同步完成 · \(report.entryCount) 条审核记录")
+                menu.update(syncStatus: "Rime 词库同步 3/3：刷新词库管理器…")
                 rimeDictionaryWindowController?.reloadFromStoredSnapshot()
+                menu.update(syncStatus: "Rime 词库同步完成 · \(report.entryCount) 条审核记录")
             case let .failure(error):
-                menu.update(status: "Rime 词库同步失败：\(error.localizedDescription)")
+                menu.update(syncStatus: "Rime 词库同步失败：\(error.localizedDescription)")
             }
         }
     }
@@ -411,42 +410,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func syncRimeSkin() {
         syncRimeConfiguration(
             paths: [RimeResourcePolicy.skinConfigurationPath],
-            progress: "正在同步 Rime 皮肤…",
+            operation: "Rime 皮肤同步",
             success: "Rime 皮肤同步完成"
-        )
-    }
-
-    private func syncRimeConfiguration() {
-        syncRimeConfiguration(
-            paths: nil,
-            progress: "正在同步 Rime 所有配置…",
-            success: "Rime 所有配置同步完成"
         )
     }
 
     private func syncAllConfiguration() {
         syncRimeConfiguration(
             paths: nil,
-            progress: "正在一键同步所有配置…",
+            operation: "一键同步所有配置",
             success: "一键同步所有配置完成"
         )
     }
 
     private func syncRimeConfiguration(
         paths: Set<String>?,
-        progress: String,
+        operation: String,
         success: String
     ) {
         guard rimeSyncTask == nil else { return }
+        menu.update(syncStatus: "\(operation) 1/3：准备目录…")
         do {
             try prepareRimeDirectoryForConfigurationSync()
         } catch {
-            menu.update(status: "Rime 配置同步失败：\(error.localizedDescription)")
+            menu.update(syncStatus: "\(operation)失败：\(error.localizedDescription)")
             return
         }
 
         menu.update(rimeSyncInProgress: true)
-        menu.update(status: progress)
+        menu.update(syncStatus: "\(operation) 2/3：合并并写入配置…")
         let coordinator = rimeConfigurationCoordinator
         rimeSyncTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -467,10 +459,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let conflictMessage = report.conflicts.isEmpty
                     ? ""
                     : " · \(report.conflicts.count) 个文件冲突，已暂停"
-                menu.update(status: "\(success) · \(changedCount) 项变更\(conflictMessage)")
+                menu.update(syncStatus: "\(operation) 3/3：刷新 Rime…")
                 refreshRimeThemes()
+                menu.update(syncStatus: "\(success) · \(changedCount) 项变更\(conflictMessage)")
             case let .failure(error):
-                menu.update(status: "Rime 配置同步失败：\(error.localizedDescription)")
+                menu.update(syncStatus: "\(operation)失败：\(error.localizedDescription)")
             }
         }
     }
