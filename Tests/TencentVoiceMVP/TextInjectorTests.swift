@@ -122,7 +122,7 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertNil(target.copiedText)
     }
 
-    func testManualSafeCopySkipsTextTargetWritesEvenWithoutAnError() async throws {
+    func testEnabledSafeCopyWritesToTextTargetAndClipboard() async throws {
         let target = FakeTextTarget(text: "已有文字", supportsAXReplacement: false)
         let injector = TextInjector(target: target, safeCopyEnabled: true)
 
@@ -136,14 +136,36 @@ final class TextInjectorTests: XCTestCase {
         ))
         try await injector.finish(finalText: "手动安全复制")
 
-        XCTAssertEqual(target.text, "已有文字")
+        XCTAssertEqual(target.text, "已有文字手动安全复制")
         XCTAssertEqual(target.copiedText, "手动安全复制")
-        XCTAssertEqual(target.pastedTexts, [])
-        XCTAssertEqual(injector.modeDescription, "safe_copy")
-        XCTAssertEqual(injector.degradationCode, "safe_copy_manual")
+        XCTAssertEqual(target.pastedTexts, ["手动安全复制"])
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+        XCTAssertNil(injector.degradationCode)
     }
 
-    func testManualSafeCopyDoesNotReplaceClipboardForEmptyResult() async throws {
+    func testEnabledSafeCopyUsesAXReplacementAndClipboard() async throws {
+        let target = FakeTextTarget(text: "已有文字", supportsAXReplacement: true)
+        let injector = TextInjector(target: target, safeCopyEnabled: true)
+
+        try injector.begin()
+        injector.apply(projection: projection(
+            committed: "",
+            active: "手动安全复制",
+            id: 1,
+            revision: 1,
+            isFinal: true
+        ))
+        try injector.finishImmediately(finalText: "手动安全复制")
+
+        XCTAssertEqual(target.text, "已有文字手动安全复制")
+        XCTAssertEqual(target.copiedText, "手动安全复制")
+        XCTAssertEqual(target.pastedTexts, [])
+        XCTAssertEqual(target.replaceCallCount, 1)
+        XCTAssertEqual(injector.modeDescription, "ax")
+        XCTAssertNil(injector.degradationCode)
+    }
+
+    func testEnabledSafeCopyDoesNotReplaceClipboardForEmptyResult() async throws {
         let target = FakeTextTarget(text: "已有文字", supportsAXReplacement: false)
         let injector = TextInjector(target: target, safeCopyEnabled: true)
 

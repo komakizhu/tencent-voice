@@ -227,7 +227,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func safeCopyRow() -> NSView {
         let description = NSTextField(
-            labelWithString: "适用于所有支持文本输入的应用；保存后生效；关闭时发生输入错误不会自动复制"
+            labelWithString: "正常输出到输入框，并在会话结束时同步复制最终结果；发生输入错误时作为回退；保存后生效"
         )
         description.textColor = .secondaryLabelColor
         description.lineBreakMode = .byWordWrapping
