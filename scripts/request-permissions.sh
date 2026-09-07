@@ -34,4 +34,4 @@ if ! /usr/bin/open -g "${settings_url}"; then
   exit 69
 fi
 
-print "已打开 macOS 隐私与安全性设置（${permission}）。请手动开启腾讯语音输入 MVP 对应项目。"
+print "已打开 macOS 隐私与安全性设置（${permission}）。请手动开启 Rime Voice 对应项目。"

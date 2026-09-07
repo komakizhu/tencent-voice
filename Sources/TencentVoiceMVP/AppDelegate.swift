@@ -318,7 +318,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyyMMdd-HHmmss"
-        return "TencentVoiceMVP-Diagnostic-\(formatter.string(from: Date())).json"
+        return "Rime Voice-Diagnostic-\(formatter.string(from: Date())).json"
     }
 
     private func refreshRimeThemes() {

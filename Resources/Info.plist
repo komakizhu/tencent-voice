@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>腾讯语音输入 MVP</string>
+	<string>Rime Voice</string>
 	<key>CFBundleExecutable</key>
 	<string>TencentVoiceMVP</string>
 	<key>CFBundleIconFile</key>
@@ -11,13 +11,13 @@
 	<key>CFBundleIdentifier</key>
 	<string>local.tencent-voice-mvp</string>
 	<key>CFBundleName</key>
-	<string>TencentVoiceMVP</string>
+	<string>Rime Voice</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>0.2.2</string>
 	<key>CFBundleVersion</key>
-	<string>57</string>
+	<string>58</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>

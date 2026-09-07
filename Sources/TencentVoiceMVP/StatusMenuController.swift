@@ -28,8 +28,8 @@ final class StatusMenuController: NSObject {
         item.button?.title = ""
         item.button?.image = statusImage()
         item.button?.imageScaling = .scaleProportionallyDown
-        item.button?.setAccessibilityLabel("腾讯语音输入")
-        item.button?.toolTip = "腾讯语音输入"
+        item.button?.setAccessibilityLabel("Rime Voice")
+        item.button?.toolTip = "Rime Voice"
 
         item.menu = makeMenu()
         statusItem = item
@@ -107,7 +107,7 @@ final class StatusMenuController: NSObject {
         let title = "同步状态：\(syncStatus)"
         syncStatusMenuItem?.title = title
         syncStatusMenuItemView?.text = title
-        statusItem?.button?.toolTip = "腾讯语音输入 · 同步状态：\(syncStatus)"
+        statusItem?.button?.toolTip = "Rime Voice · 同步状态：\(syncStatus)"
     }
 
     func update(shortcut: Shortcut) {

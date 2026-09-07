@@ -411,7 +411,7 @@ private struct RimeAuditMCPMain {
             let server = Server(
                 name: "RimeAuditMCP",
                 version: "0.2.0",
-                instructions: "只读取 Rime 审核数据并提交提案；所有实际修改必须由 TencentVoiceMVP 菜单栏界面确认。",
+                instructions: "只读取 Rime 审核数据并提交提案；所有实际修改必须由 Rime Voice 菜单栏界面确认。",
                 capabilities: .init(tools: .init(listChanged: false)),
                 configuration: .strict
             )

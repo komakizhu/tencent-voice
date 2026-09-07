@@ -58,9 +58,9 @@ esac
 if [[ -n "${TVMVP_OUTPUT_APP:-}" ]]; then
     APP_DIR="$TVMVP_OUTPUT_APP"
 elif [[ "$PACING_PRESET" == "balanced" ]]; then
-    APP_DIR="$PROJECT_DIR/dist/TencentVoiceMVP.app"
+    APP_DIR="$PROJECT_DIR/dist/Rime Voice.app"
 else
-    APP_DIR="$PROJECT_DIR/dist/presets/TencentVoiceMVP-$BUNDLE_SHORT_VERSION-build$BUNDLE_BUILD-$PACING_PRESET.app"
+    APP_DIR="$PROJECT_DIR/dist/presets/Rime Voice-$BUNDLE_SHORT_VERSION-build$BUNDLE_BUILD-$PACING_PRESET.app"
 fi
 
 mkdir -p "$PROJECT_DIR/dist"
@@ -102,7 +102,7 @@ case "$APP_PARENT" in
         ;;
 esac
 
-DISPLAY_NAME="${TVMVP_DISPLAY_NAME:-腾讯语音输入 MVP · $PACING_PRESET}"
+DISPLAY_NAME="${TVMVP_DISPLAY_NAME:-Rime Voice}"
 
 cd "$PROJECT_DIR"
 rm -rf -- "$APP_DIR"

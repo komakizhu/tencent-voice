@@ -186,7 +186,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "腾讯语音输入设置"
+        window.title = "Rime Voice 设置"
         self.onSave = onSave
         self.onTestConnection = onTestConnection
         self.onExportDiagnosticLog = onExportDiagnosticLog

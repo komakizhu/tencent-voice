@@ -122,7 +122,7 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
 
     func renderedText() -> String {
         var lines = [
-            "腾讯语音输入 MVP 故障诊断报告",
+            "Rime Voice 故障诊断报告",
             "报告版本：\(schemaVersion)",
             "生成时间：\(Self.format(generatedAt))",
             "",

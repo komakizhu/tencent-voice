@@ -100,8 +100,8 @@ enum TextTargetError: Error, LocalizedError {
         case .unsupported: return "当前输入框不支持实时改写"
         case .targetChanged: return "输入目标在识别过程中发生了变化"
         case .writeFailed: return "无法写入当前输入框"
-        case .accessibilityDenied: return "请在系统设置的“隐私与安全性 → 辅助功能”中允许腾讯语音输入 MVP"
-        case .postEventDenied: return "系统禁止腾讯语音输入 MVP 发送键盘事件，请在辅助功能中重新允许后重启应用"
+        case .accessibilityDenied: return "请在系统设置的“隐私与安全性 → 辅助功能”中允许 Rime Voice"
+        case .postEventDenied: return "系统禁止 Rime Voice 发送键盘事件，请在辅助功能中重新允许后重启应用"
         }
     }
 
