@@ -10,7 +10,7 @@
 4. 之后直接打开 `/Applications/TencentVoiceMVP.app` 即可；普通启动和点击“开始录音”都只检查权限，不会再次主动申请。
 5. 默认点击 Command+0 开始录音，再点击 Command+0 停止；设置中可以重新录制快捷键。
 
-当前开发支线版本为 0.2.1，基于 `main` 的 0.2.0 build 45。
+当前 `main` 版本为 0.2.1，构建号以 `Resources/Info.plist` 为准。
 
 设置页的“测试连接”按钮会使用当前填写的 AppID、SecretId、SecretKey 和识别引擎执行一次腾讯 ASR WebSocket 握手。握手成功才会提示连接可用；这个测试不会录音、不会写入文本，也不会计入用量。
 

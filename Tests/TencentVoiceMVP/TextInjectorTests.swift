@@ -176,6 +176,32 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertEqual(target.text, "已有文字")
     }
 
+    func testEnabledSafeCopyFallsBackAfterInputFailureAndCopiesFinalResult() async throws {
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let injector = TextInjector(target: target, safeCopyEnabled: true)
+
+        try injector.begin()
+        injector.apply(projection: projection(
+            committed: "",
+            active: "第一段",
+            id: 1,
+            revision: 1
+        ))
+        target.text = "用户已经编辑了目标"
+        injector.apply(projection: projection(
+            committed: "",
+            active: "第二段",
+            id: 1,
+            revision: 2
+        ))
+        try await injector.finish(finalText: "第二段")
+
+        XCTAssertEqual(target.text, "用户已经编辑了目标")
+        XCTAssertEqual(target.copiedText, "第二段")
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
+        XCTAssertEqual(injector.degradationCode, "text_target_changed")
+    }
+
     func testSafeCopyDisabledStopsAfterInputFailureWithoutCopyingToClipboard() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let injector = TextInjector(target: target)
