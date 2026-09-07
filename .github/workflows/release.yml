@@ -75,6 +75,7 @@ jobs:
           mapfile -d '' assets < <(find release-assets -type f -print0)
           test "${#assets[@]}" -gt 0
           gh release create "$TAG_NAME" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --generate-notes \
             --title "Rime Voice ${TAG_NAME}"
