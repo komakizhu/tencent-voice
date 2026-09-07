@@ -34,7 +34,7 @@ final class RimeSyncCoreTests: XCTestCase {
         XCTAssertNotNil(records.first(where: { $0.relativePath == "rime_ice.schema.yaml" })?.sha256)
     }
 
-    func testThreeWayResolverUsesBaselineAndDetectsEqualTimeConflict() throws {
+    func testThreeWayResolverUsesBaselineAndTreatsIdenticalContentAsUnchanged() throws {
         let baseline = FileRecord.present(path: "one.yaml", modifiedNanoseconds: 100, byteCount: 1, sha256: "a", owner: "mac")
         let local = FileRecord.present(path: "one.yaml", modifiedNanoseconds: 200, byteCount: 1, sha256: "b", owner: "mac")
         let shared = FileRecord.present(path: "one.yaml", modifiedNanoseconds: 150, byteCount: 1, sha256: "c", owner: "mac2")
@@ -47,7 +47,7 @@ final class RimeSyncCoreTests: XCTestCase {
         let sameContentLocal = FileRecord.present(path: "one.yaml", modifiedNanoseconds: 400, byteCount: 1, sha256: "same", owner: "mac")
         let sameContentShared = FileRecord.present(path: "one.yaml", modifiedNanoseconds: 400, byteCount: 1, sha256: "same", owner: "mac2")
         let changedBaseline = FileRecord.present(path: "one.yaml", modifiedNanoseconds: 100, byteCount: 1, sha256: "base", owner: "mac")
-        XCTAssertEqual(ThreeWayMergeResolver.resolve(local: sameContentLocal, shared: sameContentShared, baseline: changedBaseline), .conflict)
+        XCTAssertEqual(ThreeWayMergeResolver.resolve(local: sameContentLocal, shared: sameContentShared, baseline: changedBaseline), .unchanged)
     }
 
     func testThreeWayResolverRequiresABaselineForTwoDivergedFiles() {

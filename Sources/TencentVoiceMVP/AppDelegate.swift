@@ -482,11 +482,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // use the same coordinator as configuration synchronization.
         rimeReviewCoordinator = rimeConfigurationCoordinator
         let installationURL = rimeLocalDirectory.appendingPathComponent("installation.yaml")
-        guard !fileManager.fileExists(atPath: installationURL.path) else { return }
+        let syncDirectory = URL(
+            fileURLWithPath: "/Users/Shared/RimeSync/rime-userdata",
+            isDirectory: true
+        )
+        let installation = try? RimeInstallationFile.loading(from: installationURL)
+        guard installation?.installationID != rimeInstallationID
+            || installation?.syncDirectory != syncDirectory.path else {
+            return
+        }
         try RimeInstallationFile.updating(
             existingURL: installationURL,
             installationID: rimeInstallationID,
-            syncDirectory: URL(fileURLWithPath: "/Users/Shared/RimeSync/rime-userdata", isDirectory: true)
+            syncDirectory: syncDirectory
         )
     }
 

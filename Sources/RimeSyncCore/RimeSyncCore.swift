@@ -232,9 +232,6 @@ public enum ThreeWayMergeResolver {
         let localChanged = baseline.map { $0.contentIdentity != local.contentIdentity } ?? true
         let sharedChanged = baseline.map { $0.contentIdentity != shared.contentIdentity } ?? true
         if local.contentIdentity == shared.contentIdentity {
-            if localChanged && sharedChanged && local.modifiedNanoseconds == shared.modifiedNanoseconds {
-                return .conflict
-            }
             return .unchanged
         }
         if localChanged && !sharedChanged { return .local }

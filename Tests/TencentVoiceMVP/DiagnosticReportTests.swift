@@ -383,6 +383,63 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertEqual(action.metadata["errorMessage"], "已隐藏")
     }
 
+    func testLoggerMigratesLegacyInterruptedDiagnosticJournal() throws {
+        let testDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVP-DiagnosticReportTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: testDirectory) }
+
+        let journalURL = testDirectory
+            .appendingPathComponent("TencentVoiceMVP/diagnostics/active.json")
+        try FileManager.default.createDirectory(
+            at: journalURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let app = String(
+            decoding: try DiagnosticJSON.encoder().encode(appInfo()),
+            as: UTF8.self
+        )
+        let sessionID = UUID()
+        let journal = """
+        {
+          "schemaVersion": 1,
+          "startedAt": "2026-09-07T05:00:00.000Z",
+          "app": \(app),
+          "events": [
+            {
+              "timestamp": "2026-09-07T05:01:00.000Z",
+              "kind": "session",
+              "name": "safe_copy",
+              "sessionID": "\(sessionID.uuidString)",
+              "fields": {
+                "failureCode": "text_target_changed",
+                "renderedLength": "3",
+                "writeCount": "0"
+              }
+            }
+          ],
+          "droppedEventCount": 2
+        }
+        """
+        try Data(journal.utf8).write(to: journalURL, options: .atomic)
+
+        let logger = SessionLogger(
+            enabled: { false },
+            applicationSupportDirectoryURL: testDirectory
+        )
+        let entries = logger.allPersistedEntries()
+        let migratedEvent = try XCTUnwrap(entries.first { $0.event == "safe_copy" })
+        let migrationEvent = try XCTUnwrap(
+            entries.first { $0.event == "legacy_diagnostic_journal_migrated" }
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journalURL.path))
+        XCTAssertEqual(migratedEvent.sessionID, sessionID)
+        XCTAssertEqual(migratedEvent.failureCode, "text_target_changed")
+        XCTAssertEqual(migratedEvent.renderedLength, 3)
+        XCTAssertEqual(migratedEvent.writeCount, 0)
+        XCTAssertEqual(migrationEvent.metadata["droppedEventCount"], "2")
+    }
+
     func testUnifiedLogSanitizesFailureMessagesBeforeExport() throws {
         let testDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("TencentVoiceMVP-DiagnosticReportTests-\(UUID().uuidString)")

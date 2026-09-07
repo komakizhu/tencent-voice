@@ -1,5 +1,38 @@
 import Foundation
 
+private struct LegacyDiagnosticTraceEvent: Decodable {
+    let timestamp: Date
+    let kind: String
+    let name: String
+    let sessionID: UUID?
+    let fields: [String: String]
+}
+
+private struct LegacyDiagnosticTraceJournal: Decodable {
+    let schemaVersion: Int
+    let startedAt: Date
+    let app: DiagnosticAppInfo
+    let events: [LegacyDiagnosticTraceEvent]
+    let droppedEventCount: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case startedAt
+        case app
+        case events
+        case droppedEventCount
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        startedAt = try container.decode(Date.self, forKey: .startedAt)
+        app = try container.decode(DiagnosticAppInfo.self, forKey: .app)
+        events = try container.decode([LegacyDiagnosticTraceEvent].self, forKey: .events)
+        droppedEventCount = try container.decodeIfPresent(Int.self, forKey: .droppedEventCount) ?? 0
+    }
+}
+
 struct SessionLogEntry: Codable, Equatable, Sendable {
     enum Kind: String, Codable, Sendable {
         case session
@@ -197,6 +230,7 @@ final class SessionLogger {
             ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         DiagnosticJSON.configureDateEncoding(for: encoder)
         DiagnosticJSON.configureDateDecoding(for: decoder)
+        try? migrateLegacyDiagnosticJournal()
     }
 
     func append(_ entry: SessionLogEntry) throws {
@@ -205,6 +239,10 @@ final class SessionLogger {
             inMemoryEntries.removeFirst(inMemoryEntries.count - inMemoryLimit)
         }
         guard enabled() else { return }
+        try persist(entry)
+    }
+
+    private func persist(_ entry: SessionLogEntry) throws {
         let directory = applicationSupportDirectoryURL
             .appendingPathComponent("TencentVoiceMVP/sessions", isDirectory: true)
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -267,6 +305,73 @@ final class SessionLogger {
             }
         }
         return Array(entries.reversed())
+    }
+
+    private func migrateLegacyDiagnosticJournal() throws {
+        let journalURL = applicationSupportDirectoryURL
+            .appendingPathComponent("TencentVoiceMVP/diagnostics/active.json")
+        guard fileManager.fileExists(atPath: journalURL.path) else { return }
+
+        let journal = try decoder.decode(
+            LegacyDiagnosticTraceJournal.self,
+            from: Data(contentsOf: journalURL)
+        )
+        let fallbackSessionID = UUID()
+        let entries = journal.events.map { event in
+            let fields = event.fields
+            return SessionLogEntry(
+                timestamp: event.timestamp,
+                sessionID: event.sessionID ?? fallbackSessionID,
+                eventID: nil,
+                kind: SessionLogEntry.Kind(rawValue: event.kind) ?? .session,
+                event: event.name,
+                state: fields["state"],
+                injectionMode: fields["injectionMode"],
+                targetApplicationName: fields["targetApplicationName"],
+                targetApplicationBundleIdentifier: fields["targetApplicationBundleIdentifier"],
+                targetApplicationProcessID: Self.integer(fields["targetApplicationProcessID"]).map(Int32.init),
+                sequence: Self.integer(fields["sequence"]),
+                sliceType: Self.integer(fields["sliceType"]),
+                wireFinal: fields["wireFinal"].flatMap(Bool.init),
+                segmentID: Self.integer(fields["segmentID"]),
+                segmentPhase: fields["segmentPhase"],
+                committedLength: Self.integer(fields["committedLength"]),
+                activeLength: Self.integer(fields["activeLength"]),
+                renderedLength: Self.integer(fields["renderedLength"]),
+                revision: fields["revision"].flatMap(UInt64.init),
+                writeCount: Self.integer(fields["writeCount"]),
+                backspaceCount: Self.integer(fields["backspaceCount"]),
+                deepReplacementCount: Self.integer(fields["deepReplacementCount"]),
+                maximumTrailingReplacementLength: Self.integer(fields["maximumTrailingReplacementLength"]),
+                discardCount: Self.integer(fields["discardCount"]),
+                errorCount: Self.integer(fields["errorCount"]),
+                errorCode: Self.integer(fields["errorCode"]),
+                failureCode: fields["failureCode"],
+                metadata: fields
+            )
+        }
+        for entry in entries {
+            try persist(entry)
+        }
+        try persist(SessionLogEntry(
+            timestamp: Date(),
+            sessionID: fallbackSessionID,
+            eventID: nil,
+            kind: .action,
+            event: "legacy_diagnostic_journal_migrated",
+            metadata: [
+                "schemaVersion": String(journal.schemaVersion),
+                "eventCount": String(journal.events.count),
+                "droppedEventCount": String(journal.droppedEventCount),
+                "previousVersion": journal.app.shortVersion,
+                "previousBuild": journal.app.build
+            ]
+        ))
+        try fileManager.removeItem(at: journalURL)
+    }
+
+    private static func integer(_ value: String?) -> Int? {
+        value.flatMap(Int.init)
     }
 
     var persistenceDirectoryURL: URL {
