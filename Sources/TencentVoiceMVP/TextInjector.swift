@@ -15,6 +15,7 @@ final class TextInjector {
     private let keyboardPacing: KeyboardPacingConfiguration
     private let pacingClock: KeyboardPacingClock
     private var keyboardPacer: KeyboardCharacterPacer?
+    private var keyboardWriter: AcknowledgedKeyboardWriter?
     private var snapshot: TextSnapshot?
     private var ownedRange = TextRange(location: 0, length: 0)
     private var lastDocumentText = ""
@@ -60,6 +61,10 @@ final class TextInjector {
 
     private(set) var degradationCode: String?
 
+    func drainDiagnostics() -> [TextInputDiagnostic] {
+        target.drainDiagnostics()
+    }
+
     func begin() throws {
         resetForBegin()
         do {
@@ -76,7 +81,13 @@ final class TextInjector {
             errorCount = 0
             degradationCode = nil
             degradationReason = nil
-            mode = captured.supportsAXReplacement ? .ax : .keyboardLiveTail
+            // Codex advertises writable AX text and returns success even when
+            // the next read does not reflect the insertion. Use keyboard input
+            // from the start; retrying after an AX write could duplicate text.
+            // AXTextTarget still checks the focused element and caret before
+            // each keyboard operation.
+            let requiresKeyboardInput = captured.targetApplication?.bundleIdentifier == "com.openai.codex"
+            mode = captured.supportsAXReplacement && !requiresKeyboardInput ? .ax : .keyboardLiveTail
             installKeyboardPacerIfNeeded()
         } catch TextTargetError.unsupported, TextTargetError.targetChanged, TextTargetError.writeFailed {
             resetForBegin()
@@ -122,6 +133,7 @@ final class TextInjector {
                 } else {
                     try applyKeyboardCandidate(completionText)
                 }
+                try await keyboardWriter?.finish(completionText)
             } catch {
                 enterSafeCopy(after: error)
             }
@@ -215,6 +227,11 @@ final class TextInjector {
 
     private func applyKeyboardCandidate(_ candidateText: String) throws {
         guard candidateText != lastSubmittedText else { return }
+        if let keyboardWriter {
+            try keyboardWriter.accept(candidateText)
+            lastSubmittedText = candidateText
+            return
+        }
 
         if candidateText.hasPrefix(lastSubmittedText) {
             let suffix = String(candidateText.dropFirst(lastSubmittedText.count))
@@ -242,7 +259,20 @@ final class TextInjector {
     }
 
     private func installKeyboardPacerIfNeeded() {
-        guard mode == .keyboardLiveTail, keyboardPacing.isEnabled else { return }
+        guard mode == .keyboardLiveTail else { return }
+        if let acknowledging = target as? any KeyboardAcknowledgingTarget,
+           acknowledging.requiresKeyboardAcknowledgement {
+            keyboardWriter = AcknowledgedKeyboardWriter(target: acknowledging,
+                onCommit: { [weak self] previous, submitted in
+                    guard let self else { return }
+                    self.writeCount += 1
+                    let prefix = sharedTextPrefix(previous, submitted)
+                    let replaced = previous.count - prefix.count
+                    self.maximumTrailingReplacementLength = max(self.maximumTrailingReplacementLength, replaced)
+                    if replaced > self.deepReplacementThreshold { self.deepReplacementCount += 1 }
+                }, onFailure: { [weak self] error in self?.enterSafeCopy(after: error) })
+        }
+        guard keyboardPacing.isEnabled else { return }
         keyboardPacer = KeyboardCharacterPacer(
             configuration: keyboardPacing,
             clock: pacingClock,
@@ -262,6 +292,11 @@ final class TextInjector {
     }
 
     private func appendPacedText(_ text: String) throws {
+        if let keyboardWriter {
+            try keyboardWriter.accept(lastSubmittedText + text)
+            lastSubmittedText.append(contentsOf: text)
+            return
+        }
         try target.paste(text)
         lastSubmittedText.append(contentsOf: text)
         writeCount += 1
@@ -271,12 +306,20 @@ final class TextInjector {
         guard lastSubmittedText.hasSuffix(previousText) else {
             throw TextTargetError.targetChanged
         }
+        if let keyboardWriter {
+            let candidate = String(lastSubmittedText.dropLast(previousText.count)) + text
+            try keyboardWriter.accept(candidate)
+            lastSubmittedText = candidate
+            return
+        }
         try target.replaceTrailingText(previousText, with: text)
         lastSubmittedText = String(lastSubmittedText.dropLast(previousText.count)) + text
         writeCount += 1
     }
 
     private func enterSafeCopy(after error: Error) {
+        guard mode != .safeCopy, mode != .disabledAfterError else { return }
+        keyboardWriter?.cancel()
         keyboardPacer?.cancel()
         mode = safeCopyEnabled ? .safeCopy : .disabledAfterError
         errorCount += 1
@@ -285,6 +328,8 @@ final class TextInjector {
     }
 
     private func resetForBegin() {
+        keyboardWriter?.cancel()
+        keyboardWriter = nil
         keyboardPacer?.cancel()
         keyboardPacer = nil
         snapshot = nil
@@ -303,6 +348,8 @@ final class TextInjector {
     }
 
     private func reset() {
+        keyboardWriter?.cancel()
+        keyboardWriter = nil
         keyboardPacer?.cancel()
         keyboardPacer = nil
         snapshot = nil

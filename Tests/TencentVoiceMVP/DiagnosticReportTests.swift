@@ -3,6 +3,43 @@ import XCTest
 
 @MainActor
 final class DiagnosticReportTests: XCTestCase {
+    func testInputDiagnosticsUseUnifiedReportAndExistingPersistenceSwitch() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let session = UUID()
+        let events = [
+            SessionLogEntry(sessionID: session, event: "keyboard_caret_recovered", metadata: [
+                "expectedLocation": "128", "initialLocation": "127", "actualLocation": "128",
+                "waitMilliseconds": "50", "sourceBuild": "66", "recognizedText": "PRIVATE_BODY"
+            ]),
+            SessionLogEntry(sessionID: session, event: "ax_document_mismatch", metadata: [
+                "expectedDocumentLength": "7", "actualDocumentLength": "5", "lastAXStatus": "0"
+            ]),
+            SessionLogEntry(sessionID: session, event: "keyboard_caret_timeout")
+        ]
+        var enabled = false
+        let logger = SessionLogger(enabled: { enabled }, applicationSupportDirectoryURL: directory)
+        for event in events { try logger.append(event) }
+        XCTAssertTrue(logger.allPersistedEntries().isEmpty)
+        XCTAssertEqual(logger.recentEntries().count, 3)
+        enabled = true
+        for event in events { try logger.append(event) }
+        let report = DiagnosticReport(
+            app: appInfo(), permissions: PrivacyPermissionReport(statuses: []),
+            credentials: DiagnosticCredentialInfo(state: .configured, detail: "configured"),
+            settings: DiagnosticSettingsInfo(shortcut: "test", engineModelType: "test", persistentSessionLogEnabled: true),
+            events: logger.allPersistedEntries(), logDirectoryPath: directory.path
+        )
+        XCTAssertEqual(report.findings.first { $0.code == "keyboard_caret_recovered" }?.level, .info)
+        XCTAssertTrue(report.findings.contains { $0.code == "ax_document_mismatch" })
+        XCTAssertTrue(report.findings.contains { $0.code == "keyboard_caret_timeout" })
+        XCTAssertTrue(report.renderedText().contains("expectedLocation=128"))
+        XCTAssertTrue(report.renderedText().contains("lastAXStatus=0"))
+        let json = String(decoding: try DiagnosticJSON.encoder().encode(report), as: UTF8.self)
+        XCTAssertTrue(json.contains("keyboard_caret_recovered"))
+        XCTAssertFalse(json.contains("PRIVATE_BODY"))
+    }
+
     func testReportExplainsSafeCopyTriggerWithoutRecognizedText() {
         let report = DiagnosticReport(
             generatedAt: Date(timeIntervalSince1970: 1_700_000_000),

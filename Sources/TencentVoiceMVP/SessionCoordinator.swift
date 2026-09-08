@@ -314,18 +314,25 @@ final class SessionCoordinator: SessionCoordinating {
         errorCount += 1
         log(event: "error", error: error)
         let finalProjection = latestProjection
-        do {
-            try injector?.finishImmediately(finalText: finalProjection?.text ?? "")
-        } catch {
-            errorCount += 1
-            log(event: "finish_error", projection: finalProjection, error: error)
-        }
-        logDegradationIfNeeded(projection: finalProjection)
+        let finishingInjector = injector
+        let finishingSessionID = self.sessionID
         let currentPrebuffer = prebuffer
         eventTask?.cancel()
-        resetSession()
-        setState(.error(error.localizedDescription))
-        Task { await currentPrebuffer?.clear() }
+        setState(.stopping)
+        Task { @MainActor in
+            do {
+                try await finishingInjector?.finish(finalText: finalProjection?.text ?? "")
+            } catch {
+                guard self.sessionID == finishingSessionID else { return }
+                self.errorCount += 1
+                self.log(event: "finish_error", projection: finalProjection, error: error)
+            }
+            guard self.sessionID == finishingSessionID else { return }
+            self.logDegradationIfNeeded(projection: finalProjection)
+            self.resetSession()
+            self.setState(.error(error.localizedDescription))
+            await currentPrebuffer?.clear()
+        }
     }
 
     private func handleAudioError(_ error: Error, sessionID: UUID? = nil) {
@@ -452,9 +459,25 @@ final class SessionCoordinator: SessionCoordinating {
             errorCount: errorCount + (injector?.errorCount ?? 0),
             errorCode: errorCode,
             failureCode: resolvedFailureCode,
-            failureMessage: resolvedFailureMessage
+            failureMessage: resolvedFailureMessage,
+            metadata: [
+                "sourceBuild": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
+                "sourceAppPath": Bundle.main.bundlePath
+            ]
         )
         try? logger.append(entry)
+        for diagnostic in injector?.drainDiagnostics() ?? [] {
+            var fields = diagnostic.fields
+            fields.merge(entry.metadata) { _, new in new }
+            try? logger.append(SessionLogEntry(
+                timestamp: diagnostic.timestamp, sessionID: sessionID,
+                event: diagnostic.event, state: stateName, injectionMode: injector?.modeDescription,
+                targetApplicationName: injector?.targetApplication?.name,
+                targetApplicationBundleIdentifier: injector?.targetApplication?.bundleIdentifier,
+                targetApplicationProcessID: injector?.targetApplication?.processIdentifier,
+                metadata: fields
+            ))
+        }
     }
 
 }

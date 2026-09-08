@@ -235,6 +235,7 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
 
         let sessionGroups = Dictionary(grouping: events, by: \.sessionID)
             .values
+            .map { $0.sorted { $0.timestamp < $1.timestamp } }
             .sorted { lhs, rhs in
                 (lhs.map(\.timestamp).max() ?? .distantPast)
                     > (rhs.map(\.timestamp).max() ?? .distantPast)
@@ -243,6 +244,35 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
         for sessionEvents in sessionGroups {
             guard let sessionID = sessionEvents.first?.sessionID.uuidString else { continue }
             let sessionLabel = "会话 \(sessionID)"
+            let diagnosticMessages: [String: String] = [
+                "keyboard_caret_recovered": "键盘事件发出后光标反馈短暂滞后，等待同步后已恢复，未重复发送文字。",
+                "keyboard_caret_timeout": "光标位置持续不符合预期，已停止继续输入；可能是反馈延迟超过等待时间或光标被移动。",
+                "keyboard_focus_changed": "键盘输入期间焦点元素发生变化，已停止输入。",
+                "input_application_changed": "前台应用发生变化，已停止输入。",
+                "ax_focus_changed": "AX 文本更新期间焦点元素发生变化。",
+                "ax_document_mismatch": "AX 读回文本与预期不符；请结合上次写入返回码判断，可能涉及写入未生效、回滚、读回延迟或外部编辑。",
+                "ax_selection_mismatch": "AX 光标或文本替换范围不符合预期。",
+                "ax_selection_unreadable": "无法取得有效的 AX 光标范围。",
+                "ax_value_unreadable": "AX 未提供可读取的文本值。",
+                "ax_write_failed": "AX 写入接口返回失败，具体属性和返回码已记录。",
+                "ax_read_failed": "AX 读取接口返回失败，具体属性和返回码已记录。"
+            ]
+            for code in diagnosticMessages.keys.sorted() {
+                let matching = sessionEvents.filter { $0.event == code }
+                guard let latest = matching.last, let message = diagnosticMessages[code] else { continue }
+                let numericKeys = ["expectedLocation", "expectedLength", "initialLocation", "actualLocation",
+                                   "actualLength", "millisecondsSinceDispatch", "waitMilliseconds", "polls",
+                                   "expectedDocumentLength", "actualDocumentLength", "lastAXStatus", "status"]
+                let values = numericKeys.compactMap { key -> String? in
+                    guard let value = latest.metadata[key], Double(value) != nil else { return nil }
+                    return "\(key)=\(value)"
+                }.joined(separator: ", ")
+                findings.append(DiagnosticFinding(
+                    level: code == "keyboard_caret_recovered" ? .info : .warning,
+                    code: code,
+                    message: "\(sessionLabel)：\(message) 共 \(matching.count) 次。\(values)"
+                ))
+            }
             let resultEvents = sessionEvents.filter {
                 ($0.event == "partial" || $0.event == "final" || $0.event == "stream_ended"
                     || $0.event == "finished" || $0.event == "finished_timeout")

@@ -1,0 +1,632 @@
+[0/1] Planning build
+Building for debugging...
+[0/11] Write sources
+[2/11] Write swift-version--58304C5D6DBC2206.txt
+[4/11] Compiling TencentVoiceMVP AcknowledgedKeyboardWriter.swift
+[5/11] Emitting module TencentVoiceMVP
+[6/11] Compiling TencentVoiceMVP AXTextTarget.swift
+[7/11] Compiling TencentVoiceMVP InputReplay.swift
+[8/12] Compiling TencentVoiceMVP AppDelegate.swift
+[8/13] Write Objects.LinkFileList
+[9/13] Linking TencentVoiceMVP
+[10/13] Applying TencentVoiceMVP
+[12/16] Compiling TencentVoiceMVPTests AcknowledgedKeyboardWriterTests.swift
+[13/16] Compiling TencentVoiceMVPTests KeyboardSelectionTransactionTests.swift
+[14/16] Emitting module TencentVoiceMVPTests
+[14/16] Write Objects.LinkFileList
+[15/16] Linking TencentVoiceMVPPackageTests
+Build complete! (7.48s)
+Test Suite 'All tests' started at 2026-09-08 16:58:29.814.
+Test Suite 'TencentVoiceMVPPackageTests.xctest' started at 2026-09-08 16:58:29.815.
+Test Suite 'ASRProjectionAccumulatorTests' started at 2026-09-08 16:58:29.815.
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testEmptyBoundaryDoesNotClearCommittedText]' started.
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testEmptyBoundaryDoesNotClearCommittedText]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testEmptyFinalDoesNotClearActiveSegment]' started.
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testEmptyFinalDoesNotClearActiveSegment]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testFinalResultKeepsTheFinalSegmentVisibleUntilStreamFinishes]' started.
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testFinalResultKeepsTheFinalSegmentVisibleUntilStreamFinishes]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testLateOlderSegmentCannotRewriteCurrentProjection]' started.
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testLateOlderSegmentCannotRewriteCurrentProjection]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testProjectionCarriesServerStablePrefixForTheActiveSegment]' started.
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testProjectionCarriesServerStablePrefixForTheActiveSegment]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testProjectionKeepsCommittedPrefixAndMutableActiveSegmentSeparate]' started.
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testProjectionKeepsCommittedPrefixAndMutableActiveSegmentSeparate]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testShorterFinalOnlyEditsCurrentActiveSegment]' started.
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testShorterFinalOnlyEditsCurrentActiveSegment]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testStreamEndCommitsActiveTextWithoutChangingVisibleText]' started.
+Test Case '-[TencentVoiceMVPTests.ASRProjectionAccumulatorTests testStreamEndCommitsActiveTextWithoutChangingVisibleText]' passed (0.000 seconds).
+Test Suite 'ASRProjectionAccumulatorTests' passed at 2026-09-08 16:58:29.816.
+	 Executed 8 tests, with 0 failures (0 unexpected) in 0.001 (0.002) seconds
+Test Suite 'ASRResultNormalizerTests' started at 2026-09-08 16:58:29.817.
+Test Case '-[TencentVoiceMVPTests.ASRResultNormalizerTests testCarriesStableWordPrefixWithTheActiveSegment]' started.
+Test Case '-[TencentVoiceMVPTests.ASRResultNormalizerTests testCarriesStableWordPrefixWithTheActiveSegment]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ASRResultNormalizerTests testEmptySegmentStartIsOnlyABoundaryAndDoesNotEraseText]' started.
+Test Case '-[TencentVoiceMVPTests.ASRResultNormalizerTests testEmptySegmentStartIsOnlyABoundaryAndDoesNotEraseText]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ASRResultNormalizerTests testNewSequenceAfterReuseGetsLaterSegmentOrder]' started.
+Test Case '-[TencentVoiceMVPTests.ASRResultNormalizerTests testNewSequenceAfterReuseGetsLaterSegmentOrder]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ASRResultNormalizerTests testReusedSequenceAfterFinalGetsANewSegmentID]' started.
+Test Case '-[TencentVoiceMVPTests.ASRResultNormalizerTests testReusedSequenceAfterFinalGetsANewSegmentID]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ASRResultNormalizerTests testSegmentStartEmitsASeparateSegmentEvenIfPreviousWasNotFinal]' started.
+Test Case '-[TencentVoiceMVPTests.ASRResultNormalizerTests testSegmentStartEmitsASeparateSegmentEvenIfPreviousWasNotFinal]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ASRResultNormalizerTests testSlicesExposeCurrentSegmentWithoutPretendingItIsTheWholeStream]' started.
+Test Case '-[TencentVoiceMVPTests.ASRResultNormalizerTests testSlicesExposeCurrentSegmentWithoutPretendingItIsTheWholeStream]' passed (0.000 seconds).
+Test Suite 'ASRResultNormalizerTests' passed at 2026-09-08 16:58:29.817.
+	 Executed 6 tests, with 0 failures (0 unexpected) in 0.001 (0.001) seconds
+Test Suite 'AcknowledgedKeyboardWriterTests' started at 2026-09-08 16:58:29.817.
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testCancellationDoesNotPostQueuedCandidate]' started.
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testCancellationDoesNotPostQueuedCandidate]' passed (0.002 seconds).
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testFocusChangeDuringPendingWriteStopsWithoutFollowup]' started.
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testFocusChangeDuringPendingWriteStopsWithoutFollowup]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testLegacyDispatchOnlyPathReproducesNextSegmentStop]' started.
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testLegacyDispatchOnlyPathReproducesNextSegmentStop]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testLivePacerFinishesOnlyAfterAcknowledgedFinalText]' started.
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testLivePacerFinishesOnlyAfterAcknowledgedFinalText]' passed (0.070 seconds).
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testLongRevisionAndImmediateNextSegmentKeepPrefixAndUnicode]' started.
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testLongRevisionAndImmediateNextSegmentKeepPrefixAndUnicode]' passed (0.003 seconds).
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testMatchingCaretWithStaleSameLengthTextIsNotAcknowledged]' started.
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testMatchingCaretWithStaleSameLengthTextIsNotAcknowledged]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testPendingWriteCoalescesNewCandidatesWithoutResending]' started.
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testPendingWriteCoalescesNewCandidatesWithoutResending]' passed (0.002 seconds).
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testUnresponsiveDocumentTimesOutWithoutAssumingSuccess]' started.
+Test Case '-[TencentVoiceMVPTests.AcknowledgedKeyboardWriterTests testUnresponsiveDocumentTimesOutWithoutAssumingSuccess]' passed (0.000 seconds).
+Test Suite 'AcknowledgedKeyboardWriterTests' passed at 2026-09-08 16:58:29.895.
+	 Executed 8 tests, with 0 failures (0 unexpected) in 0.078 (0.078) seconds
+Test Suite 'AppSmokeTests' started at 2026-09-08 16:58:29.895.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testBackupPickerShowsConfiguredRetentionAndSelectableBackups]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testBackupPickerShowsConfiguredRetentionAndSelectableBackups]' passed (0.088 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testBackupSettingsDefaultToTenAndIgnoreInvalidPersistedValues]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testBackupSettingsDefaultToTenAndIgnoreInvalidPersistedValues]' passed (0.003 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testManualRimeEntryFormShowsAllEditableFields]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testManualRimeEntryFormShowsAllEditableFields]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testPermissionResetButtonPresentsStepByStepGuide]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testPermissionResetButtonPresentsStepByStepGuide]' passed (0.038 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testPermissionSetupGuideAdvancesOnePermissionAtATime]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testPermissionSetupGuideAdvancesOnePermissionAtATime]' passed (0.011 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testRimeAuditCheckboxesSupportMixedHeaderState]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testRimeAuditCheckboxesSupportMixedHeaderState]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testRimeDictionaryMenuItemsUseLocalCommandShortcuts]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testRimeDictionaryMenuItemsUseLocalCommandShortcuts]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testRimeDictionaryWindowUsesUpdatedActionLayout]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testRimeDictionaryWindowUsesUpdatedActionLayout]' passed (0.031 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testRimeFilterSliderShowsFiveSmallTickLabels]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testRimeFilterSliderShowsFiveSmallTickLabels]' passed (0.004 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testSettingsButtonShowsSavedStatus]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testSettingsButtonShowsSavedStatus]' passed (0.012 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testSettingsDiagnosticLogCanBeExportedWithoutTogglingRecording]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testSettingsDiagnosticLogCanBeExportedWithoutTogglingRecording]' passed (0.010 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testSettingsWindowAlignsFormLabelsAndOmitsPermissionDescriptions]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testSettingsWindowAlignsFormLabelsAndOmitsPermissionDescriptions]' passed (0.027 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testSettingsWindowOpensConfiguredLogDirectory]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testSettingsWindowOpensConfiguredLogDirectory]' passed (0.013 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testSettingsWindowSavesHiddenMenuBarIcon]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testSettingsWindowSavesHiddenMenuBarIcon]' passed (0.011 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testStatusMenuContainsAutoStartToggle]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testStatusMenuContainsAutoStartToggle]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testStatusMenuContainsRimeSyncActions]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testStatusMenuContainsRimeSyncActions]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testStatusMenuControllerCanBeCreated]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testStatusMenuControllerCanBeCreated]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testStatusMenuDisablesAllRimeSyncActionsWhileBusy]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testStatusMenuDisablesAllRimeSyncActionsWhileBusy]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testStatusMenuDisplaysSyncProgress]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testStatusMenuDisplaysSyncProgress]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testUsageMenuItemViewRendersUsageAcrossTwoLines]' started.
+Test Case '-[TencentVoiceMVPTests.AppSmokeTests testUsageMenuItemViewRendersUsageAcrossTwoLines]' passed (0.001 seconds).
+Test Suite 'AppSmokeTests' passed at 2026-09-08 16:58:30.152.
+	 Executed 20 tests, with 0 failures (0 unexpected) in 0.256 (0.257) seconds
+Test Suite 'AppVersionTests' started at 2026-09-08 16:58:30.152.
+Test Case '-[TencentVoiceMVPTests.AppVersionTests testDisplayTextFallsBackWhenBuildIsMissing]' started.
+Test Case '-[TencentVoiceMVPTests.AppVersionTests testDisplayTextFallsBackWhenBuildIsMissing]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.AppVersionTests testDisplayTextIncludesVersionAndBuild]' started.
+Test Case '-[TencentVoiceMVPTests.AppVersionTests testDisplayTextIncludesVersionAndBuild]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.AppVersionTests testDisplayTextOmitsBuildForPublicRelease]' started.
+Test Case '-[TencentVoiceMVPTests.AppVersionTests testDisplayTextOmitsBuildForPublicRelease]' passed (0.000 seconds).
+Test Suite 'AppVersionTests' passed at 2026-09-08 16:58:30.152.
+	 Executed 3 tests, with 0 failures (0 unexpected) in 0.000 (0.000) seconds
+Test Suite 'BuildConfigurationTests' started at 2026-09-08 16:58:30.152.
+Test Case '-[TencentVoiceMVPTests.BuildConfigurationTests testDefaultModelAndShortcutAreTheMVPDefaults]' started.
+Test Case '-[TencentVoiceMVPTests.BuildConfigurationTests testDefaultModelAndShortcutAreTheMVPDefaults]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.BuildConfigurationTests testPacingPreviewPresetsStayWithinTheLiveSafetyBounds]' started.
+Test Case '-[TencentVoiceMVPTests.BuildConfigurationTests testPacingPreviewPresetsStayWithinTheLiveSafetyBounds]' passed (0.000 seconds).
+Test Suite 'BuildConfigurationTests' passed at 2026-09-08 16:58:30.153.
+	 Executed 2 tests, with 0 failures (0 unexpected) in 0.000 (0.000) seconds
+Test Suite 'CodexTextInjectionTests' started at 2026-09-08 16:58:30.153.
+Test Case '-[TencentVoiceMVPTests.CodexTextInjectionTests testCodexStillStopsWhenKeyboardTargetChanges]' started.
+Test Case '-[TencentVoiceMVPTests.CodexTextInjectionTests testCodexStillStopsWhenKeyboardTargetChanges]' passed (0.015 seconds).
+Test Case '-[TencentVoiceMVPTests.CodexTextInjectionTests testCodexStreamsAndRevisesWithoutTrustingSuccessfulNoOpAXWrite]' started.
+Test Case '-[TencentVoiceMVPTests.CodexTextInjectionTests testCodexStreamsAndRevisesWithoutTrustingSuccessfulNoOpAXWrite]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.CodexTextInjectionTests testOtherApplicationsKeepAXRouting]' started.
+Test Case '-[TencentVoiceMVPTests.CodexTextInjectionTests testOtherApplicationsKeepAXRouting]' passed (0.000 seconds).
+Test Suite 'CodexTextInjectionTests' passed at 2026-09-08 16:58:30.168.
+	 Executed 3 tests, with 0 failures (0 unexpected) in 0.015 (0.015) seconds
+Test Suite 'DiagnosticReportTests' started at 2026-09-08 16:58:30.168.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testBuilderExportsAllPersistedEventsWithoutARecentEventCap]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testBuilderExportsAllPersistedEventsWithoutARecentEventCap]' passed (0.088 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testBuilderIncludesPersistedEventsInTheUnifiedExport]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testBuilderIncludesPersistedEventsInTheUnifiedExport]' passed (0.004 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testFindingsAreScopedToIndividualSessions]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testFindingsAreScopedToIndividualSessions]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testInputDiagnosticsUseUnifiedReportAndExistingPersistenceSwitch]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testInputDiagnosticsUseUnifiedReportAndExistingPersistenceSwitch]' passed (0.005 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testLegacySessionEntriesDecodeAsSessionEvents]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testLegacySessionEntriesDecodeAsSessionEvents]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testLoggerKeepsRecentEntriesWhenPersistentLoggingIsDisabled]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testLoggerKeepsRecentEntriesWhenPersistentLoggingIsDisabled]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testLoggerMigratesLegacyInterruptedDiagnosticJournal]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testLoggerMigratesLegacyInterruptedDiagnosticJournal]' passed (0.003 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testLoggerPersistsDiagnosticActionsIntoTheUnifiedExportLog]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testLoggerPersistsDiagnosticActionsIntoTheUnifiedExportLog]' passed (0.002 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testReportExplainsInputFailureWhenSafeCopyIsDisabled]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testReportExplainsInputFailureWhenSafeCopyIsDisabled]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testReportExplainsSafeCopyTriggerWithoutRecognizedText]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testReportExplainsSafeCopyTriggerWithoutRecognizedText]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testReportFlagsProcessThatPredatesInstalledAppBundle]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testReportFlagsProcessThatPredatesInstalledAppBundle]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testReportHidesUnrecognizedFailureMessages]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testReportHidesUnrecognizedFailureMessages]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testReportIncludesFinishFailure]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testReportIncludesFinishFailure]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testReportRecognizesSafeCopyInLegacyFinishedEvent]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testReportRecognizesSafeCopyInLegacyFinishedEvent]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testReportSeparatesStartedSessionWithoutASRResult]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testReportSeparatesStartedSessionWithoutASRResult]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testSettingsInfoReadsReportsCreatedBeforeSafeCopyFlag]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testSettingsInfoReadsReportsCreatedBeforeSafeCopyFlag]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testUnifiedLogSanitizesFailureMessagesBeforeExport]' started.
+Test Case '-[TencentVoiceMVPTests.DiagnosticReportTests testUnifiedLogSanitizesFailureMessagesBeforeExport]' passed (0.001 seconds).
+Test Suite 'DiagnosticReportTests' passed at 2026-09-08 16:58:30.278.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.110 (0.110) seconds
+Test Suite 'HotkeyEventProcessorTests' started at 2026-09-08 16:58:30.278.
+Test Case '-[TencentVoiceMVPTests.HotkeyEventProcessorTests testKeyUpWithoutCommandModifierStillReleases]' started.
+Test Case '-[TencentVoiceMVPTests.HotkeyEventProcessorTests testKeyUpWithoutCommandModifierStillReleases]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.HotkeyEventProcessorTests testMatchingKeyDownAndKeyUpAreConsumedAndTriggerOnce]' started.
+Test Case '-[TencentVoiceMVPTests.HotkeyEventProcessorTests testMatchingKeyDownAndKeyUpAreConsumedAndTriggerOnce]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.HotkeyEventProcessorTests testRepeatedKeyDownIsConsumedWithoutAnotherPress]' started.
+Test Case '-[TencentVoiceMVPTests.HotkeyEventProcessorTests testRepeatedKeyDownIsConsumedWithoutAnotherPress]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.HotkeyEventProcessorTests testUnmatchedKeyAndModifierPassThrough]' started.
+Test Case '-[TencentVoiceMVPTests.HotkeyEventProcessorTests testUnmatchedKeyAndModifierPassThrough]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.HotkeyEventProcessorTests testUpdatingOrResettingProcessorStopsOldShortcutFromBeingConsumed]' started.
+Test Case '-[TencentVoiceMVPTests.HotkeyEventProcessorTests testUpdatingOrResettingProcessorStopsOldShortcutFromBeingConsumed]' passed (0.000 seconds).
+Test Suite 'HotkeyEventProcessorTests' passed at 2026-09-08 16:58:30.279.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.001 (0.001) seconds
+Test Suite 'KeyboardCaretSynchronizerTests' started at 2026-09-08 16:58:30.279.
+Test Case '-[TencentVoiceMVPTests.KeyboardCaretSynchronizerTests testFocusChangeDuringWaitAbortsImmediately]' started.
+Test Case '-[TencentVoiceMVPTests.KeyboardCaretSynchronizerTests testFocusChangeDuringWaitAbortsImmediately]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.KeyboardCaretSynchronizerTests testNoRecentDispatchDoesNotWaitOrIgnoreUserCaretMovement]' started.
+Test Case '-[TencentVoiceMVPTests.KeyboardCaretSynchronizerTests testNoRecentDispatchDoesNotWaitOrIgnoreUserCaretMovement]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.KeyboardCaretSynchronizerTests testObserved127To128DelayRecoversWithoutResendingInput]' started.
+Test Case '-[TencentVoiceMVPTests.KeyboardCaretSynchronizerTests testObserved127To128DelayRecoversWithoutResendingInput]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.KeyboardCaretSynchronizerTests testPersistentCaretChangeTimesOut]' started.
+Test Case '-[TencentVoiceMVPTests.KeyboardCaretSynchronizerTests testPersistentCaretChangeTimesOut]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.KeyboardCaretSynchronizerTests testSynchronizedCaretHasNoExtraLatency]' started.
+Test Case '-[TencentVoiceMVPTests.KeyboardCaretSynchronizerTests testSynchronizedCaretHasNoExtraLatency]' passed (0.000 seconds).
+Test Suite 'KeyboardCaretSynchronizerTests' passed at 2026-09-08 16:58:30.279.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.001 (0.001) seconds
+Test Suite 'KeyboardCharacterPacerTests' started at 2026-09-08 16:58:30.279.
+Test Case '-[TencentVoiceMVPTests.KeyboardCharacterPacerTests testFinalUsesBoundedNonlinearFlush]' started.
+Test Case '-[TencentVoiceMVPTests.KeyboardCharacterPacerTests testFinalUsesBoundedNonlinearFlush]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.KeyboardCharacterPacerTests testFirstCharacterIsImmediateAndFollowingCharactersUseOneContinuousQueue]' started.
+Test Case '-[TencentVoiceMVPTests.KeyboardCharacterPacerTests testFirstCharacterIsImmediateAndFollowingCharactersUseOneContinuousQueue]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.KeyboardCharacterPacerTests testPendingRevisionChangesMemoryWithoutReplacingVisibleText]' started.
+Test Case '-[TencentVoiceMVPTests.KeyboardCharacterPacerTests testPendingRevisionChangesMemoryWithoutReplacingVisibleText]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.KeyboardCharacterPacerTests testSubsequentBatchUsesReservoirAfterTheQueueDrains]' started.
+Test Case '-[TencentVoiceMVPTests.KeyboardCharacterPacerTests testSubsequentBatchUsesReservoirAfterTheQueueDrains]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.KeyboardCharacterPacerTests testVisibleRevisionReplacesOnlyTheAlreadyVisibleTail]' started.
+Test Case '-[TencentVoiceMVPTests.KeyboardCharacterPacerTests testVisibleRevisionReplacesOnlyTheAlreadyVisibleTail]' passed (0.000 seconds).
+Test Suite 'KeyboardCharacterPacerTests' passed at 2026-09-08 16:58:30.282.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.003 (0.003) seconds
+Test Suite 'KeyboardSelectionTransactionTests' started at 2026-09-08 16:58:30.282.
+Test Case '-[TencentVoiceMVPTests.KeyboardSelectionTransactionTests testDeletionIsConfirmedWithoutRetry]' started.
+Test Case '-[TencentVoiceMVPTests.KeyboardSelectionTransactionTests testDeletionIsConfirmedWithoutRetry]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.KeyboardSelectionTransactionTests testDroppedSelectionEventsNeverReplaceWrongRange]' started.
+Test Case '-[TencentVoiceMVPTests.KeyboardSelectionTransactionTests testDroppedSelectionEventsNeverReplaceWrongRange]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.KeyboardSelectionTransactionTests testFocusChangeBeforeSelectionReceiptNeverInserts]' started.
+Test Case '-[TencentVoiceMVPTests.KeyboardSelectionTransactionTests testFocusChangeBeforeSelectionReceiptNeverInserts]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.KeyboardSelectionTransactionTests testReplacementWaitsForExactSelectionThenExactDocument]' started.
+Test Case '-[TencentVoiceMVPTests.KeyboardSelectionTransactionTests testReplacementWaitsForExactSelectionThenExactDocument]' passed (0.000 seconds).
+Test Suite 'KeyboardSelectionTransactionTests' passed at 2026-09-08 16:58:30.283.
+	 Executed 4 tests, with 0 failures (0 unexpected) in 0.001 (0.001) seconds
+Test Suite 'KeychainCredentialStoreTests' started at 2026-09-08 16:58:30.283.
+Test Case '-[TencentVoiceMVPTests.KeychainCredentialStoreTests testCredentialsRoundTripThroughKeychain]' started.
+Test Case '-[TencentVoiceMVPTests.KeychainCredentialStoreTests testCredentialsRoundTripThroughKeychain]' passed (0.075 seconds).
+Test Suite 'KeychainCredentialStoreTests' passed at 2026-09-08 16:58:30.358.
+	 Executed 1 test, with 0 failures (0 unexpected) in 0.075 (0.075) seconds
+Test Suite 'LocalYAMLCredentialStoreTests' started at 2026-09-08 16:58:30.358.
+Test Case '-[TencentVoiceMVPTests.LocalYAMLCredentialStoreTests testCredentialsRoundTripThroughLocalYAML]' started.
+Test Case '-[TencentVoiceMVPTests.LocalYAMLCredentialStoreTests testCredentialsRoundTripThroughLocalYAML]' passed (0.002 seconds).
+Test Suite 'LocalYAMLCredentialStoreTests' passed at 2026-09-08 16:58:30.360.
+	 Executed 1 test, with 0 failures (0 unexpected) in 0.002 (0.002) seconds
+Test Suite 'LoginItemTests' started at 2026-09-08 16:58:30.360.
+Test Case '-[TencentVoiceMVPTests.LoginItemTests testDisablingLoginItemUnregistersTheService]' started.
+Test Case '-[TencentVoiceMVPTests.LoginItemTests testDisablingLoginItemUnregistersTheService]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.LoginItemTests testEnablingLoginItemRegistersTheService]' started.
+Test Case '-[TencentVoiceMVPTests.LoginItemTests testEnablingLoginItemRegistersTheService]' passed (0.000 seconds).
+Test Suite 'LoginItemTests' passed at 2026-09-08 16:58:30.360.
+	 Executed 2 tests, with 0 failures (0 unexpected) in 0.000 (0.000) seconds
+Test Suite 'PCMChunkerTests' started at 2026-09-08 16:58:30.360.
+Test Case '-[TencentVoiceMVPTests.PCMChunkerTests testFlushReturnsRemainder]' started.
+Test Case '-[TencentVoiceMVPTests.PCMChunkerTests testFlushReturnsRemainder]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.PCMChunkerTests testSplits16kMonoPCMInto6400ByteChunks]' started.
+Test Case '-[TencentVoiceMVPTests.PCMChunkerTests testSplits16kMonoPCMInto6400ByteChunks]' passed (0.000 seconds).
+Test Suite 'PCMChunkerTests' passed at 2026-09-08 16:58:30.361.
+	 Executed 2 tests, with 0 failures (0 unexpected) in 0.000 (0.000) seconds
+Test Suite 'PersistentCredentialStoreTests' started at 2026-09-08 16:58:30.361.
+Test Case '-[TencentVoiceMVPTests.PersistentCredentialStoreTests testLegacyMigrationWritesYAMLOnce]' started.
+Test Case '-[TencentVoiceMVPTests.PersistentCredentialStoreTests testLegacyMigrationWritesYAMLOnce]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.PersistentCredentialStoreTests testNormalLoadDoesNotTouchLegacyKeychain]' started.
+Test Case '-[TencentVoiceMVPTests.PersistentCredentialStoreTests testNormalLoadDoesNotTouchLegacyKeychain]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.PersistentCredentialStoreTests testPerUserYAMLCredentialsMigrateToSharedPrimary]' started.
+Test Case '-[TencentVoiceMVPTests.PersistentCredentialStoreTests testPerUserYAMLCredentialsMigrateToSharedPrimary]' passed (0.001 seconds).
+Test Suite 'PersistentCredentialStoreTests' passed at 2026-09-08 16:58:30.363.
+	 Executed 3 tests, with 0 failures (0 unexpected) in 0.003 (0.003) seconds
+Test Suite 'PrivacyPermissionCheckerTests' started at 2026-09-08 16:58:30.363.
+Test Case '-[TencentVoiceMVPTests.PrivacyPermissionCheckerTests testKeyboardEventPermissionOpensAccessibilityPane]' started.
+Test Case '-[TencentVoiceMVPTests.PrivacyPermissionCheckerTests testKeyboardEventPermissionOpensAccessibilityPane]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.PrivacyPermissionCheckerTests testPermissionActionsUseInjectedResetAndSettingsActions]' started.
+Test Case '-[TencentVoiceMVPTests.PrivacyPermissionCheckerTests testPermissionActionsUseInjectedResetAndSettingsActions]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.PrivacyPermissionCheckerTests testReportDoesNotTreatUndecidedOrDeniedPermissionsAsGranted]' started.
+Test Case '-[TencentVoiceMVPTests.PrivacyPermissionCheckerTests testReportDoesNotTreatUndecidedOrDeniedPermissionsAsGranted]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.PrivacyPermissionCheckerTests testReportIsCompleteWhenAllPermissionsAreGranted]' started.
+Test Case '-[TencentVoiceMVPTests.PrivacyPermissionCheckerTests testReportIsCompleteWhenAllPermissionsAreGranted]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.PrivacyPermissionCheckerTests testReportListsEveryPermissionAndExplainsMissingItems]' started.
+Test Case '-[TencentVoiceMVPTests.PrivacyPermissionCheckerTests testReportListsEveryPermissionAndExplainsMissingItems]' passed (0.000 seconds).
+Test Suite 'PrivacyPermissionCheckerTests' passed at 2026-09-08 16:58:30.364.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.001 (0.001) seconds
+Test Suite 'RimeAuditTests' started at 2026-09-08 16:58:30.364.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testActivityDateChangesOnlyWhenCommitCountGrows]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testActivityDateChangesOnlyWhenCommitCountGrows]' passed (0.017 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testApplyFailureRestoresSharedReviewStateFromBackup]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testApplyFailureRestoresSharedReviewStateFromBackup]' passed (0.055 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testAuditCSVQuotesAndProposalValidation]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testAuditCSVQuotesAndProposalValidation]' passed (0.001 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testAuditExporterSupportsTextMarkdownAndJSON]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testAuditExporterSupportsTextMarkdownAndJSON]' passed (0.001 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testAuditUsesMaximumCommitCountAcrossNodesWithoutSumming]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testAuditUsesMaximumCommitCountAcrossNodesWithoutSumming]' passed (0.006 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testBaseDictionaryIndexCacheInvalidatesByStaticDictionaryDigest]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testBaseDictionaryIndexCacheInvalidatesByStaticDictionaryDigest]' passed (0.002 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testBaseDictionaryIndexDoesNotFollowImportsOutsideRimeDirectory]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testBaseDictionaryIndexDoesNotFollowImportsOutsideRimeDirectory]' passed (0.001 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testCommitGrowthAfterDeleteApprovalRequiresManualReview]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testCommitGrowthAfterDeleteApprovalRequiresManualReview]' passed (0.018 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testDeleteLearnedCreatesNegativeTombstoneAndPermanentIgnoreIsPersistent]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testDeleteLearnedCreatesNegativeTombstoneAndPermanentIgnoreIsPersistent]' passed (0.019 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testFilterBandsUseFiveFixedOptionsAndHideStaleNoiseByDefault]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testFilterBandsUseFiveFixedOptionsAndHideStaleNoiseByDefault]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testFirstAuditOnlyCreatesBaselineAndPromotionUsesStaticWeightOne]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testFirstAuditOnlyCreatesBaselineAndPromotionUsesStaticWeightOne]' passed (0.012 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testLegacyManagedDictionaryMergesWithPartiallyInitializedState]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testLegacyManagedDictionaryMergesWithPartiallyInitializedState]' passed (0.008 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testOfficialRimeFormulasAndStableIdentity]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testOfficialRimeFormulasAndStableIdentity]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testProposalSubmissionRejectsChangedCurrentSnapshot]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testProposalSubmissionRejectsChangedCurrentSnapshot]' passed (0.006 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testRefreshingPublishedSnapshotsDoesNotRunSyncOrBackup]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testRefreshingPublishedSnapshotsDoesNotRunSyncOrBackup]' passed (0.004 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testReplaceEntryFailureRollsBackAndPersistsFailureRecord]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testReplaceEntryFailureRollsBackAndPersistsFailureRecord]' passed (0.019 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testReplaceEntryMigratesChineseAndEnglishUserdbDataAndIsIdempotent]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testReplaceEntryMigratesChineseAndEnglishUserdbDataAndIsIdempotent]' passed (0.038 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testReplaceEntryRejectsExistingTargetAndExpiredProposal]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testReplaceEntryRejectsExistingTargetAndExpiredProposal]' passed (0.008 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testReplaceProposalJSONRoundTripsAndLegacyProposalStillDecodes]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testReplaceProposalJSONRoundTripsAndLegacyProposalStillDecodes]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testSyncUserDictionaryRunsNativeSyncAndRecordsLastSync]' started.
+Test Case '-[RimeSyncCoreTests.RimeAuditTests testSyncUserDictionaryRunsNativeSyncAndRecordsLastSync]' passed (0.008 seconds).
+Test Suite 'RimeAuditTests' passed at 2026-09-08 16:58:30.587.
+	 Executed 20 tests, with 0 failures (0 unexpected) in 0.222 (0.223) seconds
+Test Suite 'RimeSyncCoreTests' started at 2026-09-08 16:58:30.587.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testBackupManagerAcceptsCustomRetentionAndListsNewestFirst]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testBackupManagerAcceptsCustomRetentionAndListsNewestFirst]' passed (0.023 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testBackupManagerKeepsDefaultTenBackups]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testBackupManagerKeepsDefaultTenBackups]' passed (0.021 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testBackupRetentionRequiresAtLeastOneAndHasDefaultTen]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testBackupRetentionRequiresAtLeastOneAndHasDefaultTen]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testBootstrapCapturesPortableHelperAndSeparatesLegacyUserData]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testBootstrapCapturesPortableHelperAndSeparatesLegacyUserData]' passed (0.010 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testBootstrapRejectsUserdbOlderSnapshot]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testBootstrapRejectsUserdbOlderSnapshot]' passed (0.002 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testDeletingLocalFilePublishesTombstoneAndRemovesSharedCopy]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testDeletingLocalFilePublishesTombstoneAndRemovesSharedCopy]' passed (0.007 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testDirectoryLockReleasesAfterFailureAndRejectsNestedLock]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testDirectoryLockReleasesAfterFailureAndRejectsNestedLock]' passed (0.001 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testEqualTimestampConflictIsPausedAndPreservesLocalFile]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testEqualTimestampConflictIsPausedAndPreservesLocalFile]' passed (0.009 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testIdenticalInitialSyncStoresBaselineForFutureMerge]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testIdenticalInitialSyncStoresBaselineForFutureMerge]' passed (0.007 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testInstallationFilePreservesExistingConfigAndUpdatesIdentityAndSyncDir]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testInstallationFilePreservesExistingConfigAndUpdatesIdentityAndSyncDir]' passed (0.001 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testInventoryCapturesFilesAndIgnoresExcludedPaths]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testInventoryCapturesFilesAndIgnoresExcludedPaths]' passed (0.001 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testManagedDictionaryAddsSourcesAndCapsFrequencyWithoutMergingDifferentCodes]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testManagedDictionaryAddsSourcesAndCapsFrequencyWithoutMergingDifferentCodes]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testManifestRoundTripsAndTracksTombstones]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testManifestRoundTripsAndTracksTombstones]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testManualEntryUsesDefaultFrequencyAndIndependentManagedFile]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testManualEntryUsesDefaultFrequencyAndIndependentManagedFile]' passed (0.008 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testOrdinarySyncRemovesLegacyManagedDictionaryFromManifest]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testOrdinarySyncRemovesLegacyManagedDictionaryFromManifest]' passed (0.006 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testPolicyAllowsStableResourcesAndExcludesRuntimeData]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testPolicyAllowsStableResourcesAndExcludesRuntimeData]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testRestoreProtectsTargetWhileCreatingRollbackWithRetentionOne]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testRestoreProtectsTargetWhileCreatingRollbackWithRetentionOne]' passed (0.008 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testRestoreRejectsBackupPathTraversalWithoutTouchingCurrentRime]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testRestoreRejectsBackupPathTraversalWithoutTouchingCurrentRime]' passed (0.001 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testRestoreReplacesCurrentRimeWithSelectedBackup]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testRestoreReplacesCurrentRimeWithSelectedBackup]' passed (0.003 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testReviewCoordinatorAccumulatesEachSourceOnceAndKeepsDifferentCodes]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testReviewCoordinatorAccumulatesEachSourceOnceAndKeepsDifferentCodes]' passed (0.039 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testReviewCoordinatorDefaultsToAllSelectedAndSkippedEntryReturnsNextTime]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testReviewCoordinatorDefaultsToAllSelectedAndSkippedEntryReturnsNextTime]' passed (0.037 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testReviewCoordinatorRejectsSnapshotChangedDuringReview]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testReviewCoordinatorRejectsSnapshotChangedDuringReview]' passed (0.011 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testRimeSnapshotParserAcceptsNativeSnapshotHeaderWhenAvailable]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testRimeSnapshotParserAcceptsNativeSnapshotHeaderWhenAvailable]' passed (0.001 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testRimeSnapshotParserReadsRowsAndSkipsInvalidData]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testRimeSnapshotParserReadsRowsAndSkipsInvalidData]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testRimeSnapshotParserRetainsNegativeCommitTombstones]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testRimeSnapshotParserRetainsNegativeCommitTombstones]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSharedDirectoryLayoutCreatesGroupWritableDirectories]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSharedDirectoryLayoutCreatesGroupWritableDirectories]' passed (0.002 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSquirrelMaintenanceBacksUpOnlyCurrentDictionary]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSquirrelMaintenanceBacksUpOnlyCurrentDictionary]' passed (0.206 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSquirrelMaintenanceRejectsFailedCommand]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSquirrelMaintenanceRejectsFailedCommand]' passed (0.001 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSyncCanLimitChangesToRimeSkinConfiguration]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSyncCanLimitChangesToRimeSkinConfiguration]' passed (0.015 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSyncMergesIndependentChangesAndPublishesMergedResult]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSyncMergesIndependentChangesAndPublishesMergedResult]' passed (0.025 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSyncPublishesLocalFileAndCreatesBackup]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSyncPublishesLocalFileAndCreatesBackup]' passed (0.009 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSyncPullsNewerSharedFileWithoutOverwritingUserdb]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSyncPullsNewerSharedFileWithoutOverwritingUserdb]' passed (0.011 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSyncPullsRimeSkinForAnotherAccountWithoutExistingConfig]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testSyncPullsRimeSkinForAnotherAccountWithoutExistingConfig]' passed (0.009 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testThreeWayResolverRequiresABaselineForTwoDivergedFiles]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testThreeWayResolverRequiresABaselineForTwoDivergedFiles]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testThreeWayResolverUsesBaselineAndTreatsIdenticalContentAsUnchanged]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testThreeWayResolverUsesBaselineAndTreatsIdenticalContentAsUnchanged]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testThreeWayTextMergeCombinesIndependentChanges]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testThreeWayTextMergeCombinesIndependentChanges]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testThreeWayTextMergeCombinesReplacementAndInsertionChanges]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testThreeWayTextMergeCombinesReplacementAndInsertionChanges]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testThreeWayTextMergeKeepsIndependentAppendsFromBothSides]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testThreeWayTextMergeKeepsIndependentAppendsFromBothSides]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testThreeWayTextMergeRejectsOverlappingChanges]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testThreeWayTextMergeRejectsOverlappingChanges]' passed (0.000 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testTwoAccountsExchangeAConfigChangeThroughSharedManifest]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testTwoAccountsExchangeAConfigChangeThroughSharedManifest]' passed (0.025 seconds).
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testVerifierDetectsSharedNodeHashDrift]' started.
+Test Case '-[RimeSyncCoreTests.RimeSyncCoreTests testVerifierDetectsSharedNodeHashDrift]' passed (0.002 seconds).
+Test Suite 'RimeSyncCoreTests' passed at 2026-09-08 16:58:31.091.
+	 Executed 41 tests, with 0 failures (0 unexpected) in 0.502 (0.503) seconds
+Test Suite 'RimeThemeStoreTests' started at 2026-09-08 16:58:31.091.
+Test Case '-[TencentVoiceMVPTests.RimeThemeStoreTests testLegacyNestedThemesRemainReadable]' started.
+Test Case '-[TencentVoiceMVPTests.RimeThemeStoreTests testLegacyNestedThemesRemainReadable]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.RimeThemeStoreTests testLoadsSlashThemesAndCurrentSelection]' started.
+Test Case '-[TencentVoiceMVPTests.RimeThemeStoreTests testLoadsSlashThemesAndCurrentSelection]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.RimeThemeStoreTests testSelectUpdatesBothModesPreservesPermissionsAndReloads]' started.
+Test Case '-[TencentVoiceMVPTests.RimeThemeStoreTests testSelectUpdatesBothModesPreservesPermissionsAndReloads]' passed (0.002 seconds).
+Test Case '-[TencentVoiceMVPTests.RimeThemeStoreTests testUnknownThemeDoesNotReloadOrWrite]' started.
+Test Case '-[TencentVoiceMVPTests.RimeThemeStoreTests testUnknownThemeDoesNotReloadOrWrite]' passed (0.001 seconds).
+Test Suite 'RimeThemeStoreTests' passed at 2026-09-08 16:58:31.094.
+	 Executed 4 tests, with 0 failures (0 unexpected) in 0.004 (0.004) seconds
+Test Suite 'SessionCoordinatorTests' started at 2026-09-08 16:58:31.095.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testASRErrorFinalizesLastSafeProjectionWithoutDeletingIt]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testASRErrorFinalizesLastSafeProjectionWithoutDeletingIt]' passed (0.028 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testBeginEnablesTencentVADForPauseDrivenFinalization]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testBeginEnablesTencentVADForPauseDrivenFinalization]' passed (0.011 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testCancelKeepsAlreadyVisibleKeyboardPartial]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testCancelKeepsAlreadyVisibleKeyboardPartial]' passed (0.023 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testCredentialFailureDoesNotTouchTarget]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testCredentialFailureDoesNotTouchTarget]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testEnabledSafeCopyWritesThroughAndCopiesThroughSettingsStore]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testEnabledSafeCopyWritesThroughAndCopiesThroughSettingsStore]' passed (0.013 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testFinalRevisionDoesNotDisableFollowingSegment]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testFinalRevisionDoesNotDisableFollowingSegment]' passed (0.024 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testKeyboardPartialAppearsImmediatelyBeforeFinal]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testKeyboardPartialAppearsImmediatelyBeforeFinal]' passed (0.046 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testKeyboardPartialThenFinalIsAppendedWithoutReplacement]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testKeyboardPartialThenFinalIsAppendedWithoutReplacement]' passed (0.013 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testKeyboardSegmentsAreAppendedInOrder]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testKeyboardSegmentsAreAppendedInOrder]' passed (0.012 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testKeyboardServerStableMetadataDoesNotDelayVisiblePartial]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testKeyboardServerStableMetadataDoesNotDelayVisiblePartial]' passed (0.024 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testKeyboardStreamEndCommitsLastPartialWithoutExplicitStop]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testKeyboardStreamEndCommitsLastPartialWithoutExplicitStop]' passed (0.024 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testLateFinalDuringStoppingUsesTheShortFlushWindow]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testLateFinalDuringStoppingUsesTheShortFlushWindow]' passed (0.013 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testPartialThenFinalIsWrittenWithoutDuplication]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testPartialThenFinalIsWrittenWithoutDuplication]' passed (0.012 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testPauseFinalCommitsSentenceWhileSessionContinues]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testPauseFinalCommitsSentenceWhileSessionContinues]' passed (0.023 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testStopBeforeFinalEmptyFinalKeepsCurrentText]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testStopBeforeFinalEmptyFinalKeepsCurrentText]' passed (0.011 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testStopBeforeFinalKeepsPartialAndAcceptsLateFinal]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testStopBeforeFinalKeepsPartialAndAcceptsLateFinal]' passed (0.011 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testStopFlushesLastAudioChunkBeforeSendingEndMarker]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testStopFlushesLastAudioChunkBeforeSendingEndMarker]' passed (0.022 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testStopFlushesPendingKeyboardSmoothingCharacters]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testStopFlushesPendingKeyboardSmoothingCharacters]' passed (0.068 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testStoppingStartsPacingFlushBeforeASRWaitCompletes]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testStoppingStartsPacingFlushBeforeASRWaitCompletes]' passed (0.015 seconds).
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testStopTimeoutFreezesLastSafeProjection]' started.
+Test Case '-[TencentVoiceMVPTests.SessionCoordinatorTests testStopTimeoutFreezesLastSafeProjection]' passed (0.023 seconds).
+Test Suite 'SessionCoordinatorTests' passed at 2026-09-08 16:58:31.511.
+	 Executed 20 tests, with 0 failures (0 unexpected) in 0.416 (0.417) seconds
+Test Suite 'SettingsStoreTests' started at 2026-09-08 16:58:31.511.
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testCustomShortcutsAreNotMigrated]' started.
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testCustomShortcutsAreNotMigrated]' passed (0.006 seconds).
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testDefaultsUseCommand0AndDisableTextLogs]' started.
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testDefaultsUseCommand0AndDisableTextLogs]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testEnginePresetsContainTheThreeSupportedModels]' started.
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testEnginePresetsContainTheThreeSupportedModels]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testLegacyF5MigratesToCommand0OnlyOnce]' started.
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testLegacyF5MigratesToCommand0OnlyOnce]' passed (0.002 seconds).
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testManuallySavingF5AfterMigrationKeepsF5]' started.
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testManuallySavingF5AfterMigrationKeepsF5]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testOlderSettingsWithoutPrepaidQuotaDecodeWithEmptyQuota]' started.
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testOlderSettingsWithoutPrepaidQuotaDecodeWithEmptyQuota]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testSettingsRoundTrip]' started.
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testSettingsRoundTrip]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testUnknownPersistedEngineFallsBackToStandardPreset]' started.
+Test Case '-[TencentVoiceMVPTests.SettingsStoreTests testUnknownPersistedEngineFallsBackToStandardPreset]' passed (0.000 seconds).
+Test Suite 'SettingsStoreTests' passed at 2026-09-08 16:58:31.523.
+	 Executed 8 tests, with 0 failures (0 unexpected) in 0.011 (0.012) seconds
+Test Suite 'ShortcutTests' started at 2026-09-08 16:58:31.523.
+Test Case '-[TencentVoiceMVPTests.ShortcutTests testBareLetterIsRejectedButModifiedLetterIsAccepted]' started.
+Test Case '-[TencentVoiceMVPTests.ShortcutTests testBareLetterIsRejectedButModifiedLetterIsAccepted]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ShortcutTests testDefaultShortcutIsCommand0]' started.
+Test Case '-[TencentVoiceMVPTests.ShortcutTests testDefaultShortcutIsCommand0]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ShortcutTests testLegacyF5ShortcutRemainsAvailableForMigration]' started.
+Test Case '-[TencentVoiceMVPTests.ShortcutTests testLegacyF5ShortcutRemainsAvailableForMigration]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ShortcutTests testMenuShortcutPresentationMapsFunctionKeys]' started.
+Test Case '-[TencentVoiceMVPTests.ShortcutTests testMenuShortcutPresentationMapsFunctionKeys]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ShortcutTests testMenuShortcutPresentationUsesConfiguredKeyAndModifiers]' started.
+Test Case '-[TencentVoiceMVPTests.ShortcutTests testMenuShortcutPresentationUsesConfiguredKeyAndModifiers]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.ShortcutTests testShortcutRoundTripsThroughJSON]' started.
+Test Case '-[TencentVoiceMVPTests.ShortcutTests testShortcutRoundTripsThroughJSON]' passed (0.000 seconds).
+Test Suite 'ShortcutTests' passed at 2026-09-08 16:58:31.524.
+	 Executed 6 tests, with 0 failures (0 unexpected) in 0.001 (0.001) seconds
+Test Suite 'TencentASRClientTests' started at 2026-09-08 16:58:31.524.
+Test Case '-[TencentVoiceMVPTests.TencentASRClientTests testConnectionCompletesAfterSuccessfulTencentHandshake]' started.
+Test Case '-[TencentVoiceMVPTests.TencentASRClientTests testConnectionCompletesAfterSuccessfulTencentHandshake]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentASRClientTests testConnectionSurfacesTencentHandshakeError]' started.
+Test Case '-[TencentVoiceMVPTests.TencentASRClientTests testConnectionSurfacesTencentHandshakeError]' passed (0.000 seconds).
+Test Suite 'TencentASRClientTests' passed at 2026-09-08 16:58:31.525.
+	 Executed 2 tests, with 0 failures (0 unexpected) in 0.001 (0.001) seconds
+Test Suite 'TencentSignerTests' started at 2026-09-08 16:58:31.525.
+Test Case '-[TencentVoiceMVPTests.TencentSignerTests testHMACSHA1UsesRFC2202Vector]' started.
+Test Case '-[TencentVoiceMVPTests.TencentSignerTests testHMACSHA1UsesRFC2202Vector]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentSignerTests testSignedURLContainsPercentEncodedSignatureAndNoSecretKey]' started.
+Test Case '-[TencentVoiceMVPTests.TencentSignerTests testSignedURLContainsPercentEncodedSignatureAndNoSecretKey]' passed (0.000 seconds).
+Test Suite 'TencentSignerTests' passed at 2026-09-08 16:58:31.525.
+	 Executed 2 tests, with 0 failures (0 unexpected) in 0.000 (0.000) seconds
+Test Suite 'TencentUsageTests' started at 2026-09-08 16:58:31.525.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testAbandonedLocalUsageSessionIsRecoveredOnNextLaunch]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testAbandonedLocalUsageSessionIsRecoveredOnNextLaunch]' passed (0.002 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testConfiguredPrepaidQuotaOverridesFreeQuota]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testConfiguredPrepaidQuotaOverridesFreeQuota]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testExistingPerUserUsageMigratesToSharedCredentialBucketOnce]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testExistingPerUserUsageMigratesToSharedCredentialBucketOnce]' passed (0.003 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testGeneralRealtimeEngineHasFiveHourFreeQuota]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testGeneralRealtimeEngineHasFiveHourFreeQuota]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testLargeModelHasNoFreeQuota]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testLargeModelHasNoFreeQuota]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testLegacyLocalUsageIsNotCopiedAgainWhenTheUserChangesCredentials]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testLegacyLocalUsageIsNotCopiedAgainWhenTheUserChangesCredentials]' passed (0.003 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testLegacyUnscopedUsageDoesNotLeakIntoAnEngineBucket]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testLegacyUnscopedUsageDoesNotLeakIntoAnEngineBucket]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testLegacyUnscopedUsageMigratesToThePreviousDefaultEngineOnlyOnce]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testLegacyUnscopedUsageMigratesToThePreviousDefaultEngineOnlyOnce]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testLocalUsageSessionIsLiveAndCommittedWhenItEnds]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testLocalUsageSessionIsLiveAndCommittedWhenItEnds]' passed (0.002 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testPrepaidQuotaIsSharedForTheSameCredentials]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testPrepaidQuotaIsSharedForTheSameCredentials]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testPrepaidSummaryShowsPackagePercentage]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testPrepaidSummaryShowsPackagePercentage]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testSharedPrepaidSummaryUsesShortUsageLabel]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testSharedPrepaidSummaryUsesShortUsageLabel]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testSharedUsageIsVisibleToAnotherMacOSAccountForTheSameCredentials]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testSharedUsageIsVisibleToAnotherMacOSAccountForTheSameCredentials]' passed (0.002 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testSharedUsageSeparatesDifferentCredentialIdentities]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testSharedUsageSeparatesDifferentCredentialIdentities]' passed (0.002 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testTotalSecondsSpansMonthsForAQuotaPackage]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testTotalSecondsSpansMonthsForAQuotaPackage]' passed (0.002 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testUsageIsTrackedSeparatelyForEachEngine]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testUsageIsTrackedSeparatelyForEachEngine]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testUsagePercentageUsesTheLocallyRecordedValue]' started.
+Test Case '-[TencentVoiceMVPTests.TencentUsageTests testUsagePercentageUsesTheLocallyRecordedValue]' passed (0.000 seconds).
+Test Suite 'TencentUsageTests' passed at 2026-09-08 16:58:31.546.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.021 (0.021) seconds
+Test Suite 'TencentWireMessageTests' started at 2026-09-08 16:58:31.546.
+Test Case '-[TencentVoiceMVPTests.TencentWireMessageTests testDecodeLeadingStableWordPrefix]' started.
+Test Case '-[TencentVoiceMVPTests.TencentWireMessageTests testDecodeLeadingStableWordPrefix]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentWireMessageTests testDecodePartialResult]' started.
+Test Case '-[TencentVoiceMVPTests.TencentWireMessageTests testDecodePartialResult]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentWireMessageTests testDecodeStreamEnd]' started.
+Test Case '-[TencentVoiceMVPTests.TencentWireMessageTests testDecodeStreamEnd]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TencentWireMessageTests testEmptyWordListLeavesStablePrefixUnavailableForFallback]' started.
+Test Case '-[TencentVoiceMVPTests.TencentWireMessageTests testEmptyWordListLeavesStablePrefixUnavailableForFallback]' passed (0.000 seconds).
+Test Suite 'TencentWireMessageTests' passed at 2026-09-08 16:58:31.547.
+	 Executed 4 tests, with 0 failures (0 unexpected) in 0.001 (0.001) seconds
+Test Suite 'TextInjectorTests' started at 2026-09-08 16:58:31.547.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testActiveRevisionDoesNotDisableKeyboardLiveTailPath]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testActiveRevisionDoesNotDisableKeyboardLiveTailPath]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testAXUnsupportedTargetUsesKeyboardSegmentCommitMode]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testAXUnsupportedTargetUsesKeyboardSegmentCommitMode]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testEnabledSafeCopyDoesNotReplaceClipboardForEmptyResult]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testEnabledSafeCopyDoesNotReplaceClipboardForEmptyResult]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testEnabledSafeCopyFallsBackAfterInputFailureAndCopiesFinalResult]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testEnabledSafeCopyFallsBackAfterInputFailureAndCopiesFinalResult]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testEnabledSafeCopyUsesAXReplacementAndClipboard]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testEnabledSafeCopyUsesAXReplacementAndClipboard]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testEnabledSafeCopyWritesToTextTargetAndClipboard]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testEnabledSafeCopyWritesToTextTargetAndClipboard]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testFinalKeepsServerStablePrefixAndFlushesOnlyTheUnstableTail]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testFinalKeepsServerStablePrefixAndFlushesOnlyTheUnstableTail]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testFinishKeepsReplacementMetricsUntilSessionCleanup]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testFinishKeepsReplacementMetricsUntilSessionCleanup]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardCommittedRevisionIsCorrectedWithoutStoppingInput]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardCommittedRevisionIsCorrectedWithoutStoppingInput]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardDeepPartialRevisionIsImmediatelyReplacedWithoutBackspaces]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardDeepPartialRevisionIsImmediatelyReplacedWithoutBackspaces]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardEmptyFinishUsesLastKnownPartial]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardEmptyFinishUsesLastKnownPartial]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardEmptyNewSegmentBoundaryCommitsPreviousSegment]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardEmptyNewSegmentBoundaryCommitsPreviousSegment]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardFinalRevisionDoesNotDisableFollowingSegment]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardFinalRevisionDoesNotDisableFollowingSegment]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardLiveTailPureGrowthOnlyAppendsText]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardLiveTailPureGrowthOnlyAppendsText]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardPacingFlushesPendingCharactersOnFinal]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardPacingFlushesPendingCharactersOnFinal]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardPacingRevisesPendingCharactersWithoutTouchingVisibleText]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardPacingRevisesPendingCharactersWithoutTouchingVisibleText]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardPacingShowsFirstCharacterImmediatelyAndCompletesWithinDeadline]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardPacingShowsFirstCharacterImmediatelyAndCompletesWithinDeadline]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardPartialAppearsImmediatelyAndGrowthAppends]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardPartialAppearsImmediatelyAndGrowthAppends]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardRepeatedFinalDoesNotDuplicateText]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardRepeatedFinalDoesNotDuplicateText]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardSegmentCommitDoesNotDeleteEarlierSegment]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardSegmentCommitDoesNotDeleteEarlierSegment]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardSegmentCommitPreservesEmojiAndCombiningCharacters]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardSegmentCommitPreservesEmojiAndCombiningCharacters]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardServerStableMetadataDoesNotDelayVisiblePartial]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardServerStableMetadataDoesNotDelayVisiblePartial]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardShorterInterimProjectionDoesNotTripSafeCopy]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardShorterInterimProjectionDoesNotTripSafeCopy]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardStablePrefixPreservesEmojiAndCombiningCharacters]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardStablePrefixPreservesEmojiAndCombiningCharacters]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardStablePrefixSurvivesActiveRevisionWithoutDeletingSubmittedText]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardStablePrefixSurvivesActiveRevisionWithoutDeletingSubmittedText]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardStreamEndCommitsBufferedPartialOnce]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testKeyboardStreamEndCommitsBufferedPartialOnce]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testPartialUpdatesReplaceOwnedRange]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testPartialUpdatesReplaceOwnedRange]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testSafeCopyDisabledStopsAfterInputFailureWithoutCopyingToClipboard]' started.
+Test Case '-[TencentVoiceMVPTests.TextInjectorTests testSafeCopyDisabledStopsAfterInputFailureWithoutCopyingToClipboard]' passed (0.000 seconds).
+Test Suite 'TextInjectorTests' passed at 2026-09-08 16:58:31.552.
+	 Executed 28 tests, with 0 failures (0 unexpected) in 0.005 (0.005) seconds
+Test Suite 'TextTargetTests' started at 2026-09-08 16:58:31.552.
+Test Case '-[TencentVoiceMVPTests.TextTargetTests testAXReplacementAppendsWithoutRewritingExistingText]' started.
+Test Case '-[TencentVoiceMVPTests.TextTargetTests testAXReplacementAppendsWithoutRewritingExistingText]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextTargetTests testAXReplacementHandlesEmojiAndCombiningCharacters]' started.
+Test Case '-[TencentVoiceMVPTests.TextTargetTests testAXReplacementHandlesEmojiAndCombiningCharacters]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextTargetTests testAXReplacementOnlyChangesUnstableMiddle]' started.
+Test Case '-[TencentVoiceMVPTests.TextTargetTests testAXReplacementOnlyChangesUnstableMiddle]' passed (0.000 seconds).
+Test Case '-[TencentVoiceMVPTests.TextTargetTests testSyntheticKeyboardEventsNeverCarryPhysicalModifiers]' started.
+Test Case '-[TencentVoiceMVPTests.TextTargetTests testSyntheticKeyboardEventsNeverCarryPhysicalModifiers]' passed (0.001 seconds).
+Test Case '-[TencentVoiceMVPTests.TextTargetTests testSyntheticKeyboardSelectionEventCarriesOnlyRequestedShift]' started.
+Test Case '-[TencentVoiceMVPTests.TextTargetTests testSyntheticKeyboardSelectionEventCarriesOnlyRequestedShift]' passed (0.000 seconds).
+Test Suite 'TextTargetTests' passed at 2026-09-08 16:58:31.553.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.001 (0.001) seconds
+Test Suite 'TencentVoiceMVPPackageTests.xctest' passed at 2026-09-08 16:58:31.553.
+	 Executed 257 tests, with 0 failures (0 unexpected) in 1.730 (1.738) seconds
+Test Suite 'All tests' passed at 2026-09-08 16:58:31.554.
+	 Executed 257 tests, with 0 failures (0 unexpected) in 1.730 (1.740) seconds
+􀟈  Test run started.
+􀄵  Testing Library Version: 124.4
+􀄵  Target Platform: arm64e-apple-macos14.0
+􁁛  Test run with 0 tests passed after 0.001 seconds.
