@@ -5,6 +5,7 @@ enum SessionState: Equatable {
     case idle
     case connecting
     case listening
+    case recovering
     case stopping
     case error(String)
 }
@@ -44,8 +45,12 @@ final class SessionCoordinator: SessionCoordinating {
     let credentialStore: CredentialStore
     let logger: SessionLogger
     private let onStateChange: (SessionState) -> Void
+    private var stateObserver: ((SessionState) -> Void)?
     private(set) var state: SessionState = .idle {
-        didSet { onStateChange(state) }
+        didSet {
+            onStateChange(state)
+            stateObserver?(state)
+        }
     }
 
     private var injector: TextInjector?
@@ -54,6 +59,8 @@ final class SessionCoordinator: SessionCoordinating {
     private var eventTask: Task<Void, Never>?
     private var latestProjection: ASRProjection?
     private var finishSent = false
+    private var asrReady = false
+    private var audioRecovering = false
     private var sessionID: UUID?
     private let finishTimeoutNanoseconds: UInt64
     private let keyboardSmoothing: KeyboardSmoothingConfiguration
@@ -112,6 +119,8 @@ final class SessionCoordinator: SessionCoordinating {
             injector = newInjector
             latestProjection = nil
             finishSent = false
+            asrReady = false
+            audioRecovering = false
             discardCount = 0
             errorCount = 0
             degradationWasLogged = false
@@ -130,7 +139,9 @@ final class SessionCoordinator: SessionCoordinating {
             let forwarder = AudioChunkForwarder()
             prebuffer = buffer
             audioForwarder = forwarder
-            try await audio.start { [weak self, weak buffer] chunk in
+            try await audio.start(
+                sessionID: id,
+                onChunk: { [weak self, weak buffer] chunk in
                 guard let buffer else { return }
                 forwarder.submit { [weak self, weak buffer] in
                     guard let buffer else { return }
@@ -140,13 +151,23 @@ final class SessionCoordinator: SessionCoordinating {
                         await self?.handleAudioError(error, sessionID: id)
                     }
                 }
-            }
+                },
+                onEvent: { [weak self] event in
+                    Task { @MainActor [weak self] in
+                        self?.handleAudioEvent(event)
+                    }
+                }
+            )
             log(event: "audio_capture_started")
-            guard sessionID == id, state == .connecting else { throw SessionError.cancelled }
+            guard sessionID == id,
+                  state == .connecting || state == .recovering || state == .listening
+            else { throw SessionError.cancelled }
 
             let stream = try await asr.start(configuration: configuration)
             log(event: "asr_started")
-            guard sessionID == id, state == .connecting else { throw SessionError.cancelled }
+            guard sessionID == id,
+                  state == .connecting || state == .recovering || state == .listening
+            else { throw SessionError.cancelled }
             try await buffer.attach { [weak self, asr] chunk in
                 do {
                     try await asr.sendAudio(chunk)
@@ -155,9 +176,14 @@ final class SessionCoordinator: SessionCoordinating {
                     throw error
                 }
             }
-            guard sessionID == id, state == .connecting else { throw SessionError.cancelled }
-            setState(.listening)
-            log(event: "started")
+            guard sessionID == id,
+                  state == .connecting || state == .recovering || state == .listening
+            else { throw SessionError.cancelled }
+            asrReady = true
+            if !audioRecovering && (state == .connecting || state == .recovering) {
+                setState(.listening)
+                log(event: "started")
+            }
             eventTask = Task { [weak self] in
                 do {
                     for try await update in stream {
@@ -170,17 +196,27 @@ final class SessionCoordinator: SessionCoordinating {
             }
         } catch {
             if case SessionError.cancelled = error {
-                await cleanUpAfterFailedStart()
-                setState(.idle)
+                guard sessionID == id else { return }
+                await cleanUpAfterFailedStart(sessionID: id)
+                if sessionID == nil {
+                    setState(.idle)
+                }
                 return
             }
+            guard sessionID == id else { return }
             // Keep startup failures diagnosable after cleanup without writing
             // credentials, signed URLs, audio, or recognized text.
             log(event: "startup_error", error: error, sessionID: id)
-            await cleanUpAfterFailedStart()
-            setState(.error(error.localizedDescription))
+            await cleanUpAfterFailedStart(sessionID: id)
+            if sessionID == nil {
+                setState(.error(error.localizedDescription))
+            }
             throw error
         }
+    }
+
+    func setStateObserver(_ observer: @escaping (SessionState) -> Void) {
+        stateObserver = observer
     }
 
     func end() async throws {
@@ -190,6 +226,12 @@ final class SessionCoordinator: SessionCoordinating {
             return
         }
         guard state != .stopping else { return }
+        // Startup still owns setup until the connection and prebuffer are ready.
+        // Do not run graceful end concurrently with cancelled-start cleanup.
+        guard asrReady else {
+            cancel()
+            return
+        }
         guard let endingSessionID = sessionID else {
             cancel()
             return
@@ -266,7 +308,7 @@ final class SessionCoordinator: SessionCoordinating {
 
     private func process(_ update: ASRUpdate, sessionID: UUID) {
         guard self.sessionID == sessionID else { return }
-        guard state == .listening || state == .stopping else { return }
+        guard state == .listening || state == .stopping || state == .recovering else { return }
         if update.isStreamEnded {
             if let projection = projectionAccumulator.apply(update) {
                 latestProjection = projection
@@ -308,7 +350,7 @@ final class SessionCoordinator: SessionCoordinating {
 
     private func handleASRError(_ error: Error, sessionID: UUID? = nil) {
         if let sessionID, self.sessionID != sessionID { return }
-        guard state == .connecting || state == .listening else { return }
+        guard state == .connecting || state == .listening || state == .recovering else { return }
         audio.stop()
         asr.cancel()
         errorCount += 1
@@ -332,6 +374,51 @@ final class SessionCoordinator: SessionCoordinating {
         handleASRError(error, sessionID: sessionID)
     }
 
+    private func handleAudioEvent(_ event: AudioCaptureEvent) {
+        guard sessionID == event.sessionID else { return }
+        switch event.kind {
+        case let .interrupted(previousFormat):
+            guard state == .connecting || state == .listening || state == .recovering else { return }
+            audioRecovering = true
+            if state != .recovering {
+                setState(.recovering)
+            }
+            log(
+                event: "audio_capture_interrupted",
+                failureCode: "microphone_configuration_changed",
+                metadata: previousFormat?.metadata ?? [:],
+                sessionID: event.sessionID
+            )
+        case let .recovering(attempt):
+            guard state == .connecting || state == .listening || state == .recovering else { return }
+            audioRecovering = true
+            if state != .recovering {
+                setState(.recovering)
+            }
+            log(
+                event: "audio_capture_recovery_attempt",
+                metadata: ["attempt": String(attempt)],
+                sessionID: event.sessionID
+            )
+        case let .recovered(format, durationNanoseconds):
+            guard state == .recovering else { return }
+            audioRecovering = false
+            if asrReady {
+                setState(.listening)
+            }
+            var metadata = format.metadata
+            metadata["duration_ms"] = String(durationNanoseconds / 1_000_000)
+            log(
+                event: "audio_capture_recovered",
+                metadata: metadata,
+                sessionID: event.sessionID
+            )
+        case let .failed(error):
+            guard state == .connecting || state == .listening || state == .recovering else { return }
+            handleASRError(error, sessionID: event.sessionID)
+        }
+    }
+
     private func ensureMicrophonePermission() async throws {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
@@ -346,7 +433,8 @@ final class SessionCoordinator: SessionCoordinating {
         }
     }
 
-    private func cleanUpAfterFailedStart() async {
+    private func cleanUpAfterFailedStart(sessionID expectedSessionID: UUID) async {
+        guard sessionID == expectedSessionID else { return }
         audioForwarder?.cancel()
         audio.stop()
         asr.cancel()
@@ -364,6 +452,8 @@ final class SessionCoordinator: SessionCoordinating {
         eventTask = nil
         latestProjection = nil
         finishSent = false
+        asrReady = false
+        audioRecovering = false
         sessionID = nil
         discardCount = 0
         errorCount = 0
@@ -408,6 +498,7 @@ final class SessionCoordinator: SessionCoordinating {
         error: Error? = nil,
         failureCode: String? = nil,
         failureMessage: String? = nil,
+        metadata: [String: String] = [:],
         sessionID overrideSessionID: UUID? = nil
     ) {
         guard let sessionID = overrideSessionID ?? sessionID else { return }
@@ -415,6 +506,7 @@ final class SessionCoordinator: SessionCoordinating {
         case .idle: "idle"
         case .connecting: "connecting"
         case .listening: "listening"
+        case .recovering: "recovering"
         case .stopping: "stopping"
         case .error: "error"
         }
@@ -452,7 +544,8 @@ final class SessionCoordinator: SessionCoordinating {
             errorCount: errorCount + (injector?.errorCount ?? 0),
             errorCode: errorCode,
             failureCode: resolvedFailureCode,
-            failureMessage: resolvedFailureMessage
+            failureMessage: resolvedFailureMessage,
+            metadata: metadata
         )
         try? logger.append(entry)
     }

@@ -210,6 +210,152 @@ final class SessionCoordinatorTests: XCTestCase {
         coordinator.cancel()
     }
 
+    func testAudioInterruptionMovesToRecoveringAndThenBackToListening() async throws {
+        let audio = FakeAudioCapture()
+        let coordinator = makeCoordinator(
+            audio: audio,
+            target: FakeTextTarget(text: "")
+        )
+
+        try await coordinator.begin()
+        guard let sessionID = audio.lastSessionID else {
+            return XCTFail("audio session ID was not captured")
+        }
+
+        audio.emit(AudioCaptureEvent(
+            sessionID: sessionID,
+            kind: .interrupted(previousFormat: AudioCaptureFormat(sampleRate: 24_000, channelCount: 1))
+        ))
+        await settleCoordinator()
+        XCTAssertEqual(coordinator.state, .recovering)
+
+        audio.emit(AudioCaptureEvent(sessionID: sessionID, kind: .recovering(attempt: 1)))
+        audio.emit(AudioCaptureEvent(
+            sessionID: sessionID,
+            kind: .recovered(
+                format: AudioCaptureFormat(sampleRate: 48_000, channelCount: 1),
+                durationNanoseconds: 250_000_000
+            )
+        ))
+        await settleCoordinator()
+        XCTAssertEqual(coordinator.state, .listening)
+        coordinator.cancel()
+    }
+
+    func testStartCompletionCannotOverrideAudioRecovery() async throws {
+        let audio = FakeAudioCapture()
+        audio.holdsStarts = true
+        let asr = FakeRealtimeASRClient()
+        let target = FakeTextTarget(text: "")
+        let coordinator = makeCoordinator(asr: asr, audio: audio, target: target)
+        let start = Task { try await coordinator.begin() }
+        await waitForAudioStart(audio, count: 1)
+        let id = try XCTUnwrap(audio.lastSessionID)
+        audio.emit(.init(sessionID: id, kind: .interrupted(previousFormat: nil)))
+        await settleCoordinator()
+        audio.releaseNextStart()
+        try await start.value
+        XCTAssertEqual(coordinator.state, .recovering)
+        asr.emit(.init(text: "切换前的尾句", isFinal: true, sequence: 0))
+        await settleCoordinator()
+        XCTAssertEqual(target.text, "切换前的尾句")
+        audio.emit(.init(sessionID: id, kind: .recovered(
+            format: .init(sampleRate: 24_000, channelCount: 1), durationNanoseconds: 600_000_000
+        )))
+        await settleCoordinator()
+        XCTAssertEqual(coordinator.state, .listening)
+        coordinator.cancel()
+    }
+
+    func testAudioRecoversBeforeConnectionCompletes() async throws {
+        let audio = FakeAudioCapture()
+        audio.holdsStarts = true
+        let coordinator = makeCoordinator(audio: audio, target: FakeTextTarget(text: ""))
+        let start = Task { try await coordinator.begin() }
+        await waitForAudioStart(audio, count: 1)
+        let id = try XCTUnwrap(audio.lastSessionID)
+        audio.emit(.init(sessionID: id, kind: .interrupted(previousFormat: nil)))
+        await settleCoordinator()
+        audio.emit(.init(sessionID: id, kind: .recovered(
+            format: .init(sampleRate: 24_000, channelCount: 1), durationNanoseconds: 100_000_000
+        )))
+        await settleCoordinator()
+        XCTAssertNotEqual(coordinator.state, .listening)
+        audio.releaseNextStart()
+        try await start.value
+        XCTAssertEqual(coordinator.state, .listening)
+        coordinator.cancel()
+    }
+
+    func testStopDuringStartupRecoveryCancelsInsteadOfFinishing() async throws {
+        let audio = FakeAudioCapture()
+        audio.holdsStarts = true
+        let asr = FakeRealtimeASRClient()
+        let coordinator = makeCoordinator(asr: asr, audio: audio, target: FakeTextTarget(text: ""))
+        let start = Task { try await coordinator.begin() }
+        await waitForAudioStart(audio, count: 1)
+        let id = try XCTUnwrap(audio.lastSessionID)
+        audio.emit(.init(sessionID: id, kind: .interrupted(previousFormat: nil)))
+        await settleCoordinator()
+        try await coordinator.end()
+        XCTAssertEqual(coordinator.state, .idle)
+        XCTAssertEqual(asr.finishCallCount, 0)
+        audio.releaseNextStart()
+        try await start.value
+        XCTAssertEqual(coordinator.state, .idle)
+        XCTAssertNil(asr.startedConfiguration)
+    }
+
+    func testAudioRecoveryFailureKeepsRecognizedTextAndEntersError() async throws {
+        let audio = FakeAudioCapture()
+        let target = FakeTextTarget(text: "")
+        let asr = FakeRealtimeASRClient()
+        let coordinator = makeCoordinator(asr: asr, audio: audio, target: target)
+
+        try await coordinator.begin()
+        guard let sessionID = audio.lastSessionID else {
+            return XCTFail("audio session ID was not captured")
+        }
+        asr.emit(.init(text: "切换前的文字", isFinal: false, sequence: 0))
+        await settleCoordinator()
+
+        audio.emit(AudioCaptureEvent(
+            sessionID: sessionID,
+            kind: .failed(.recoveryTimedOut)
+        ))
+        await settleCoordinator()
+
+        XCTAssertEqual(coordinator.state, .error("麦克风设备切换后未能恢复"))
+        XCTAssertEqual(target.text, "切换前的文字")
+        XCTAssertEqual(asr.finishCallCount, 0)
+    }
+
+    func testLateCancelledStartCannotCleanUpTheNextSession() async throws {
+        let audio = FakeAudioCapture()
+        audio.holdsStarts = true
+        let coordinator = makeCoordinator(audio: audio, target: FakeTextTarget(text: ""))
+
+        let firstStart = Task { @MainActor in
+            try? await coordinator.begin()
+        }
+        await waitForAudioStart(audio, count: 1)
+        coordinator.cancel()
+
+        let secondStart = Task { @MainActor in
+            try? await coordinator.begin()
+        }
+        await waitForAudioStart(audio, count: 2)
+
+        audio.releaseNextStart()
+        await firstStart.value
+        XCTAssertEqual(coordinator.state, .connecting)
+
+        audio.releaseNextStart()
+        await secondStart.value
+        XCTAssertEqual(coordinator.state, .listening)
+        coordinator.cancel()
+    }
+
     func testPauseFinalCommitsSentenceWhileSessionContinues() async throws {
         let asr = FakeRealtimeASRClient()
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
@@ -582,6 +728,15 @@ private func settleCoordinator() async {
     for _ in 0..<10 {
         await Task.yield()
     }
+}
+
+@MainActor
+private func waitForAudioStart(_ audio: FakeAudioCapture, count: Int) async {
+    for _ in 0..<100 {
+        if audio.startCallCount >= count { return }
+        await Task.yield()
+    }
+    XCTFail("audio start did not reach call (count)")
 }
 
 private func assertThrowsAsync<T>(_ body: () async throws -> T) async {

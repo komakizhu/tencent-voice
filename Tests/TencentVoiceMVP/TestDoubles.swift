@@ -155,12 +155,27 @@ final class FakeRealtimeASRClient: RealtimeASRClient {
 
 final class FakeAudioCapture: AudioCapture {
     private var handler: (@Sendable (Data) -> Void)?
+    private var eventHandler: (@Sendable (AudioCaptureEvent) -> Void)?
+    private var pendingStarts: [CheckedContinuation<Void, Error>] = []
     private(set) var startCallCount = 0
+    private(set) var lastSessionID: UUID?
     var dataToEmitOnStop: Data?
+    var holdsStarts = false
 
-    func start(onChunk: @escaping @Sendable (Data) -> Void) async throws {
+    func start(
+        sessionID: UUID,
+        onChunk: @escaping @Sendable (Data) -> Void,
+        onEvent: @escaping @Sendable (AudioCaptureEvent) -> Void
+    ) async throws {
         handler = onChunk
+        eventHandler = onEvent
+        lastSessionID = sessionID
         startCallCount += 1
+        if holdsStarts {
+            try await withCheckedThrowingContinuation { continuation in
+                pendingStarts.append(continuation)
+            }
+        }
     }
 
     func stop() {
@@ -171,6 +186,15 @@ final class FakeAudioCapture: AudioCapture {
 
     func emit(_ data: Data) {
         handler?(data)
+    }
+
+    func emit(_ event: AudioCaptureEvent) {
+        eventHandler?(event)
+    }
+
+    func releaseNextStart() {
+        guard !pendingStarts.isEmpty else { return }
+        pendingStarts.removeFirst().resume()
     }
 }
 
