@@ -3,12 +3,18 @@ import AppKit
 import Foundation
 
 @MainActor
-final class AXTextTarget: TextTarget {
+final class AXTextTarget: KeyboardAcknowledgingTarget {
+    private(set) var requiresKeyboardAcknowledgement = false
+    private var confirmedKeyboardDocument: String?
+    private var pendingKeyboardWrite: KeyboardDocumentState?
+    private var pendingKeyboardReplacement: (selected: KeyboardDocumentState, insertion: String)?
+    private var keyboardGeneration: UInt64 = 0
+    private var isCodexTarget = false
     private var targetElement: AXUIElement?
     private var targetProcessID: pid_t?
     private var targetApplicationProcessID: pid_t?
     private var expectedKeyboardSelection: TextRange?
-    private let keyboardEventSender = KeyboardEventSender()
+    private let keyboardEventSender: KeyboardEventSender
     private var diagnostics: [TextInputDiagnostic] = []
     private var droppedDiagnosticCount = 0
     private var diagnosticOperationContext: TextInputDiagnosticContext?
@@ -16,6 +22,10 @@ final class AXTextTarget: TextTarget {
     private var lastKeyboardDispatch: UInt64?
     private var lastAXWriteStatus: Int32?
     private var lastAXWriteKind = "none"
+
+    init(operationObserver: ((String) -> Void)? = nil) {
+        keyboardEventSender = KeyboardEventSender(stageObserver: operationObserver)
+    }
 
     func drainDiagnostics() -> [TextInputDiagnostic] {
         defer { diagnostics.removeAll(keepingCapacity: true) }
@@ -63,6 +73,11 @@ final class AXTextTarget: TextTarget {
     }
 
     func capture() throws -> TextSnapshot {
+        keyboardGeneration &+= 1
+        pendingKeyboardWrite = nil
+        pendingKeyboardReplacement = nil
+        confirmedKeyboardDocument = nil
+        requiresKeyboardAcknowledgement = false
         diagnostics.removeAll(keepingCapacity: true)
         droppedDiagnosticCount = 0
         diagnosticOperationContext = nil
@@ -76,6 +91,7 @@ final class AXTextTarget: TextTarget {
         targetApplicationProcessID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         expectedKeyboardSelection = nil
         let targetApplication = currentApplication()
+        isCodexTarget = targetApplication?.bundleIdentifier == "com.openai.codex"
 
         // Some Electron/WebKit controls expose neither a stable AX value nor
         // a stable focused AX element while the DOM is being rebuilt. That is
@@ -108,27 +124,16 @@ final class AXTextTarget: TextTarget {
         let hasReadableAXTextState = element.map {
             readableText(in: $0) != nil && readableSelection(in: $0) != nil
         } ?? false
-        let role = element.flatMap {
-            (try? attribute(kAXRoleAttribute, from: $0) as? String)
-        } ?? "unknown"
-        let selectedAttributeSettable = element.map { selectedTextIsSettable(on: $0) } ?? false
-        let valueAttributeSettable = element.map { valueIsSettable(on: $0) } ?? false
         expectedKeyboardSelection = readableKeyboardSelection
+        requiresKeyboardAcknowledgement = hasReadableAXTextState
+        confirmedKeyboardDocument = element.flatMap { keyboardDocument(in: $0) }
         recordDiagnostic("input_target_captured", [
             "hasElement": String(element != nil), "hasReadableState": String(hasReadableAXTextState),
-            "role": role,
-            "selectedSettable": String(selectedAttributeSettable),
-            "valueSettable": String(valueAttributeSettable),
-            "valueReadable": String(element.map { readableText(in: $0) != nil } ?? false),
-            "selectionReadable": String(readableKeyboardSelection != nil),
+            "selectedSettable": String(element.map { selectedTextIsSettable(on: $0) } ?? false),
+            "valueSettable": String(element.map { valueIsSettable(on: $0) } ?? false),
             "documentLength": String(text.utf16.count), "selectionLocation": String(selection.location),
             "selectionLength": String(selection.length),
-            "keyboardCompatibility": String(targetApplication?.bundleIdentifier == "com.openai.codex"),
-            "targetApplicationProcessID": targetApplicationProcessID.map(String.init) ?? "unknown",
-            "targetElementProcessID": targetProcessID.map(String.init) ?? "unknown",
-            "frontmostApplicationProcessID": targetApplicationProcessID.map(String.init) ?? "unknown",
-            "frontmostApplicationMatchesTarget": "true",
-            "elementProcessMatchesTarget": String(targetProcessID == targetApplicationProcessID)
+            "keyboardCompatibility": String(targetApplication?.bundleIdentifier == "com.openai.codex")
         ])
         return TextSnapshot(
             element: element,
@@ -229,25 +234,15 @@ final class AXTextTarget: TextTarget {
 
     func paste(_ text: String) throws {
         try ensureKeyboardTargetIsSafe()
-        let plannedSelection = expectedKeyboardSelection
-        let stats = try keyboardEventSender.send(text, processID: eventProcessID)
+        let receipt = try keyboardReceipt(replacing: expectedKeyboardSelection, with: text)
+        try keyboardEventSender.send(text, processID: eventProcessID)
         lastKeyboardDispatch = DispatchTime.now().uptimeNanoseconds
-        recordDiagnostic("keyboard_dispatch", [
-            "dispatchKind": "append",
-            "plannedSelectionLocation": plannedSelection.map { String($0.location) } ?? "unknown",
-            "plannedSelectionLength": plannedSelection.map { String($0.length) } ?? "unknown",
-            "targetProcessID": eventProcessID.map(String.init) ?? "unknown",
-            "localDispatchCompleted": "true",
-            "targetCompletionConfirmed": "false",
-            "postToPidAcknowledgement": "false",
-            "plannedKeyboardEventCount": String(stats.plannedKeyboardEventCount),
-            "postedKeyboardEventCount": String(stats.postedKeyboardEventCount),
-            "unicodeBlockCount": String(stats.unicodeBlockCount),
-            "shiftKeyEventCount": String(stats.shiftKeyEventCount),
-            "unicodeKeyEventCount": String(stats.unicodeKeyEventCount),
-            "deleteKeyEventCount": String(stats.deleteKeyEventCount),
-            "shiftActiveDuringReplacement": String(stats.shiftActiveDuringReplacement)
-        ])
+        if let receipt {
+            pendingKeyboardWrite = receipt
+            recordDiagnostic("keyboard_write_submitted", ["expectedLocation": String(receipt.selection.location),
+                                                        "expectedDocumentLength": String(receipt.text.utf16.count)])
+            return
+        }
         if let selection = expectedKeyboardSelection {
             expectedKeyboardSelection = TextRange(
                 location: selection.location + text.utf16.count,
@@ -271,29 +266,123 @@ final class AXTextTarget: TextTarget {
         } else {
             updatedSelection = nil
         }
-        let stats = try keyboardEventSender.replaceTrailingText(
+        let replacementRange = expectedKeyboardSelection.map {
+            TextRange(location: $0.location - previousText.utf16.count, length: previousText.utf16.count)
+        }
+        let receipt = try keyboardReceipt(replacing: replacementRange, with: text, previousText: previousText)
+        if let receipt, let replacementRange, let document = confirmedKeyboardDocument {
+            let selected = KeyboardDocumentState(text: document, selection: replacementRange)
+            let usesAXSelection = targetElement.map {
+                isAttributeSettable($0, kAXSelectedTextRangeAttribute as CFString)
+            } ?? false
+            if usesAXSelection, let targetElement {
+                try setSelection(replacementRange, on: targetElement)
+            } else {
+                try keyboardEventSender.selectTrailingText(previousText, processID: eventProcessID)
+            }
+            pendingKeyboardReplacement = (selected, text)
+            pendingKeyboardWrite = receipt
+            recordDiagnostic("keyboard_selection_submitted", [
+                "route": usesAXSelection ? "ax_range" : "keyboard",
+                "expectedLocation": String(replacementRange.location),
+                "expectedLength": String(replacementRange.length)
+            ])
+            return
+        }
+        try keyboardEventSender.replaceTrailingText(
             previousText,
             with: text,
             processID: eventProcessID
         )
         lastKeyboardDispatch = DispatchTime.now().uptimeNanoseconds
-        recordDiagnostic("keyboard_dispatch", [
-            "dispatchKind": "tail_replacement",
-            "plannedSelectionLocation": expectedKeyboardSelection.map { String($0.location) } ?? "unknown",
-            "plannedSelectionLength": String(previousText.utf16.count),
-            "targetProcessID": eventProcessID.map(String.init) ?? "unknown",
-            "localDispatchCompleted": "true",
-            "targetCompletionConfirmed": "false",
-            "postToPidAcknowledgement": "false",
-            "plannedKeyboardEventCount": String(stats.plannedKeyboardEventCount),
-            "postedKeyboardEventCount": String(stats.postedKeyboardEventCount),
-            "unicodeBlockCount": String(stats.unicodeBlockCount),
-            "shiftKeyEventCount": String(stats.shiftKeyEventCount),
-            "unicodeKeyEventCount": String(stats.unicodeKeyEventCount),
-            "deleteKeyEventCount": String(stats.deleteKeyEventCount),
-            "shiftActiveDuringReplacement": String(stats.shiftActiveDuringReplacement)
-        ])
+        if let receipt {
+            pendingKeyboardWrite = receipt
+            recordDiagnostic("keyboard_write_submitted", ["expectedLocation": String(receipt.selection.location),
+                "expectedDocumentLength": String(receipt.text.utf16.count), "replacementCharacters": String(previousText.count)])
+            return
+        }
         expectedKeyboardSelection = updatedSelection
+    }
+
+    func acknowledgeKeyboardWrite() async throws {
+        guard let receipt = pendingKeyboardWrite else { return }
+        let generation = keyboardGeneration
+        let start = DispatchTime.now().uptimeNanoseconds
+        let read = { () throws -> KeyboardDocumentState in
+            guard generation == self.keyboardGeneration else { throw CancellationError() }
+            try self.ensureTargetApplicationIsFrontmost()
+            let element = try self.focusedElement()
+            guard let targetElement = self.targetElement, CFEqual(element, targetElement),
+                  let text = self.keyboardDocument(in: element),
+                  let selection = self.readableSelection(in: element) else {
+                throw TextTargetError.targetChanged
+            }
+            return KeyboardDocumentState(text: text, selection: selection)
+        }
+        do {
+            if let replacement = pendingKeyboardReplacement {
+                try await KeyboardWriteAcknowledgement.replaceSelection(
+                    selected: replacement.selected, result: receipt, read: read
+                ) {
+                    self.recordDiagnostic(
+                        "keyboard_selection_acknowledged",
+                        context: self.previousDiagnosticOperationContext
+                    )
+                    try self.keyboardEventSender.replaceSelection(with: replacement.insertion, processID: self.eventProcessID)
+                    self.lastKeyboardDispatch = DispatchTime.now().uptimeNanoseconds
+                    self.recordDiagnostic(
+                        "keyboard_replacement_submitted",
+                        context: self.previousDiagnosticOperationContext
+                    )
+                }
+            } else {
+                try await KeyboardWriteAcknowledgement.wait(for: receipt, read: read)
+            }
+            guard generation == keyboardGeneration else { throw CancellationError() }
+            confirmedKeyboardDocument = receipt.text
+            expectedKeyboardSelection = receipt.selection
+            pendingKeyboardWrite = nil
+            pendingKeyboardReplacement = nil
+            recordDiagnostic("keyboard_write_acknowledged", [
+                "elapsedMilliseconds": String((DispatchTime.now().uptimeNanoseconds - start) / 1_000_000),
+                "documentMatches": "true", "selectionMatches": "true"
+            ], context: previousDiagnosticOperationContext)
+        } catch {
+            recordDiagnostic(
+                "keyboard_write_unconfirmed",
+                ["code": DiagnosticErrorFormatter.code(for: error)],
+                context: previousDiagnosticOperationContext
+            )
+            throw error
+        }
+    }
+
+    private func keyboardReceipt(replacing range: TextRange?, with text: String,
+                                 previousText: String? = nil) throws -> KeyboardDocumentState? {
+        guard requiresKeyboardAcknowledgement else { return nil }
+        guard let range, let document = confirmedKeyboardDocument,
+              range.location >= 0, range.length >= 0,
+              range.location <= document.utf16.count,
+              range.length <= document.utf16.count - range.location else { throw TextTargetError.targetChanged }
+        let nsRange = NSRange(location: range.location, length: range.length)
+        if let previousText, (document as NSString).substring(with: nsRange) != previousText {
+            throw TextTargetError.targetChanged
+        }
+        let result = NSMutableString(string: document)
+        result.replaceCharacters(in: nsRange, with: text)
+        return KeyboardDocumentState(text: result as String,
+                                     selection: TextRange(location: range.location + text.utf16.count, length: 0))
+    }
+
+    private func keyboardDocument(in element: AXUIElement) -> String? {
+        guard let value = readableText(in: element) else { return nil }
+        if isCodexTarget, readableSelection(in: element) == TextRange(location: 0, length: 0) {
+            let placeholder = (try? attribute("AXPlaceholderValue", from: element)) as? String
+            let description = (try? attribute(kAXDescriptionAttribute, from: element)) as? String
+            if let placeholder, !placeholder.isEmpty, value == placeholder { return "" }
+            if let description, !description.isEmpty, value == "\n" + description { return "" }
+        }
+        return value
     }
 
     func copyToClipboard(_ text: String) throws {
@@ -344,85 +433,47 @@ final class AXTextTarget: TextTarget {
         guard let targetElement else { return }
         let currentElement = try focusedElement()
         guard CFEqual(currentElement, targetElement) else {
-            recordDiagnostic("keyboard_focus_changed", [
-                "elementSame": "false",
-                "targetApplicationMatches": "true"
-            ])
+            recordDiagnostic("keyboard_focus_changed")
             throw TextTargetError.targetChanged
+        }
+        if requiresKeyboardAcknowledgement {
+            guard pendingKeyboardWrite == nil else { throw TextTargetError.writeFailed }
+            guard keyboardDocument(in: currentElement) == confirmedKeyboardDocument,
+                  readableSelection(in: currentElement) == expectedKeyboardSelection else {
+                recordDiagnostic("keyboard_confirmed_state_changed")
+                throw TextTargetError.targetChanged
+            }
+            return
         }
         if let expectedKeyboardSelection {
             let actualSelection = readableSelection(in: currentElement)
-            let age = lastKeyboardDispatch.map {
-                Double(DispatchTime.now().uptimeNanoseconds - $0) / 1_000_000
-            } ?? -1
-            let baseFields = [
-                "expectedLocation": String(expectedKeyboardSelection.location),
-                "expectedLength": String(expectedKeyboardSelection.length),
-                "initialLocation": String(actualSelection?.location ?? -1),
-                "initialLength": String(actualSelection?.length ?? -1),
-                "actualLocation": String(actualSelection?.location ?? -1),
-                "actualLength": String(actualSelection?.length ?? -1),
-                "lastDispatchAgeMilliseconds": String(age),
-                "waitBudgetMilliseconds": "150",
-                "waitQualificationMaxAgeMilliseconds": "250",
-                "polls": "0",
-                "waitMilliseconds": "0",
-                "selectedRangeNonEmpty": String((actualSelection?.length ?? 0) > 0),
-                "elementSame": "true",
-                "targetApplicationMatches": "true"
-            ]
-            if actualSelection == expectedKeyboardSelection {
-                recordDiagnostic(
-                    "keyboard_caret_observed",
-                    baseFields.merging([
-                        "waitClassification": "matched_without_wait",
-                        "feedbackObservedMonotonicMilliseconds": String(
-                            TextInputDiagnosticClock.milliseconds()
-                        )
-                    ]) { _, new in new },
-                    context: previousDiagnosticOperationContext ?? diagnosticOperationContext
-                )
-            } else if age < 0 || age > 250 {
-                recordDiagnostic(
-                    "keyboard_wait_skipped",
-                    baseFields.merging([
-                        "waitClassification": "wait_skipped",
-                        "waitSkippedReason": age < 0 ? "no_recent_dispatch" : "dispatch_age_exceeded",
-                        "feedbackObservedMonotonicMilliseconds": String(
-                            TextInputDiagnosticClock.milliseconds()
-                        )
-                    ]) { _, new in new },
-                    context: previousDiagnosticOperationContext ?? diagnosticOperationContext
-                )
-                throw TextTargetError.targetChanged
-            } else {
+            if actualSelection != expectedKeyboardSelection {
+                let age = lastKeyboardDispatch.map {
+                    Double(DispatchTime.now().uptimeNanoseconds - $0) / 1_000_000
+                } ?? -1
                 let result = try KeyboardCaretSynchronizer.wait(
                     expected: expectedKeyboardSelection, initial: actualSelection,
-                    canWait: true
+                    canWait: age >= 0 && age <= 250
                 ) {
                     try self.ensureTargetApplicationIsFrontmost()
                     let focused = try self.focusedElement()
                     guard CFEqual(focused, targetElement) else {
-                        self.recordDiagnostic("keyboard_focus_changed", ["elementSame": "false"])
+                        self.recordDiagnostic("keyboard_focus_changed")
                         throw TextTargetError.targetChanged
                     }
                     return self.readableSelection(in: focused)
                 }
                 let recovered = result.selection == expectedKeyboardSelection
-                recordDiagnostic(
-                    recovered ? "keyboard_caret_recovered" : "keyboard_wait_timeout",
-                    baseFields.merging([
-                        "waitClassification": recovered ? "recovered_after_wait" : "wait_timeout",
-                        "actualLocation": String(result.selection?.location ?? -1),
-                        "actualLength": String(result.selection?.length ?? -1),
-                        "polls": String(result.polls),
-                        "waitMilliseconds": String(result.elapsedMilliseconds),
-                        "feedbackObservedMonotonicMilliseconds": String(
-                            TextInputDiagnosticClock.milliseconds()
-                        )
-                    ]) { _, new in new },
-                    context: previousDiagnosticOperationContext ?? diagnosticOperationContext
-                )
+                recordDiagnostic(recovered ? "keyboard_caret_recovered" : "keyboard_caret_timeout", [
+                    "expectedLocation": String(expectedKeyboardSelection.location),
+                    "expectedLength": String(expectedKeyboardSelection.length),
+                    "initialLocation": String(actualSelection?.location ?? -1),
+                    "initialLength": String(actualSelection?.length ?? -1),
+                    "actualLocation": String(result.selection?.location ?? -1),
+                    "actualLength": String(result.selection?.length ?? -1),
+                    "millisecondsSinceDispatch": String(age), "waitMilliseconds": String(result.elapsedMilliseconds),
+                    "polls": String(result.polls)
+                ])
                 guard recovered else { throw TextTargetError.targetChanged }
             }
         }
@@ -497,26 +548,45 @@ final class AXTextTarget: TextTarget {
     }
 }
 
-private struct KeyboardDispatchStats {
-    var plannedKeyboardEventCount = 0
-    var postedKeyboardEventCount = 0
-    var unicodeBlockCount = 0
-    var shiftKeyEventCount = 0
-    var unicodeKeyEventCount = 0
-    var deleteKeyEventCount = 0
-    var shiftActiveDuringReplacement = false
-}
-
 private final class KeyboardEventSender: @unchecked Sendable {
+    private let stageObserver: ((String) -> Void)?
+
+    init(stageObserver: ((String) -> Void)? = nil) {
+        self.stageObserver = stageObserver
+    }
     private let queue = DispatchQueue(label: "local.tencent.voice.mvp.keyboard-events")
     private let leftArrowKeyCode: CGKeyCode = 123
     private let deleteKeyCode: CGKeyCode = 51
 
-    func send(_ text: String, processID: pid_t?) throws -> KeyboardDispatchStats {
+    func selectTrailingText(_ previousText: String, processID: pid_t?) throws {
         try queue.sync {
-            var stats = KeyboardDispatchStats()
-            try sendText(text, processID: processID, stats: &stats)
-            return stats
+            guard let source = CGEventSource(stateID: .privateState) else { throw TextTargetError.writeFailed }
+            stageObserver?("selection_post_begin")
+            for _ in previousText {
+                try sendKey(keyCode: leftArrowKeyCode, flags: .maskShift, source: source, processID: processID)
+            }
+            stageObserver?("selection_post_end")
+        }
+    }
+
+    func replaceSelection(with text: String, processID: pid_t?) throws {
+        try queue.sync {
+            stageObserver?("replacement_post_begin")
+            if text.isEmpty {
+                guard let source = CGEventSource(stateID: .privateState) else { throw TextTargetError.writeFailed }
+                try sendKey(keyCode: deleteKeyCode, source: source, processID: processID)
+            } else {
+                try sendText(text, processID: processID)
+            }
+            stageObserver?("replacement_post_end")
+        }
+    }
+
+    func send(_ text: String, processID: pid_t?) throws {
+        try queue.sync {
+            stageObserver?("append_post_begin")
+            try sendText(text, processID: processID)
+            stageObserver?("append_post_end")
         }
     }
 
@@ -524,45 +594,40 @@ private final class KeyboardEventSender: @unchecked Sendable {
         _ previousText: String,
         with text: String,
         processID: pid_t?
-    ) throws -> KeyboardDispatchStats {
+    ) throws {
         try queue.sync {
-            var stats = KeyboardDispatchStats()
             guard !previousText.isEmpty else {
-                try sendText(text, processID: processID, stats: &stats)
-                return stats
+                try sendText(text, processID: processID)
+                return
             }
             guard let source = CGEventSource(stateID: .privateState) else {
                 throw TextTargetError.writeFailed
             }
-            stats.shiftActiveDuringReplacement = true
+            stageObserver?("selection_post_begin")
             for _ in previousText {
                 try sendKey(
                     keyCode: leftArrowKeyCode,
                     flags: .maskShift,
                     source: source,
-                    processID: processID,
-                    stats: &stats
+                    processID: processID
                 )
             }
+            stageObserver?("selection_post_end")
+            stageObserver?("replacement_post_begin")
             if text.isEmpty {
                 try sendKey(
                     keyCode: deleteKeyCode,
                     source: source,
-                    processID: processID,
-                    stats: &stats
+                    processID: processID
                 )
             } else {
-                try sendText(text, processID: processID, stats: &stats)
+                try sendText(text, processID: processID)
             }
-            return stats
+            stageObserver?("replacement_post_end")
         }
     }
 
-    private func sendText(
-        _ text: String,
-        processID: pid_t?,
-        stats: inout KeyboardDispatchStats
-    ) throws {
+    private func sendText(_ text: String, processID: pid_t?) throws {
         guard !text.isEmpty else { return }
         guard let source = CGEventSource(stateID: .privateState) else {
             throw TextTargetError.writeFailed
@@ -593,11 +658,8 @@ private final class KeyboardEventSender: @unchecked Sendable {
                   ) else {
                 throw TextTargetError.writeFailed
             }
-            stats.unicodeBlockCount += 1
-            stats.unicodeKeyEventCount += 2
-            stats.plannedKeyboardEventCount += 2
-            post(keyDown, processID: processID, stats: &stats)
-            post(keyUp, processID: processID, stats: &stats)
+            post(keyDown, processID: processID)
+            post(keyUp, processID: processID)
             start = end
         }
     }
@@ -606,8 +668,7 @@ private final class KeyboardEventSender: @unchecked Sendable {
         keyCode: CGKeyCode,
         flags: CGEventFlags = [],
         source: CGEventSource,
-        processID: pid_t?,
-        stats: inout KeyboardDispatchStats
+        processID: pid_t?
     ) throws {
         guard let keyDown = SyntheticKeyboardEventFactory.keyEvent(
             source: source,
@@ -623,22 +684,11 @@ private final class KeyboardEventSender: @unchecked Sendable {
               ) else {
             throw TextTargetError.writeFailed
         }
-        stats.plannedKeyboardEventCount += 2
-        if flags.contains(.maskShift) {
-            stats.shiftKeyEventCount += 2
-        } else if keyCode == deleteKeyCode {
-            stats.deleteKeyEventCount += 2
-        }
-        post(keyDown, processID: processID, stats: &stats)
-        post(keyUp, processID: processID, stats: &stats)
+        post(keyDown, processID: processID)
+        post(keyUp, processID: processID)
     }
 
-    private func post(
-        _ event: CGEvent,
-        processID: pid_t?,
-        stats: inout KeyboardDispatchStats
-    ) {
-        stats.postedKeyboardEventCount += 1
+    private func post(_ event: CGEvent, processID: pid_t?) {
         if let processID {
             event.postToPid(processID)
         } else {

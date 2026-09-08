@@ -4,6 +4,10 @@ import AppKit
 @MainActor
 struct TencentVoiceMVPMain {
     static func main() {
+        if CommandLine.arguments.contains("--input-replay") {
+            InputReplay.start()
+            return
+        }
         let currentProcessID = ProcessInfo.processInfo.processIdentifier
         let bundleIdentifier = Bundle.main.bundleIdentifier ?? "local.tencent-voice-mvp"
         let anotherInstanceIsRunning = NSRunningApplication
