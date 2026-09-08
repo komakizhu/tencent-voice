@@ -6,15 +6,36 @@ protocol KeyboardAcknowledgingTarget: TextTarget {
     func acknowledgeKeyboardWrite() async throws
 }
 
+enum KeyboardWriteReadError: Error, Equatable {
+    case retryable
+}
+
 struct KeyboardDocumentState: Equatable {
     let text: String
     let selection: TextRange
+    let rawText: String?
+
+    init(text: String, selection: TextRange, rawText: String? = nil) {
+        self.text = text
+        self.selection = selection
+        self.rawText = rawText
+    }
 }
 
 // A deadline bounds an unresponsive target; it never defines successful delivery.
 // In particular, a matching caret with stale, same-length text is not a receipt.
 @MainActor
 enum KeyboardWriteAcknowledgement {
+    // Only used while confirming an already posted operation. An inconsistent
+    // AX snapshot is not a receipt and must never cause another keyboard post.
+    static func readObservation(_ read: () throws -> KeyboardDocumentState) throws -> KeyboardDocumentState {
+        do {
+            return try read()
+        } catch is AXTextDocumentResolutionError {
+            throw KeyboardWriteReadError.retryable
+        }
+    }
+
     static func replaceSelection(
         selected: KeyboardDocumentState,
         result: KeyboardDocumentState,
@@ -40,7 +61,13 @@ enum KeyboardWriteAcknowledgement {
         let start = now()
         while true {
             try Task.checkCancellation()
-            if try read() == expected { return }
+            do {
+                if try read() == expected { return }
+            } catch let error as KeyboardWriteReadError where error == .retryable {
+                // A renderer may expose the new caret before its AXValue. The
+                // existing acknowledgement deadline remains the only bound.
+                _ = error
+            }
             let elapsed = now() &- start
             guard elapsed < timeoutNanoseconds else { throw TextTargetError.writeFailed }
             try await sleep(min(10_000_000, timeoutNanoseconds - elapsed))

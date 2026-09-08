@@ -51,22 +51,34 @@ func sharedTextPrefix(_ lhs: String, _ rhs: String) -> String {
 struct TextSnapshot {
     let element: AXUIElement?
     let text: String
+    let rawText: String
+    let coordinateText: String
     let selection: TextRange
     let supportsAXReplacement: Bool
     let targetApplication: TextTargetApplication?
+    let placeholderNormalized: Bool
+    let coordinateMapping: AXTextCoordinateMapping?
 
     init(
         element: AXUIElement? = nil,
         text: String,
         selection: TextRange,
         supportsAXReplacement: Bool = true,
-        targetApplication: TextTargetApplication? = nil
+        targetApplication: TextTargetApplication? = nil,
+        rawText: String? = nil,
+        coordinateText: String? = nil,
+        placeholderNormalized: Bool = false,
+        coordinateMapping: AXTextCoordinateMapping? = nil
     ) {
         self.element = element
         self.text = text
+        self.rawText = rawText ?? text
+        self.coordinateText = coordinateText ?? text
         self.selection = selection
         self.supportsAXReplacement = supportsAXReplacement
         self.targetApplication = targetApplication
+        self.placeholderNormalized = placeholderNormalized
+        self.coordinateMapping = coordinateMapping
     }
 }
 

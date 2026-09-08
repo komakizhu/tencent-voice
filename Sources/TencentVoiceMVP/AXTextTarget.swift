@@ -2,12 +2,23 @@ import ApplicationServices
 import AppKit
 import Foundation
 
+private enum KeyboardDocumentStateReadError: Error {
+    case retryable
+    case unavailable
+}
+
 @MainActor
 final class AXTextTarget: KeyboardAcknowledgingTarget {
     private(set) var requiresKeyboardAcknowledgement = false
     private var confirmedKeyboardDocument: String?
     private var pendingKeyboardWrite: KeyboardDocumentState?
     private var pendingKeyboardReplacement: (selected: KeyboardDocumentState, insertion: String)?
+    private var replacementWasSent = false
+    private var confirmedKeyboardRawText: String?
+    private var confirmedKeyboardMapping: AXTextCoordinateMapping?
+    private var lastResolvedCodexDocument: AXTextDocumentState?
+    private var codexPlaceholderEvidence: AXPlaceholderEvidence?
+    private var codexAXValueFallbackAllowed = false
     private var keyboardGeneration: UInt64 = 0
     private var isCodexTarget = false
     private var targetElement: AXUIElement?
@@ -22,6 +33,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
     private var lastKeyboardDispatch: UInt64?
     private var lastAXWriteStatus: Int32?
     private var lastAXWriteKind = "none"
+    private var lastCoordinateDiagnosticKey: String?
 
     init(operationObserver: ((String) -> Void)? = nil) {
         keyboardEventSender = KeyboardEventSender(stageObserver: operationObserver)
@@ -76,6 +88,12 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         keyboardGeneration &+= 1
         pendingKeyboardWrite = nil
         pendingKeyboardReplacement = nil
+        replacementWasSent = false
+        confirmedKeyboardRawText = nil
+        confirmedKeyboardMapping = nil
+        lastResolvedCodexDocument = nil
+        codexPlaceholderEvidence = nil
+        codexAXValueFallbackAllowed = false
         confirmedKeyboardDocument = nil
         requiresKeyboardAcknowledgement = false
         diagnostics.removeAll(keepingCapacity: true)
@@ -85,6 +103,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         lastKeyboardDispatch = nil
         lastAXWriteStatus = nil
         lastAXWriteKind = "none"
+        lastCoordinateDiagnosticKey = nil
         try requestInputPermissionsIfNeeded()
         targetElement = nil
         targetProcessID = nil
@@ -115,24 +134,64 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         // Electron/web content controls do not always expose kAXValueAttribute,
         // even though they still accept Unicode keyboard events. Keep the
         // focused element as a keyboard target instead of falling all the way
-        // back to append-only mode. The keyboard append path uses the caret at
-        // capture time and never rewrites the document prefix afterwards.
-        let text = element.flatMap { readableText(in: $0) } ?? ""
+        // back to append-only mode. When Codex exposes readable text, however,
+        // its AXValue and selection coordinates must be interpreted together.
+        let rawText = element.flatMap { readableText(in: $0) }
         let readableKeyboardSelection = element.flatMap { readableSelection(in: $0) }
-        let selection = readableKeyboardSelection
-            ?? TextRange(location: text.utf16.count, length: 0)
-        let hasReadableAXTextState = element.map {
-            readableText(in: $0) != nil && readableSelection(in: $0) != nil
-        } ?? false
+        let rawSelection = readableKeyboardSelection
+            ?? TextRange(location: rawText?.utf16.count ?? 0, length: 0)
+        let hasReadableAXTextState = rawText != nil && readableKeyboardSelection != nil
+        var codexState: AXTextDocumentState?
+        if isCodexTarget, let element, let rawText, let readableKeyboardSelection {
+            let evidence = placeholderEvidence(in: element)
+            codexPlaceholderEvidence = evidence
+            do {
+                let state = try readCodexTextDocument(
+                    rawText: rawText,
+                    selection: readableKeyboardSelection,
+                    evidence: evidence,
+                    element: element
+                )
+                codexState = state
+                lastResolvedCodexDocument = state
+                recordCoordinateResolution(state: state, evidence: evidence)
+            } catch let error as AXTextDocumentResolutionError {
+                recordCoordinateResolutionFailure(
+                    error,
+                    rawText: rawText,
+                    selection: readableKeyboardSelection,
+                    evidence: evidence
+                )
+            } catch {
+                recordCoordinateResolutionFailure(
+                    .coordinateReadUnavailable,
+                    rawText: rawText,
+                    selection: readableKeyboardSelection,
+                    evidence: evidence
+                )
+            }
+        }
+        let text = codexState?.text ?? rawText ?? ""
+        let selection = codexState?.selection ?? rawSelection
         expectedKeyboardSelection = readableKeyboardSelection
         requiresKeyboardAcknowledgement = hasReadableAXTextState
-        confirmedKeyboardDocument = element.flatMap { keyboardDocument(in: $0) }
+        confirmedKeyboardDocument = if let codexState {
+            codexState.text
+        } else if !isCodexTarget, let rawText {
+            rawText
+        } else {
+            nil
+        }
+        confirmedKeyboardRawText = codexState?.rawText
+        confirmedKeyboardMapping = codexState?.mapping
         recordDiagnostic("input_target_captured", [
             "hasElement": String(element != nil), "hasReadableState": String(hasReadableAXTextState),
             "selectedSettable": String(element.map { selectedTextIsSettable(on: $0) } ?? false),
             "valueSettable": String(element.map { valueIsSettable(on: $0) } ?? false),
-            "documentLength": String(text.utf16.count), "selectionLocation": String(selection.location),
-            "selectionLength": String(selection.length),
+            "documentLength": String(text.utf16.count),
+            "axValueLengthUTF16": String(rawText?.utf16.count ?? 0),
+            "axCoordinateLengthUTF16": String(codexState?.text.utf16.count ?? text.utf16.count),
+            "selectionLocation": String(selection.location), "selectionLength": String(selection.length),
             "keyboardCompatibility": String(targetApplication?.bundleIdentifier == "com.openai.codex")
         ])
         return TextSnapshot(
@@ -142,7 +201,11 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
             supportsAXReplacement: hasReadableAXTextState && (element.map {
                 selectedTextIsSettable(on: $0) || valueIsSettable(on: $0)
             } ?? false),
-            targetApplication: targetApplication
+            targetApplication: targetApplication,
+            rawText: rawText ?? text,
+            coordinateText: codexState?.text ?? text,
+            placeholderNormalized: codexState?.placeholderNormalized ?? false,
+            coordinateMapping: codexState?.mapping
         )
     }
 
@@ -271,7 +334,11 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         }
         let receipt = try keyboardReceipt(replacing: replacementRange, with: text, previousText: previousText)
         if let receipt, let replacementRange, let document = confirmedKeyboardDocument {
-            let selected = KeyboardDocumentState(text: document, selection: replacementRange)
+            let selected = KeyboardDocumentState(
+                text: document,
+                selection: replacementRange,
+                rawText: confirmedKeyboardRawText
+            )
             let usesAXSelection = targetElement.map {
                 isAttributeSettable($0, kAXSelectedTextRangeAttribute as CFString)
             } ?? false
@@ -312,12 +379,20 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
             guard generation == self.keyboardGeneration else { throw CancellationError() }
             try self.ensureTargetApplicationIsFrontmost()
             let element = try self.focusedElement()
-            guard let targetElement = self.targetElement, CFEqual(element, targetElement),
-                  let text = self.keyboardDocument(in: element),
-                  let selection = self.readableSelection(in: element) else {
+            guard let targetElement = self.targetElement, CFEqual(element, targetElement) else {
                 throw TextTargetError.targetChanged
             }
-            return KeyboardDocumentState(text: text, selection: selection)
+            do {
+                return try KeyboardWriteAcknowledgement.readObservation {
+                    try self.keyboardDocumentState(in: element, confirming: true)
+                }
+            } catch KeyboardWriteReadError.retryable {
+                throw KeyboardWriteReadError.retryable
+            } catch KeyboardDocumentStateReadError.retryable {
+                throw KeyboardWriteReadError.retryable
+            } catch {
+                throw TextTargetError.targetChanged
+            }
         }
         do {
             if let replacement = pendingKeyboardReplacement {
@@ -329,6 +404,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
                         context: self.previousDiagnosticOperationContext
                     )
                     try self.keyboardEventSender.replaceSelection(with: replacement.insertion, processID: self.eventProcessID)
+                    self.replacementWasSent = true
                     self.lastKeyboardDispatch = DispatchTime.now().uptimeNanoseconds
                     self.recordDiagnostic(
                         "keyboard_replacement_submitted",
@@ -341,8 +417,16 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
             guard generation == keyboardGeneration else { throw CancellationError() }
             confirmedKeyboardDocument = receipt.text
             expectedKeyboardSelection = receipt.selection
+            if self.isCodexTarget, let resolved = self.lastResolvedCodexDocument {
+                confirmedKeyboardRawText = resolved.rawText
+                confirmedKeyboardMapping = resolved.mapping
+            } else {
+                confirmedKeyboardRawText = receipt.rawText
+                confirmedKeyboardMapping = nil
+            }
             pendingKeyboardWrite = nil
             pendingKeyboardReplacement = nil
+            replacementWasSent = false
             recordDiagnostic("keyboard_write_acknowledged", [
                 "elapsedMilliseconds": String((DispatchTime.now().uptimeNanoseconds - start) / 1_000_000),
                 "documentMatches": "true", "selectionMatches": "true"
@@ -370,19 +454,117 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         }
         let result = NSMutableString(string: document)
         result.replaceCharacters(in: nsRange, with: text)
+        let rawResult: String?
+        if isCodexTarget {
+            guard let rawDocument = confirmedKeyboardRawText,
+                  let mapping = confirmedKeyboardMapping,
+                  let rawRange = mapping.rawRange(for: range),
+                  rawRange.location >= 0,
+                  rawRange.length >= 0,
+                  rawRange.location <= rawDocument.utf16.count,
+                  rawRange.length <= rawDocument.utf16.count - rawRange.location else {
+                throw TextTargetError.targetChanged
+            }
+            let raw = NSMutableString(string: rawDocument)
+            raw.replaceCharacters(
+                in: NSRange(location: rawRange.location, length: rawRange.length),
+                with: text
+            )
+            rawResult = raw as String
+        } else {
+            rawResult = nil
+        }
         return KeyboardDocumentState(text: result as String,
-                                     selection: TextRange(location: range.location + text.utf16.count, length: 0))
+                                     selection: TextRange(location: range.location + text.utf16.count, length: 0),
+                                     rawText: rawResult)
     }
 
-    private func keyboardDocument(in element: AXUIElement) -> String? {
-        guard let value = readableText(in: element) else { return nil }
-        if isCodexTarget, readableSelection(in: element) == TextRange(location: 0, length: 0) {
-            let placeholder = (try? attribute("AXPlaceholderValue", from: element)) as? String
-            let description = (try? attribute(kAXDescriptionAttribute, from: element)) as? String
-            if let placeholder, !placeholder.isEmpty, value == placeholder { return "" }
-            if let description, !description.isEmpty, value == "\n" + description { return "" }
+    private func keyboardDocumentState(in element: AXUIElement, confirming: Bool = false) throws -> KeyboardDocumentState {
+        guard let rawText = readableText(in: element),
+              let selection = readableSelection(in: element) else {
+            throw KeyboardDocumentStateReadError.unavailable
         }
-        return value
+        if isCodexTarget {
+            if AXTextDocumentResolver.isStaleAXValueBehindSelection(
+                rawText: rawText,
+                selection: selection,
+                confirmedRawText: confirmedKeyboardRawText,
+                expectedSelection: pendingKeyboardWrite?.selection
+            ) {
+                let key = "retryable:\(rawText.utf16.count):\(selection.location)"
+                if key != lastCoordinateDiagnosticKey {
+                    lastCoordinateDiagnosticKey = key
+                    recordDiagnostic("ax_coordinate_mapping_retryable", [
+                        "reason": "ax_value_stale_behind_selection",
+                        "axValueLengthUTF16": String(rawText.utf16.count),
+                        "selectionLocation": String(selection.location),
+                        "selectionLength": String(selection.length)
+                    ])
+                }
+                throw KeyboardDocumentStateReadError.retryable
+            }
+            let evidence = codexPlaceholderEvidence ?? placeholderEvidence(in: element)
+            do {
+                let document = try AXTextDocumentResolver.readDuringReplacement(
+                    rawText: rawText,
+                    selection: selection,
+                    acknowledgedSelection: replacementWasSent ? pendingKeyboardReplacement?.selected : nil
+                ) {
+                    try readCodexTextDocument(
+                        rawText: rawText, selection: selection, evidence: evidence, element: element
+                    )
+                }
+                lastResolvedCodexDocument = document
+                return KeyboardDocumentState(
+                    text: document.text,
+                    selection: document.selection,
+                    rawText: document.rawText
+                )
+            } catch KeyboardWriteReadError.retryable {
+                recordDiagnostic("ax_coordinate_mapping_retryable", [
+                    "reason": "replacement_previous_selection_still_visible",
+                    "axValueLengthUTF16": String(rawText.utf16.count),
+                    "selectionLocation": String(selection.location),
+                    "selectionLength": String(selection.length)
+                ])
+                throw KeyboardDocumentStateReadError.retryable
+            } catch let error as AXTextDocumentResolutionError {
+                if error == .coordinateReadUnavailable,
+                   let previous = lastResolvedCodexDocument,
+                   let document = try? AXTextDocumentResolver.resolveUsingValidatedAXValueAfterPlaceholder(
+                       rawText: rawText,
+                       selection: selection,
+                       previousState: previous,
+                       continuationAllowed: codexAXValueFallbackAllowed
+                   ) {
+                    codexAXValueFallbackAllowed = true
+                    lastResolvedCodexDocument = document
+                    recordCoordinateResolution(state: document, evidence: evidence)
+                    return KeyboardDocumentState(
+                        text: document.text,
+                        selection: document.selection,
+                        rawText: document.rawText
+                    )
+                }
+                recordCoordinateResolutionFailure(
+                    error,
+                    rawText: rawText,
+                    selection: selection,
+                    evidence: evidence,
+                    confirming: confirming
+                )
+                throw error
+            } catch {
+                recordCoordinateResolutionFailure(
+                    .coordinateReadUnavailable,
+                    rawText: rawText,
+                    selection: selection,
+                    evidence: evidence
+                )
+                throw KeyboardDocumentStateReadError.unavailable
+            }
+        }
+        return KeyboardDocumentState(text: rawText, selection: selection)
     }
 
     func copyToClipboard(_ text: String) throws {
@@ -438,8 +620,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         }
         if requiresKeyboardAcknowledgement {
             guard pendingKeyboardWrite == nil else { throw TextTargetError.writeFailed }
-            guard keyboardDocument(in: currentElement) == confirmedKeyboardDocument,
-                  readableSelection(in: currentElement) == expectedKeyboardSelection else {
+            guard let currentState = try? keyboardDocumentState(in: currentElement),
+                  currentState.text == confirmedKeyboardDocument,
+                  currentState.selection == expectedKeyboardSelection,
+                  !isCodexTarget || currentState.rawText == confirmedKeyboardRawText else {
                 recordDiagnostic("keyboard_confirmed_state_changed")
                 throw TextTargetError.targetChanged
             }
@@ -508,6 +692,159 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         if let text = value as? String { return text }
         if let attributedText = value as? NSAttributedString { return attributedText.string }
         return nil
+    }
+
+    private func readCodexTextDocument(
+        rawText: String,
+        selection: TextRange,
+        evidence: AXPlaceholderEvidence,
+        element: AXUIElement
+    ) throws -> AXTextDocumentState {
+        let probe = AXTextCoordinateProbe { [weak self] range in
+            self?.readAXString(for: range, from: element)
+        }
+        return try AXTextDocumentResolver.resolve(
+            rawText: rawText,
+            selection: selection,
+            placeholderEvidence: evidence,
+            probe: probe
+        )
+    }
+
+    private func readAXString(for range: TextRange, from element: AXUIElement) -> String? {
+        var cfRange = CFRange(location: range.location, length: range.length)
+        guard let rangeValue = AXValueCreate(.cfRange, &cfRange) else { return nil }
+        var result: CFTypeRef?
+        let status = AXUIElementCopyParameterizedAttributeValue(
+            element,
+            kAXStringForRangeParameterizedAttribute as CFString,
+            rangeValue,
+            &result
+        )
+        guard status == .success, let result else { return nil }
+        if let text = result as? String { return text }
+        if let attributedText = result as? NSAttributedString { return attributedText.string }
+        return nil
+    }
+
+    private func placeholderEvidence(in element: AXUIElement) -> AXPlaceholderEvidence {
+        let explicitPlaceholder = stringAttribute("AXPlaceholderValue", from: element)
+        var markedTexts: [String] = []
+        var unmarkedTexts: [String] = []
+        var visitedCount = 0
+
+        func visit(
+            _ node: AXUIElement,
+            depth: Int,
+            inheritedPlaceholder: Bool,
+            isRoot: Bool
+        ) {
+            guard depth <= 6, visitedCount < 64 else { return }
+            visitedCount += 1
+            let marked = inheritedPlaceholder || classTokens(in: node).contains("placeholder")
+            if !isRoot,
+               stringAttribute("AXRole", from: node) == "AXStaticText",
+               let text = stringAttribute(kAXValueAttribute, from: node),
+               !text.isEmpty {
+                if marked {
+                    markedTexts.append(text)
+                } else {
+                    unmarkedTexts.append(text)
+                }
+            }
+            for child in childElements(in: node) {
+                visit(child, depth: depth + 1, inheritedPlaceholder: marked, isRoot: false)
+            }
+        }
+
+        visit(element, depth: 0, inheritedPlaceholder: false, isRoot: true)
+        return AXPlaceholderEvidence(
+            explicitPlaceholder: explicitPlaceholder,
+            markedTexts: markedTexts,
+            unmarkedTexts: unmarkedTexts
+        )
+    }
+
+    private func childElements(in element: AXUIElement) -> [AXUIElement] {
+        guard let value = try? attribute("AXChildren", from: element) else { return [] }
+        return value as? [AXUIElement] ?? []
+    }
+
+    private func stringAttribute(_ name: String, from element: AXUIElement) -> String? {
+        guard let value = try? attribute(name, from: element) else { return nil }
+        if let text = value as? String { return text }
+        if let attributedText = value as? NSAttributedString { return attributedText.string }
+        return nil
+    }
+
+    private func classTokens(in element: AXUIElement) -> Set<String> {
+        guard let value = try? attribute("AXDOMClassList", from: element) else { return [] }
+        if let values = value as? [String] {
+            return Set(values.flatMap { classTokens(in: $0) })
+        }
+        return classTokens(in: String(describing: value))
+    }
+
+    private func classTokens(in value: String) -> Set<String> {
+        Set(
+            value
+                .split { character in
+                    !(character.isLetter || character.isNumber)
+                }
+                .map { $0.lowercased() }
+        )
+    }
+
+    private func recordCoordinateResolution(
+        state: AXTextDocumentState,
+        evidence: AXPlaceholderEvidence
+    ) {
+        let key = "resolved:\(state.mapping.source.rawValue):\(state.mapping.coordinateDocumentLength)"
+        guard key != lastCoordinateDiagnosticKey else { return }
+        lastCoordinateDiagnosticKey = key
+        recordDiagnostic("ax_coordinate_mapping_resolved", [
+            "coordinateSource": state.mapping.source.rawValue,
+            "placeholderNormalized": String(state.placeholderNormalized),
+            "axValueLengthUTF16": String(state.mapping.rawDocumentLength),
+            "axCoordinateLengthUTF16": String(state.mapping.coordinateDocumentLength),
+            "omittedStructuralSeparatorCount": String(state.mapping.omittedStructuralSeparatorCount),
+            "placeholderAttributePresent": String(evidence.explicitPlaceholder?.isEmpty == false),
+            "placeholderMarkedNodeCount": String(evidence.markedTexts.count),
+            "placeholderOtherNodeCount": String(evidence.unmarkedTexts.filter { !$0.isEmpty }.count)
+        ])
+    }
+
+    private func recordCoordinateResolutionFailure(
+        _ error: AXTextDocumentResolutionError,
+        rawText: String,
+        selection: TextRange,
+        evidence: AXPlaceholderEvidence,
+        confirming: Bool = false
+    ) {
+        let reason = coordinateResolutionCode(for: error)
+        let key = "failed:\(reason):\(rawText.utf16.count):\(selection.location):\(selection.length)"
+        guard key != lastCoordinateDiagnosticKey else { return }
+        lastCoordinateDiagnosticKey = key
+        recordDiagnostic(confirming ? "ax_coordinate_mapping_retryable" : "ax_coordinate_mapping_failed", [
+            "reason": reason,
+            "axValueLengthUTF16": String(rawText.utf16.count),
+            "selectionLocation": String(selection.location),
+            "selectionLength": String(selection.length),
+            "placeholderAttributePresent": String(evidence.explicitPlaceholder?.isEmpty == false),
+            "placeholderMarkedNodeCount": String(evidence.markedTexts.count),
+            "placeholderOtherNodeCount": String(evidence.unmarkedTexts.filter { !$0.isEmpty }.count)
+        ])
+    }
+
+    private func coordinateResolutionCode(for error: AXTextDocumentResolutionError) -> String {
+        switch error {
+        case .invalidSelection: return "invalid_selection"
+        case .coordinateReadUnavailable: return "coordinate_read_unavailable"
+        case .coordinateLengthMismatch: return "coordinate_length_mismatch"
+        case .coordinateTextMismatch: return "coordinate_text_mismatch"
+        case .selectionOutOfBounds: return "selection_out_of_bounds"
+        case .selectedRangeUnavailable: return "selected_range_unavailable"
+        }
     }
 
     private func readableSelection(in element: AXUIElement) -> TextRange? {

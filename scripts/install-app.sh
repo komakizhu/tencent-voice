@@ -40,6 +40,7 @@ for pid in ${(f)"$(pgrep -x TencentVoiceMVP 2>/dev/null || true)"}; do
   process_command="$(ps -o command= -p "${pid}" 2>/dev/null)"
   if [[ "${process_user}" == "${current_user}" \
     && ("${process_command}" == */Rime\ Voice.app/Contents/MacOS/TencentVoiceMVP* \
+      || "${process_command}" == */Rime\ Voice\ Replay.app/Contents/MacOS/TencentVoiceMVP* \
       || "${process_command}" == */TencentVoiceMVP.app/Contents/MacOS/TencentVoiceMVP*) ]]; then
     kill "${pid}"
   fi

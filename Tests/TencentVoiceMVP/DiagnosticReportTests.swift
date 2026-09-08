@@ -134,6 +134,62 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertFalse(json.contains("PRIVATE_BODY"))
     }
 
+    func testReportIncludesCoordinateDiagnosticsWithoutInputText() {
+        let session = UUID()
+        let report = DiagnosticReport(
+            app: appInfo(),
+            permissions: PrivacyPermissionReport(statuses: []),
+            credentials: DiagnosticCredentialInfo(state: .configured, detail: "configured"),
+            settings: DiagnosticSettingsInfo(
+                shortcut: "test", engineModelType: "test", persistentSessionLogEnabled: true
+            ),
+            events: [
+                SessionLogEntry(
+                    sessionID: session,
+                    event: "ax_coordinate_mapping_resolved",
+                    metadata: [
+                        "coordinateSource": "axStringForRange",
+                        "axValueLengthUTF16": "8",
+                        "axCoordinateLengthUTF16": "0",
+                        "placeholderNormalized": "true",
+                        "omittedStructuralSeparatorCount": "8"
+                    ]
+                ),
+                SessionLogEntry(
+                    sessionID: session,
+                    event: "ax_coordinate_mapping_retryable",
+                    metadata: [
+                        "reason": "ax_value_stale_behind_selection",
+                        "axValueLengthUTF16": "6",
+                        "selectionLocation": "7"
+                    ]
+                ),
+                SessionLogEntry(
+                    sessionID: session,
+                    event: "ax_coordinate_mapping_failed",
+                    metadata: [
+                        "reason": "coordinate_text_mismatch",
+                        "axValueLengthUTF16": "7",
+                        "selectionLocation": "6"
+                    ]
+                )
+            ],
+            logDirectoryPath: "/tmp/logs"
+        )
+
+        XCTAssertTrue(report.findings.contains { $0.code == "ax_coordinate_mapping_resolved" })
+        XCTAssertTrue(report.findings.contains { $0.code == "ax_coordinate_mapping_retryable" })
+        XCTAssertTrue(report.findings.contains { $0.code == "ax_coordinate_mapping_failed" })
+        XCTAssertEqual(
+            report.findings.first { $0.code == "ax_coordinate_mapping_resolved" }?.level,
+            .info
+        )
+        let rendered = report.renderedText()
+        XCTAssertTrue(rendered.contains("axValueLengthUTF16=7"))
+        XCTAssertTrue(rendered.contains("coordinate_text_mismatch"))
+        XCTAssertFalse(rendered.contains("添加可选评论"))
+    }
+
     func testReportExplainsSafeCopyTriggerWithoutRecognizedText() {
         let report = DiagnosticReport(
             generatedAt: Date(timeIntervalSince1970: 1_700_000_000),

@@ -257,6 +257,9 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
                 "ax_selection_mismatch": "AX 光标或文本替换范围不符合预期。",
                 "ax_selection_unreadable": "无法取得有效的 AX 光标范围。",
                 "ax_value_unreadable": "AX 未提供可读取的文本值。",
+                "ax_coordinate_mapping_resolved": "已使用 AX 坐标文本确认当前输入框状态；报告只记录长度和映射来源，不记录正文。",
+                "ax_coordinate_mapping_retryable": "AXValue 暂时落后于已前进的选区，确认器按既有确认上限重读；未重复发送文字。",
+                "ax_coordinate_mapping_failed": "AX 文本与选区坐标无法安全统一，已停止继续写入；具体原因和长度信息已记录。",
                 "ax_write_failed": "AX 写入接口返回失败，具体属性和返回码已记录。",
                 "ax_read_failed": "AX 读取接口返回失败，具体属性和返回码已记录。"
             ]
@@ -268,7 +271,10 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
                     values += "；等待耗时分布：\(waitDistribution(matching))"
                 }
                 findings.append(DiagnosticFinding(
-                    level: ["keyboard_caret_recovered", "keyboard_caret_observed"].contains(code)
+                    level: [
+                        "keyboard_caret_recovered", "keyboard_caret_observed", "ax_coordinate_mapping_resolved",
+                        "ax_coordinate_mapping_retryable"
+                    ].contains(code)
                         ? .info
                         : .warning,
                     code: code,
@@ -446,6 +452,9 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
             "operationTrigger", "waitClassification", "waitSkippedReason", "lastDispatchAgeMilliseconds",
             "waitBudgetMilliseconds", "waitQualificationMaxAgeMilliseconds", "waitMilliseconds", "polls",
             "feedbackObservedMonotonicMilliseconds",
+            "reason", "coordinateSource", "placeholderNormalized", "axValueLengthUTF16",
+            "axCoordinateLengthUTF16", "omittedStructuralSeparatorCount", "placeholderAttributePresent",
+            "placeholderMarkedNodeCount", "placeholderOtherNodeCount",
             "expectedLocation", "expectedLength", "initialLocation", "actualLocation", "actualLength",
             "desiredLengthCharacters", "desiredLengthUTF16", "submittedLengthCharacters",
             "submittedLengthUTF16", "observedLengthCharacters", "observedLengthUTF16",

@@ -110,6 +110,31 @@ final class AcknowledgedKeyboardWriterTests: XCTestCase {
         XCTAssertGreaterThan(reads, 1)
     }
 
+    func testRetryableAXValueReadWaitsForValueToCatchUp() async throws {
+        var clock: UInt64 = 0
+        var reads = 0
+        let expected = KeyboardDocumentState(text: "abcdefg", selection: .init(location: 7, length: 0))
+
+        try await KeyboardWriteAcknowledgement.wait(
+            for: expected,
+            now: { clock },
+            sleep: { clock += $0 },
+            read: {
+                reads += 1
+                if reads == 1 {
+                    // The real AX adapter has already observed the advanced
+                    // caret, while AXValue still contains the six-character
+                    // pre-write document.
+                    throw KeyboardWriteReadError.retryable
+                }
+                return expected
+            }
+        )
+
+        XCTAssertEqual(reads, 2)
+        XCTAssertEqual(clock, 10_000_000)
+    }
+
     func testUnresponsiveDocumentTimesOutWithoutAssumingSuccess() async {
         var clock: UInt64 = 0
         do {
@@ -122,6 +147,26 @@ final class AcknowledgedKeyboardWriterTests: XCTestCase {
             XCTAssertEqual((error as? TextTargetError)?.diagnosticCode, "text_target_write_failed")
         }
         XCTAssertEqual(clock, 500_000_000)
+    }
+
+    func testTransientReadsStillRespectDeadlineAndFocusFailure() async {
+        for focusChanges in [false, true] {
+            var clock: UInt64 = 0
+            do {
+                try await KeyboardWriteAcknowledgement.wait(
+                    for: .init(text: "结果", selection: .init(location: 2, length: 0)),
+                    timeoutNanoseconds: 20_000_000, now: { clock }, sleep: { clock += $0 }
+                ) {
+                    if focusChanges && clock > 0 { throw TextTargetError.targetChanged }
+                    throw KeyboardWriteReadError.retryable
+                }
+                XCTFail("Unconfirmed text must never be accepted")
+            } catch {
+                XCTAssertEqual((error as? TextTargetError)?.diagnosticCode,
+                               focusChanges ? "text_target_changed" : "text_target_write_failed")
+            }
+            XCTAssertEqual(clock, focusChanges ? 10_000_000 : 20_000_000)
+        }
     }
 
     private func settle() async { for _ in 0..<30 { await Task.yield() } }
