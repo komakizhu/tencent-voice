@@ -101,6 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 case .idle: "idle"
                 case .connecting: "connecting"
                 case .listening: "listening"
+                case .recovering: "recovering"
                 case .stopping: "stopping"
                 case .error: "error"
                 }
@@ -111,12 +112,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 case .idle: menu.update(status: "就绪")
                 case .connecting: menu.update(status: "连接中…")
                 case .listening: menu.update(status: "录音中…")
+                case .recovering: menu.update(status: "麦克风恢复中…")
                 case .stopping: menu.update(status: "收尾中…")
                 case let .error(message): menu.update(status: "错误：\(message)")
                 }
             }
         )
         super.init()
+        coordinator.setStateObserver { [weak self] state in
+            guard case .error = state else { return }
+            self?.endTrackedUsageSession()
+            self?.updateLocalUsageDisplay()
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -575,6 +582,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .idle: "idle"
         case .connecting: "connecting"
         case .listening: "listening"
+        case .recovering: "recovering"
         case .stopping: "stopping"
         case .error: "error"
         }
@@ -583,20 +591,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
         switch coordinator.state {
         case .idle:
-            let engineModelType = settingsStore.load().engineModelType
-            try? await coordinator.begin()
-            if coordinator.state == .listening {
-                guard let credentials = loadCredentials() else { return }
-                activeUsageSessionID = try? sharedUsageStore.beginSession(
-                    for: credentials,
-                    engineModelType: engineModelType
-                )
-                updateLocalUsageDisplay()
-            }
+            await beginRecording()
         case .connecting:
             coordinator.cancel()
             updateLocalUsageDisplay()
         case .listening:
+            let endingUsageSessionID = activeUsageSessionID
+            let stoppedAt = Date()
+            try? await coordinator.end()
+            if activeUsageSessionID == endingUsageSessionID {
+                endTrackedUsageSession(at: stoppedAt)
+                updateLocalUsageDisplay()
+            }
+        case .recovering:
             let endingUsageSessionID = activeUsageSessionID
             let stoppedAt = Date()
             try? await coordinator.end()
@@ -612,7 +619,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             coordinator.cancel()
             endTrackedUsageSession()
             updateLocalUsageDisplay()
+            await beginRecording()
         }
+    }
+
+    private func beginRecording() async {
+        let engineModelType = settingsStore.load().engineModelType
+        try? await coordinator.begin()
+        guard coordinator.state == .listening || coordinator.state == .recovering,
+              let credentials = loadCredentials() else { return }
+        activeUsageSessionID = try? sharedUsageStore.beginSession(
+            for: credentials,
+            engineModelType: engineModelType
+        )
+        updateLocalUsageDisplay()
     }
 
     private func loadCredentials() -> TencentCredentials? {

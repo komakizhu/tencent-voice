@@ -56,8 +56,16 @@ enum DiagnosticErrorFormatter {
             return "没有可用的麦克风输入"
         case "microphone_converter_unavailable":
             return "无法把麦克风转换为 16 kHz PCM"
+        case "microphone_invalid_input_format":
+            return "麦克风音频格式暂时不可用"
+        case "microphone_tap_installation_failed":
+            return "麦克风音频采集安装失败"
         case "microphone_engine_start_failed":
             return "麦克风启动失败（系统错误详情已隐藏）"
+        case "microphone_conversion_failed":
+            return "麦克风音频转换失败"
+        case "microphone_recovery_timed_out":
+            return "麦克风设备切换后未能恢复"
         case "tencent_asr_invalid_url":
             return "腾讯 ASR 地址无效"
         case "tencent_asr_handshake_timeout":

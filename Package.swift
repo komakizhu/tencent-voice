@@ -16,8 +16,16 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "TencentVoiceMVP",
-            dependencies: ["RimeSyncCore"],
+            dependencies: ["RimeSyncCore", "AudioCaptureSupport"],
             path: "Sources/TencentVoiceMVP"
+        ),
+        .target(
+            name: "AudioCaptureSupport",
+            path: "Sources/AudioCaptureSupport",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("AVFoundation")
+            ]
         ),
         .target(
             name: "RimeSyncCore",
