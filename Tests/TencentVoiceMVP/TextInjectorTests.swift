@@ -698,6 +698,37 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertEqual(target.pastedTexts, ["第一当前"])
     }
 
+    func testInputOperationDiagnosticsIncludeRevisionMetricsAndMonotonicPhases() throws {
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let injector = TextInjector(target: target)
+        let initial = "这是很长很长的旧候选文字，后面仍然有很多内容"
+        let revised = "这是完全不同的新候选文字，后面仍然有很多内容"
+
+        try injector.begin()
+        injector.apply(projection: projection(committed: "", active: initial, id: 1, revision: 87))
+        injector.apply(projection: projection(committed: "", active: revised, id: 1, revision: 88))
+
+        let diagnostics = injector.drainDiagnostics()
+        let operation = try XCTUnwrap(
+            diagnostics.first {
+                $0.event == "input_operation" && $0.fields["revision"] == "88"
+            }
+        )
+        XCTAssertEqual(operation.fields["operationType"], "tail_replacement")
+        XCTAssertEqual(operation.fields["operationID"], "2")
+        XCTAssertEqual(operation.fields["revision"], "88")
+        XCTAssertEqual(operation.fields["segmentPhase"], "partial")
+        XCTAssertEqual(operation.fields["characterUnit"], "Character")
+        XCTAssertEqual(operation.fields["utf16Unit"], "UTF16")
+        XCTAssertEqual(operation.fields["previousTailLengthCharacters"], "20")
+        XCTAssertEqual(operation.fields["replacementTailLengthCharacters"], "20")
+        XCTAssertNotNil(operation.fields["operationCreatedMonotonicMilliseconds"])
+        XCTAssertNotNil(operation.fields["dispatchStartedMonotonicMilliseconds"])
+        XCTAssertNotNil(operation.fields["dispatchEndedMonotonicMilliseconds"])
+        XCTAssertNotNil(operation.fields["operationCompletedMonotonicMilliseconds"])
+        XCTAssertEqual(operation.fields["writeCountMeaning"], "submission_call_not_target_confirmation")
+    }
+
     private func settle() async {
         for _ in 0..<10 {
             await Task.yield()

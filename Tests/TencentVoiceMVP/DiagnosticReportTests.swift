@@ -3,6 +3,137 @@ import XCTest
 
 @MainActor
 final class DiagnosticReportTests: XCTestCase {
+    func testReportSeparatesWaitSkippedFromActualTimeoutAndShowsOperationContext() throws {
+        let session = UUID()
+        let events = [
+            SessionLogEntry(
+                sessionID: session,
+                event: "input_operation",
+                metadata: [
+                    "operationID": "7",
+                    "operationType": "tail_replacement",
+                    "operationStatus": "submitted",
+                    "operationTrigger": "partial",
+                    "segmentID": "1",
+                    "revision": "88",
+                    "segmentPhase": "partial",
+                    "desiredLengthCharacters": "305",
+                    "desiredLengthUTF16": "305",
+                    "submittedLengthCharacters": "302",
+                    "submittedLengthUTF16": "302",
+                    "commonPrefixLengthCharacters": "199",
+                    "commonPrefixLengthUTF16": "199",
+                    "previousTailLengthCharacters": "103",
+                    "previousTailLengthUTF16": "103",
+                    "replacementTailLengthCharacters": "104",
+                    "replacementTailLengthUTF16": "104",
+                    "characterUnit": "Character",
+                    "utf16Unit": "UTF16",
+                    "operationCreatedMonotonicMilliseconds": "1000",
+                    "operationQueuedMonotonicMilliseconds": "1000",
+                    "dispatchStartedMonotonicMilliseconds": "1001",
+                    "dispatchEndedMonotonicMilliseconds": "1002",
+                    "feedbackObservedMonotonicMilliseconds": "unknown",
+                    "operationCompletedMonotonicMilliseconds": "1002",
+                    "plannedSelectionLocation": "302",
+                    "plannedSelectionLength": "103",
+                    "expectedEndLocation": "303",
+                    "writeCountMeaning": "submission_call_not_target_confirmation"
+                ]
+            ),
+            SessionLogEntry(
+                sessionID: session,
+                event: "keyboard_wait_skipped",
+                metadata: [
+                    "operationID": "7",
+                    "waitClassification": "wait_skipped",
+                    "waitSkippedReason": "dispatch_age_exceeded",
+                    "lastDispatchAgeMilliseconds": "333.471",
+                    "waitBudgetMilliseconds": "150",
+                    "waitQualificationMaxAgeMilliseconds": "250",
+                    "polls": "0",
+                    "waitMilliseconds": "0",
+                    "expectedLocation": "302",
+                    "expectedLength": "0",
+                    "actualLocation": "199",
+                    "actualLength": "104"
+                ]
+            ),
+            SessionLogEntry(
+                sessionID: session,
+                event: "keyboard_wait_timeout",
+                metadata: [
+                    "operationID": "6",
+                    "waitClassification": "wait_timeout",
+                    "lastDispatchAgeMilliseconds": "29.782",
+                    "waitBudgetMilliseconds": "150",
+                    "polls": "15",
+                    "waitMilliseconds": "150",
+                    "expectedLocation": "128",
+                    "actualLocation": "127"
+                ]
+            )
+        ]
+        let report = DiagnosticReport(
+            app: appInfo(), permissions: PrivacyPermissionReport(statuses: []),
+            credentials: DiagnosticCredentialInfo(state: .configured, detail: "configured"),
+            settings: DiagnosticSettingsInfo(
+                shortcut: "test", engineModelType: "test", persistentSessionLogEnabled: true
+            ),
+            events: events,
+            logDirectoryPath: "/tmp/logs"
+        )
+
+        XCTAssertTrue(report.findings.contains { $0.code == "keyboard_wait_skipped" })
+        XCTAssertTrue(report.findings.contains { $0.code == "keyboard_wait_timeout" })
+        XCTAssertFalse(report.findings.contains { $0.code == "keyboard_caret_timeout" })
+        let text = report.renderedText()
+        XCTAssertTrue(text.contains("未进入等待"))
+        XCTAssertTrue(text.contains("333.471"))
+        XCTAssertTrue(text.contains("实际等待"))
+        XCTAssertTrue(text.contains("operation=7"))
+        XCTAssertTrue(text.contains("Character"))
+        XCTAssertTrue(text.contains("UTF16"))
+        XCTAssertTrue(text.contains("submission_call_not_target_confirmation"))
+    }
+
+    func testInputDiagnosticsUseUnifiedReportAndExistingPersistenceSwitch() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let session = UUID()
+        let events = [
+            SessionLogEntry(sessionID: session, event: "keyboard_caret_recovered", metadata: [
+                "expectedLocation": "128", "initialLocation": "127", "actualLocation": "128",
+                "waitMilliseconds": "50", "sourceBuild": "66", "recognizedText": "PRIVATE_BODY"
+            ]),
+            SessionLogEntry(sessionID: session, event: "ax_document_mismatch", metadata: [
+                "expectedDocumentLength": "7", "actualDocumentLength": "5", "lastAXStatus": "0"
+            ]),
+            SessionLogEntry(sessionID: session, event: "keyboard_caret_timeout")
+        ]
+        var enabled = false
+        let logger = SessionLogger(enabled: { enabled }, applicationSupportDirectoryURL: directory)
+        for event in events { try logger.append(event) }
+        XCTAssertTrue(logger.allPersistedEntries().isEmpty)
+        XCTAssertEqual(logger.recentEntries().count, 3)
+        enabled = true
+        for event in events { try logger.append(event) }
+        let report = DiagnosticReport(
+            app: appInfo(), permissions: PrivacyPermissionReport(statuses: []),
+            credentials: DiagnosticCredentialInfo(state: .configured, detail: "configured"),
+            settings: DiagnosticSettingsInfo(shortcut: "test", engineModelType: "test", persistentSessionLogEnabled: true),
+            events: logger.allPersistedEntries(), logDirectoryPath: directory.path
+        )
+        XCTAssertEqual(report.findings.first { $0.code == "keyboard_caret_recovered" }?.level, .info)
+        XCTAssertTrue(report.findings.contains { $0.code == "ax_document_mismatch" })
+        XCTAssertTrue(report.findings.contains { $0.code == "keyboard_caret_timeout" })
+        XCTAssertTrue(report.renderedText().contains("expectedLocation=128"))
+        XCTAssertTrue(report.renderedText().contains("lastAXStatus=0"))
+        let json = String(decoding: try DiagnosticJSON.encoder().encode(report), as: UTF8.self)
+        XCTAssertTrue(json.contains("keyboard_caret_recovered"))
+        XCTAssertFalse(json.contains("PRIVATE_BODY"))
+    }
+
     func testReportExplainsSafeCopyTriggerWithoutRecognizedText() {
         let report = DiagnosticReport(
             generatedAt: Date(timeIntervalSince1970: 1_700_000_000),
