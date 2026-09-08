@@ -696,6 +696,90 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(target.text, "原文安全复制结果")
         XCTAssertEqual(target.copiedText, "安全复制结果")
     }
+
+    func testInputDiagnosticsFlowFromASRThroughLoggerIntoReport() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVP-InputDiagnostics-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let asr = FakeRealtimeASRClient()
+        let logger = SessionLogger(
+            enabled: { true },
+            applicationSupportDirectoryURL: directory
+        )
+        let coordinator = SessionCoordinator(
+            asr: asr,
+            audio: FakeAudioCapture(),
+            textTarget: FakeTextTarget(text: "", supportsAXReplacement: false),
+            settingsStore: UserDefaultsSettingsStore(
+                suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"
+            ),
+            credentialStore: InMemoryCredentialStore(
+                TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+            ),
+            logger: logger,
+            keyboardSmoothing: .immediate,
+            onStateChange: { _ in }
+        )
+
+        try await coordinator.begin()
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 87,
+            segmentText: "旧候选",
+            phase: .partial
+        ))
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 88,
+            segmentText: "新候选",
+            phase: .partial
+        ))
+        await settleCoordinator()
+        coordinator.cancel()
+
+        let entries = logger.allPersistedEntries()
+        let operation = try XCTUnwrap(entries.first {
+            $0.event == "input_operation" && $0.revision == 2
+        })
+        XCTAssertEqual(operation.segmentID, 1)
+        XCTAssertEqual(operation.revision, 2)
+        XCTAssertEqual(operation.metadata["operationID"], "2")
+        XCTAssertEqual(operation.metadata["operationType"], "tail_replacement")
+        XCTAssertNotNil(operation.metadata["sourceAppPath"])
+        XCTAssertNotNil(operation.metadata["sourceBuild"])
+
+        let report = DiagnosticReport(
+            app: DiagnosticAppInfo(
+                displayName: "Rime Voice",
+                bundleIdentifier: "local.tencent-voice-mvp",
+                shortVersion: "0.2.3",
+                build: "test",
+                bundlePath: "/tmp/Rime Voice.app",
+                executablePath: "/tmp/Rime Voice.app/Contents/MacOS/TencentVoiceMVP",
+                bundleModificationDate: nil,
+                processIdentifier: 1,
+                processLaunchDate: nil,
+                currentUser: "test",
+                operatingSystem: "test",
+                machineArchitecture: "arm64",
+                signatureVerified: true,
+                signatureDetails: "test"
+            ),
+            permissions: PrivacyPermissionReport(statuses: []),
+            credentials: DiagnosticCredentialInfo(state: .configured, detail: "configured"),
+            settings: DiagnosticSettingsInfo(
+                shortcut: "test", engineModelType: "test", persistentSessionLogEnabled: true
+            ),
+            events: entries,
+            logDirectoryPath: directory.path
+        )
+        XCTAssertTrue(report.events.contains { $0.event == "input_operation" })
+        XCTAssertTrue(report.findings.contains { $0.code == "input_operation_trace" })
+        XCTAssertTrue(report.renderedText().contains("operationType=tail_replacement"))
+    }
 }
 
 @MainActor

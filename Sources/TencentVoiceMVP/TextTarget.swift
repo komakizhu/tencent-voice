@@ -72,6 +72,8 @@ struct TextSnapshot {
 
 @MainActor
 protocol TextTarget: AnyObject {
+    func drainDiagnostics() -> [TextInputDiagnostic]
+    func setDiagnosticOperation(_ context: TextInputDiagnosticContext?)
     func currentApplication() -> TextTargetApplication?
     func capture() throws -> TextSnapshot
     func replace(snapshot: TextSnapshot, range: TextRange, expectedText: String, with text: String) throws -> TextRange
@@ -81,6 +83,8 @@ protocol TextTarget: AnyObject {
 }
 
 extension TextTarget {
+    func drainDiagnostics() -> [TextInputDiagnostic] { [] }
+    func setDiagnosticOperation(_ context: TextInputDiagnosticContext?) {}
     func currentApplication() -> TextTargetApplication? { nil }
 
     func replaceTrailingText(_ previousText: String, with text: String) throws {

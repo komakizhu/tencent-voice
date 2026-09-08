@@ -31,6 +31,14 @@ final class TextInjector {
     private(set) var maximumTrailingReplacementLength = 0
     private(set) var errorCount = 0
     private(set) var degradationReason: String?
+    private(set) var degradationOccurredAt: Date?
+    private(set) var degradationOccurredMonotonicMilliseconds: UInt64?
+    private var nextOperationID = 0
+    private var diagnostics: [TextInputDiagnostic] = []
+    private var droppedDiagnosticCount = 0
+    private let diagnosticLimit = 128
+    private var currentProjectionDiagnosticFields: [String: String] = [:]
+    private var previousProjectionSegmentID: Int?
 
     init(
         target: TextTarget,
@@ -60,6 +68,21 @@ final class TextInjector {
 
     private(set) var degradationCode: String?
 
+    func drainDiagnostics() -> [TextInputDiagnostic] {
+        var result = diagnostics
+        diagnostics.removeAll(keepingCapacity: true)
+        result.append(contentsOf: target.drainDiagnostics())
+        if droppedDiagnosticCount > 0 {
+            result.append(TextInputDiagnostic(
+                timestamp: Date(),
+                event: "input_diagnostics_truncated",
+                fields: ["droppedEventCount": String(droppedDiagnosticCount)]
+            ))
+            droppedDiagnosticCount = 0
+        }
+        return result.sorted { $0.timestamp < $1.timestamp }
+    }
+
     func begin() throws {
         resetForBegin()
         do {
@@ -76,7 +99,20 @@ final class TextInjector {
             errorCount = 0
             degradationCode = nil
             degradationReason = nil
-            mode = captured.supportsAXReplacement ? .ax : .keyboardLiveTail
+            degradationOccurredAt = nil
+            degradationOccurredMonotonicMilliseconds = nil
+            nextOperationID = 0
+            diagnostics.removeAll(keepingCapacity: true)
+            droppedDiagnosticCount = 0
+            currentProjectionDiagnosticFields = [:]
+            previousProjectionSegmentID = nil
+            // Codex advertises writable AX text and returns success even when
+            // the next read does not reflect the insertion. Use keyboard input
+            // from the start; retrying after an AX write could duplicate text.
+            // AXTextTarget still checks the focused element and caret before
+            // each keyboard operation.
+            let requiresKeyboardInput = captured.targetApplication?.bundleIdentifier == "com.openai.codex"
+            mode = captured.supportsAXReplacement && !requiresKeyboardInput ? .ax : .keyboardLiveTail
             installKeyboardPacerIfNeeded()
         } catch TextTargetError.unsupported, TextTargetError.targetChanged, TextTargetError.writeFailed {
             resetForBegin()
@@ -88,6 +124,18 @@ final class TextInjector {
     func apply(projection: ASRProjection) {
         guard projection.changed || projection.isFinal || projection.isStreamEnded else {
             return
+        }
+
+        let previousText = lastProjectionText
+        let previousSegmentID = previousProjectionSegmentID
+        currentProjectionDiagnosticFields = projectionDiagnosticFields(
+            projection,
+            previousText: previousText,
+            previousSegmentID: previousSegmentID
+        )
+        defer {
+            lastProjectionText = projection.text
+            previousProjectionSegmentID = projection.activeSegmentID
         }
 
         switch mode {
@@ -178,15 +226,23 @@ final class TextInjector {
                 in: NSRange(location: previousRange.location, length: previousRange.length),
                 with: projection.text
             )
-            let newRange = try target.replace(
-                snapshot: snapshot,
-                range: previousRange,
-                expectedText: previousDocumentText,
-                with: projection.text
-            )
+            var newRange: TextRange?
+            try performInputOperation(
+                type: "ax_replacement",
+                previousText: lastProjectionText,
+                desiredText: projection.text,
+                plannedSelection: previousRange
+            ) {
+                newRange = try target.replace(
+                    snapshot: snapshot,
+                    range: previousRange,
+                    expectedText: previousDocumentText,
+                    with: projection.text
+                )
+            }
+            guard let newRange else { throw TextTargetError.writeFailed }
             ownedRange = newRange
             lastDocumentText = document as String
-            lastProjectionText = projection.text
             writeCount += 1
         } catch {
             enterSafeCopy(after: error)
@@ -194,7 +250,6 @@ final class TextInjector {
     }
 
     private func applyKeyboardLiveTail(_ projection: ASRProjection) {
-        lastProjectionText = projection.text
         do {
             guard let keyboardPacer else {
                 try applyKeyboardCandidate(projection.text)
@@ -219,7 +274,17 @@ final class TextInjector {
         if candidateText.hasPrefix(lastSubmittedText) {
             let suffix = String(candidateText.dropFirst(lastSubmittedText.count))
             if !suffix.isEmpty {
-                try target.paste(suffix)
+                try performInputOperation(
+                    type: "append",
+                    previousText: lastSubmittedText,
+                    desiredText: candidateText,
+                    plannedSelection: TextRange(
+                        location: lastSubmittedText.utf16.count,
+                        length: 0
+                    )
+                ) {
+                    try target.paste(suffix)
+                }
                 lastSubmittedText = candidateText
                 writeCount += 1
             }
@@ -236,7 +301,17 @@ final class TextInjector {
             deepReplacementCount += 1
         }
         let replacementTail = String(candidateText.dropFirst(commonPrefix.count))
-        try target.replaceTrailingText(previousTail, with: replacementTail)
+        try performInputOperation(
+            type: "tail_replacement",
+            previousText: lastSubmittedText,
+            desiredText: candidateText,
+            plannedSelection: TextRange(
+                location: lastSubmittedText.utf16.count,
+                length: previousTail.utf16.count
+            )
+        ) {
+            try target.replaceTrailingText(previousTail, with: replacementTail)
+        }
         writeCount += 1
         lastSubmittedText = candidateText
     }
@@ -262,7 +337,16 @@ final class TextInjector {
     }
 
     private func appendPacedText(_ text: String) throws {
-        try target.paste(text)
+        let previousText = lastSubmittedText
+        let desiredText = previousText + text
+        try performInputOperation(
+            type: "append",
+            previousText: previousText,
+            desiredText: desiredText,
+            plannedSelection: TextRange(location: previousText.utf16.count, length: 0)
+        ) {
+            try target.paste(text)
+        }
         lastSubmittedText.append(contentsOf: text)
         writeCount += 1
     }
@@ -271,17 +355,149 @@ final class TextInjector {
         guard lastSubmittedText.hasSuffix(previousText) else {
             throw TextTargetError.targetChanged
         }
-        try target.replaceTrailingText(previousText, with: text)
+        let currentText = lastSubmittedText
+        let desiredText = String(currentText.dropLast(previousText.count)) + text
+        maximumTrailingReplacementLength = max(
+            maximumTrailingReplacementLength,
+            previousText.count
+        )
+        if previousText.count > deepReplacementThreshold {
+            deepReplacementCount += 1
+        }
+        try performInputOperation(
+            type: "tail_replacement",
+            previousText: currentText,
+            desiredText: desiredText,
+            plannedSelection: TextRange(
+                location: currentText.utf16.count,
+                length: previousText.utf16.count
+            )
+        ) {
+            try target.replaceTrailingText(previousText, with: text)
+        }
         lastSubmittedText = String(lastSubmittedText.dropLast(previousText.count)) + text
         writeCount += 1
     }
 
+    private func projectionDiagnosticFields(
+        _ projection: ASRProjection,
+        previousText: String,
+        previousSegmentID: Int?
+    ) -> [String: String] {
+        [
+            "segmentID": projection.activeSegmentID.map(String.init) ?? "unknown",
+            "revision": String(projection.revision),
+            "segmentPhase": projection.isStreamEnded ? "streamEnd" : (projection.isFinal ? "final" : "partial"),
+            "operationTrigger": projection.isStreamEnded ? "streamEnd" : (projection.isFinal ? "final" : "partial"),
+            "crossedSegment": String(previousSegmentID != nil && previousSegmentID != projection.activeSegmentID),
+            "previousProjectionLengthCharacters": String(previousText.count),
+            "previousProjectionLengthUTF16": String(previousText.utf16.count)
+        ]
+    }
+
+    private func performInputOperation(
+        type: String,
+        previousText: String,
+        desiredText: String,
+        plannedSelection: TextRange?,
+        action: () throws -> Void
+    ) throws {
+        let operationID = nextOperationID + 1
+        nextOperationID = operationID
+        let created = TextInputDiagnosticClock.milliseconds()
+        var fields = currentProjectionDiagnosticFields
+        let commonPrefix = sharedTextPrefix(previousText, desiredText)
+        let previousTail = String(previousText.dropFirst(commonPrefix.count))
+        let replacementTail = String(desiredText.dropFirst(commonPrefix.count))
+        let operationFields: [String: String] = [
+            "operationID": String(operationID),
+            "operationType": type,
+            "inputModeBeforeOperation": modeDescription,
+            "operationStatus": "queued",
+            "operationCreatedMonotonicMilliseconds": String(created),
+            "operationQueuedMonotonicMilliseconds": String(created),
+            "desiredLengthCharacters": String(desiredText.count),
+            "desiredLengthUTF16": String(desiredText.utf16.count),
+            "submittedLengthCharacters": String(previousText.count),
+            "submittedLengthUTF16": String(previousText.utf16.count),
+            "submittedLengthAfterCharacters": String(desiredText.count),
+            "submittedLengthAfterUTF16": String(desiredText.utf16.count),
+            "observedLengthCharacters": "unknown",
+            "observedLengthUTF16": "unknown",
+            "commonPrefixLengthCharacters": String(commonPrefix.count),
+            "commonPrefixLengthUTF16": String(commonPrefix.utf16.count),
+            "previousTailLengthCharacters": String(previousTail.count),
+            "previousTailLengthUTF16": String(previousTail.utf16.count),
+            "replacementTailLengthCharacters": String(replacementTail.count),
+            "replacementTailLengthUTF16": String(replacementTail.utf16.count),
+            "characterUnit": "Character",
+            "utf16Unit": "UTF16",
+            "plannedSelectionUnit": "UTF16",
+            "plannedSelectionLocation": plannedSelection.map { String($0.location) } ?? "unknown",
+            "plannedSelectionLength": plannedSelection.map { String($0.length) } ?? "unknown",
+            "expectedEndLocation": plannedSelection.map {
+                String($0.location + desiredText.utf16.count)
+            } ?? "unknown",
+            "writeCountMeaning": "submission_call_not_target_confirmation"
+        ]
+        fields.merge(operationFields) { _, new in new }
+        let context = TextInputDiagnosticContext(
+            operationID: operationID,
+            operationType: type,
+            fields: fields
+        )
+        target.setDiagnosticOperation(context)
+        defer { target.setDiagnosticOperation(nil) }
+
+        let dispatchStarted = TextInputDiagnosticClock.milliseconds()
+        fields["operationStatus"] = "dispatching"
+        fields["dispatchStartedMonotonicMilliseconds"] = String(dispatchStarted)
+        do {
+            try action()
+            let dispatchEnded = TextInputDiagnosticClock.milliseconds()
+            fields["dispatchEndedMonotonicMilliseconds"] = String(dispatchEnded)
+            fields["feedbackObservedMonotonicMilliseconds"] = "unknown"
+            fields["operationCompletedMonotonicMilliseconds"] = String(dispatchEnded)
+            fields["operationStatus"] = "submitted"
+            recordDiagnostic("input_operation", fields)
+        } catch {
+            let failed = TextInputDiagnosticClock.milliseconds()
+            fields["dispatchEndedMonotonicMilliseconds"] = String(failed)
+            fields["operationFailedMonotonicMilliseconds"] = String(failed)
+            fields["operationStatus"] = "failed"
+            fields["failureCode"] = DiagnosticErrorFormatter.code(for: error)
+            recordDiagnostic("input_operation", fields)
+            throw error
+        }
+    }
+
+    private func recordDiagnostic(_ event: String, _ fields: [String: String]) {
+        guard diagnostics.count < diagnosticLimit else {
+            droppedDiagnosticCount += 1
+            return
+        }
+        diagnostics.append(TextInputDiagnostic(timestamp: Date(), event: event, fields: fields))
+    }
+
     private func enterSafeCopy(after error: Error) {
+        let modeBeforeDegradation = modeDescription
         keyboardPacer?.cancel()
         mode = safeCopyEnabled ? .safeCopy : .disabledAfterError
         errorCount += 1
         degradationCode = DiagnosticErrorFormatter.code(for: error)
         degradationReason = DiagnosticErrorFormatter.message(for: error)
+        if degradationOccurredAt == nil {
+            degradationOccurredAt = Date()
+            degradationOccurredMonotonicMilliseconds = TextInputDiagnosticClock.milliseconds()
+            recordDiagnostic("input_degradation", [
+                "failureCode": degradationCode ?? "unknown",
+                "degradationMode": modeDescription,
+                "inputModeBeforeDegradation": modeBeforeDegradation,
+                "failureOccurredMonotonicMilliseconds": String(
+                    degradationOccurredMonotonicMilliseconds ?? 0
+                )
+            ])
+        }
     }
 
     private func resetForBegin() {
@@ -299,6 +515,13 @@ final class TextInjector {
         errorCount = 0
         degradationCode = nil
         degradationReason = nil
+        degradationOccurredAt = nil
+        degradationOccurredMonotonicMilliseconds = nil
+        nextOperationID = 0
+        diagnostics.removeAll(keepingCapacity: true)
+        droppedDiagnosticCount = 0
+        currentProjectionDiagnosticFields = [:]
+        previousProjectionSegmentID = nil
         mode = .inactive
     }
 
@@ -317,6 +540,13 @@ final class TextInjector {
         errorCount = 0
         degradationCode = nil
         degradationReason = nil
+        degradationOccurredAt = nil
+        degradationOccurredMonotonicMilliseconds = nil
+        nextOperationID = 0
+        diagnostics.removeAll(keepingCapacity: true)
+        droppedDiagnosticCount = 0
+        currentProjectionDiagnosticFields = [:]
+        previousProjectionSegmentID = nil
         mode = .inactive
     }
 }

@@ -518,6 +518,22 @@ final class SessionCoordinator: SessionCoordinating {
         }
         let resolvedFailureCode = failureCode ?? error.map(DiagnosticErrorFormatter.code(for:))
         let resolvedFailureMessage = failureMessage ?? error.map(DiagnosticErrorFormatter.message(for:))
+        var metadata = [
+            "sourceBuild": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
+            "sourceAppPath": Bundle.main.bundlePath,
+            "writeCountMeaning": "submission_call_not_target_confirmation"
+        ]
+        if event == "safe_copy" || event == "input_error",
+           let degradationOccurredAt = injector?.degradationOccurredAt,
+           let degradationOccurredMonotonicMilliseconds = injector?.degradationOccurredMonotonicMilliseconds {
+            metadata["failureOccurredAt"] = Self.iso8601(degradationOccurredAt)
+            metadata["failureOccurredMonotonicMilliseconds"] = String(degradationOccurredMonotonicMilliseconds)
+            metadata["degradationRecordedAt"] = Self.iso8601(Date())
+            metadata["degradationRecordedOnASREvent"] = String(update != nil)
+            metadata["degradationRecordTiming"] = update == nil
+                ? "lifecycle_event"
+                : "asr_event_or_following_update"
+        }
         let entry = SessionLogEntry(
             timestamp: Date(),
             sessionID: sessionID,
@@ -548,6 +564,43 @@ final class SessionCoordinator: SessionCoordinating {
             metadata: metadata
         )
         try? logger.append(entry)
+        for diagnostic in injector?.drainDiagnostics() ?? [] {
+            var fields = diagnostic.fields
+            fields.merge(entry.metadata) { _, new in new }
+            fields["diagnosticRecordedAt"] = Self.iso8601(Date())
+            try? logger.append(SessionLogEntry(
+                timestamp: diagnostic.timestamp, sessionID: sessionID,
+                event: diagnostic.event, state: stateName, injectionMode: injector?.modeDescription,
+                targetApplicationName: injector?.targetApplication?.name,
+                targetApplicationBundleIdentifier: injector?.targetApplication?.bundleIdentifier,
+                targetApplicationProcessID: injector?.targetApplication?.processIdentifier,
+                sequence: update?.sequence,
+                sliceType: update?.sliceType,
+                wireFinal: update?.wireFinal,
+                segmentID: update?.segmentID ?? projection?.activeSegmentID,
+                segmentPhase: update?.isStreamEnded == true
+                    ? "streamEnd"
+                    : (update?.phase.rawValue ?? (projection?.isFinal == true ? "final" : nil)),
+                committedLength: projection?.committedText.count,
+                activeLength: projection?.activeSegmentText.count,
+                renderedLength: projection?.text.count,
+                revision: projection?.revision,
+                writeCount: injector?.writeCount,
+                backspaceCount: injector?.backspaceCount,
+                deepReplacementCount: injector?.deepReplacementCount,
+                maximumTrailingReplacementLength: injector?.maximumTrailingReplacementLength,
+                discardCount: discardCount,
+                errorCount: errorCount + (injector?.errorCount ?? 0),
+                failureCode: injector?.degradationCode,
+                metadata: fields
+            ))
+        }
+    }
+
+    private static func iso8601(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
     }
 
 }

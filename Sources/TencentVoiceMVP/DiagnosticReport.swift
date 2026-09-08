@@ -235,6 +235,7 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
 
         let sessionGroups = Dictionary(grouping: events, by: \.sessionID)
             .values
+            .map { $0.sorted { $0.timestamp < $1.timestamp } }
             .sorted { lhs, rhs in
                 (lhs.map(\.timestamp).max() ?? .distantPast)
                     > (rhs.map(\.timestamp).max() ?? .distantPast)
@@ -243,6 +244,54 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
         for sessionEvents in sessionGroups {
             guard let sessionID = sessionEvents.first?.sessionID.uuidString else { continue }
             let sessionLabel = "会话 \(sessionID)"
+            let diagnosticMessages: [String: String] = [
+                "keyboard_caret_recovered": "键盘事件发出后光标反馈短暂滞后，等待同步后已恢复，未重复发送文字。",
+                "keyboard_wait_skipped": "光标位置不符合预期，但未进入等待；等待资格原因已记录，不能据此断言等待超时。",
+                "keyboard_wait_timeout": "光标位置不符合预期，已实际等待并超过等待预算；仍不能单独证明是用户移动光标。",
+                "keyboard_caret_timeout": "旧版本只记录了 timeout，是否实际等待未知；不能把它当作已等待超时。",
+                "keyboard_caret_observed": "键盘输入后的目标状态已读回；本次反馈无需等待。",
+                "keyboard_focus_changed": "键盘输入期间焦点元素发生变化，已停止输入。",
+                "input_application_changed": "前台应用发生变化，已停止输入。",
+                "ax_focus_changed": "AX 文本更新期间焦点元素发生变化。",
+                "ax_document_mismatch": "AX 读回文本与预期不符；请结合上次写入返回码判断，可能涉及写入未生效、回滚、读回延迟或外部编辑。",
+                "ax_selection_mismatch": "AX 光标或文本替换范围不符合预期。",
+                "ax_selection_unreadable": "无法取得有效的 AX 光标范围。",
+                "ax_value_unreadable": "AX 未提供可读取的文本值。",
+                "ax_write_failed": "AX 写入接口返回失败，具体属性和返回码已记录。",
+                "ax_read_failed": "AX 读取接口返回失败，具体属性和返回码已记录。"
+            ]
+            for code in diagnosticMessages.keys.sorted() {
+                let matching = sessionEvents.filter { $0.event == code }
+                guard let latest = matching.last, let message = diagnosticMessages[code] else { continue }
+                var values = diagnosticDetails(latest)
+                if code == "keyboard_caret_recovered" {
+                    values += "；等待耗时分布：\(waitDistribution(matching))"
+                }
+                findings.append(DiagnosticFinding(
+                    level: ["keyboard_caret_recovered", "keyboard_caret_observed"].contains(code)
+                        ? .info
+                        : .warning,
+                    code: code,
+                    message: "\(sessionLabel)：\(message) 共 \(matching.count) 次。\(values)"
+                ))
+            }
+            let operationEvents = sessionEvents.filter { $0.event == "input_operation" }
+            if let latestOperation = operationEvents.last {
+                findings.append(DiagnosticFinding(
+                    level: .info,
+                    code: "input_operation_trace",
+                    message: "\(sessionLabel)：已关联 \(operationEvents.count) 次输入操作；最近一次 \(diagnosticDetails(latestOperation))"
+                ))
+            }
+            for truncation in sessionEvents.filter({
+                $0.event == "input_diagnostics_truncated" || $0.event == "target_diagnostics_truncated"
+            }) {
+                findings.append(DiagnosticFinding(
+                    level: .warning,
+                    code: truncation.event,
+                    message: "\(sessionLabel)：诊断上下文被截断，丢弃 \(truncation.metadata["droppedEventCount"] ?? "未知") 条；其余字段仍可用。"
+                ))
+            }
             let resultEvents = sessionEvents.filter {
                 ($0.event == "partial" || $0.event == "final" || $0.event == "stream_ended"
                     || $0.event == "finished" || $0.event == "finished_timeout")
@@ -278,10 +327,11 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
                 $0.event == "input_error" || $0.injectionMode == "disabled_after_error"
             }) {
                 let detail = safeFailureMessage(for: inputError) ?? "错误详情未记录或已隐藏。"
+                let timing = degradationTimingSummary(inputError)
                 findings.append(DiagnosticFinding(
                     level: .failure,
                     code: "input_error",
-                    message: "\(sessionLabel)：Safe Copy 已关闭，输入失败后已停止继续写入；\(detail)"
+                    message: "\(sessionLabel)：Safe Copy 已关闭，输入失败后已停止继续写入；\(detail)\(timing)"
                 ))
             }
 
@@ -368,6 +418,19 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
         if let failureMessage = safeFailureMessage(for: event) {
             fields.append("failure=\(failureMessage)")
         }
+        if event.event == "input_operation" {
+            fields.append("operation=\(event.metadata["operationID"] ?? "unknown")")
+            fields.append("operationType=\(event.metadata["operationType"] ?? "unknown")")
+            fields.append("operationStatus=\(event.metadata["operationStatus"] ?? "unknown")")
+            fields.append("desired=\(lengthSummary(event.metadata, prefix: "desired"))")
+            fields.append("submitted=\(lengthSummary(event.metadata, prefix: "submitted"))")
+            fields.append("observed=\(lengthSummary(event.metadata, prefix: "observed"))")
+            fields.append("revision=\(event.metadata["revision"] ?? "unknown")")
+            fields.append("trigger=\(event.metadata["operationTrigger"] ?? "unknown")")
+            fields.append("timing=\(timingSummary(event.metadata))")
+        } else if event.event.hasPrefix("keyboard_") || event.event.hasPrefix("ax_") {
+            fields.append("diagnostic=\(diagnosticDetails(event))")
+        }
         if !event.metadata.isEmpty {
             let metadata = event.metadata.keys.sorted().map { key in
                 "\(key)=\(event.metadata[key] ?? "")"
@@ -375,6 +438,74 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
             fields.append("metadata=\(metadata)")
         }
         return fields.joined(separator: " | ")
+    }
+
+    private static func diagnosticDetails(_ event: SessionLogEntry) -> String {
+        let keys = [
+            "operationID", "operationType", "operationStatus", "segmentID", "revision", "segmentPhase",
+            "operationTrigger", "waitClassification", "waitSkippedReason", "lastDispatchAgeMilliseconds",
+            "waitBudgetMilliseconds", "waitQualificationMaxAgeMilliseconds", "waitMilliseconds", "polls",
+            "feedbackObservedMonotonicMilliseconds",
+            "expectedLocation", "expectedLength", "initialLocation", "actualLocation", "actualLength",
+            "desiredLengthCharacters", "desiredLengthUTF16", "submittedLengthCharacters",
+            "submittedLengthUTF16", "observedLengthCharacters", "observedLengthUTF16",
+            "commonPrefixLengthCharacters", "commonPrefixLengthUTF16", "previousTailLengthCharacters",
+            "previousTailLengthUTF16", "replacementTailLengthCharacters", "replacementTailLengthUTF16",
+            "plannedSelectionLocation", "plannedSelectionLength", "expectedEndLocation", "characterUnit",
+            "utf16Unit", "writeCountMeaning", "targetProcessID", "targetApplicationProcessID",
+            "targetElementProcessID", "frontmostApplicationMatchesTarget", "elementSame",
+            "selectedRangeNonEmpty", "localDispatchCompleted", "targetCompletionConfirmed",
+            "plannedKeyboardEventCount", "postedKeyboardEventCount", "unicodeBlockCount",
+            "shiftKeyEventCount", "unicodeKeyEventCount", "deleteKeyEventCount",
+            "failureCode", "failureOccurredAt", "degradationRecordedAt",
+            "degradationRecordedOnASREvent", "degradationRecordTiming", "inputModeBeforeOperation",
+            "inputModeBeforeDegradation", "sourceBuild"
+        ]
+        return keys.compactMap { key in
+            guard let value = event.metadata[key] else { return nil }
+            return "\(key)=\(value)"
+        }.joined(separator: ", ")
+    }
+
+    private static func lengthSummary(_ metadata: [String: String], prefix: String) -> String {
+        let characters = metadata["\(prefix)LengthCharacters"] ?? "unknown"
+        let utf16 = metadata["\(prefix)LengthUTF16"] ?? "unknown"
+        return "\(characters) Character/\(utf16) UTF16"
+    }
+
+    private static func timingSummary(_ metadata: [String: String]) -> String {
+        let keys = [
+            "operationCreatedMonotonicMilliseconds", "operationQueuedMonotonicMilliseconds",
+            "dispatchStartedMonotonicMilliseconds", "dispatchEndedMonotonicMilliseconds",
+            "feedbackObservedMonotonicMilliseconds", "operationCompletedMonotonicMilliseconds",
+            "operationFailedMonotonicMilliseconds"
+        ]
+        return keys.compactMap { key in
+            guard let value = metadata[key] else { return nil }
+            return "\(key)=\(value)"
+        }.joined(separator: ",")
+    }
+
+    private static func degradationTimingSummary(_ event: SessionLogEntry) -> String {
+        guard let occurredAt = event.metadata["failureOccurredAt"] else {
+            return "（故障发生时间未记录）"
+        }
+        let recordedAt = event.metadata["degradationRecordedAt"] ?? "未知"
+        let timing = event.metadata["degradationRecordTiming"] ?? "未知"
+        return "（故障发生时间=\(occurredAt)，报告记录时间=\(recordedAt)，记录阶段=\(timing)）"
+    }
+
+    private static func waitDistribution(_ events: [SessionLogEntry]) -> String {
+        let values = events.compactMap { Double($0.metadata["waitMilliseconds"] ?? "") }
+        guard let minimum = values.min(), let maximum = values.max() else {
+            return "未知（旧版日志缺少等待耗时）"
+        }
+        let average = values.reduce(0, +) / Double(values.count)
+        return "\(formatNumber(minimum))–\(formatNumber(maximum))ms，平均\(formatNumber(average))ms"
+    }
+
+    private static func formatNumber(_ value: Double) -> String {
+        String(format: "%.1f", value)
     }
 
     private static func safeFailureMessage(for event: SessionLogEntry) -> String? {
