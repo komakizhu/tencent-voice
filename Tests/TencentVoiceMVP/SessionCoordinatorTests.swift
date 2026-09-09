@@ -32,7 +32,7 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.state, .idle)
     }
 
-    func testStoppingStartsPacingFlushBeforeASRWaitCompletes() async throws {
+    func testStoppingDefersPacingFlushUntilASRFinalizationCompletes() async throws {
         let asr = FakeRealtimeASRClient()
         asr.finishCompletesStream = false
         let clock = ManualKeyboardPacingClock()
@@ -61,14 +61,108 @@ final class SessionCoordinatorTests: XCTestCase {
         }
         await settleCoordinator()
         XCTAssertEqual(coordinator.state, .stopping)
-        XCTAssertEqual(target.text, "甲乙")
+        XCTAssertEqual(target.text, "甲")
 
         clock.advance(by: 120_000_000)
         await settleCoordinator()
-        XCTAssertEqual(target.text, "甲乙丙丁戊")
+        XCTAssertEqual(target.text, "甲乙")
+
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 1,
+            segmentText: "甲乙丙丁戊",
+            phase: .final,
+            wireFinal: true
+        ))
+        await settleCoordinator()
+        XCTAssertEqual(target.text, "甲乙")
 
         asr.finishStream()
+        await settleCoordinator()
+        clock.advance(by: 120_000_000)
+        await settleCoordinator()
         await ending.value
+        XCTAssertEqual(target.text, "甲乙丙丁戊")
+        XCTAssertEqual(coordinator.state, .idle)
+    }
+
+    func testLateFinalDoesNotTreatOwnAcknowledgementAsMixedInput() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        let target = FinalizationAcknowledgingKeyboardTarget()
+        let coordinator = makeCoordinator(asr: asr, target: target)
+
+        try await coordinator.begin()
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 0,
+            segmentText: "未完成",
+            phase: .partial
+        ))
+        await settleCoordinator()
+        XCTAssertEqual(target.postCount, 1)
+        XCTAssertEqual(target.text, "草稿：")
+
+        let ending = Task { @MainActor in
+            try? await coordinator.end()
+        }
+        await settleCoordinator()
+        XCTAssertEqual(coordinator.state, .stopping)
+
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 1,
+            segmentText: "未完成尾部",
+            phase: .final,
+            wireFinal: true
+        ))
+        asr.finishStream()
+        await settleCoordinator()
+        target.blockAcknowledgement = false
+        await ending.value
+
+        XCTAssertEqual(target.text, "草稿：未完成尾部")
+        XCTAssertEqual(coordinator.state, .idle)
+    }
+
+    func testUserEditDuringASRFinalizationFreezesOldVoiceWrite() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        let target = FinalizationAcknowledgingKeyboardTarget()
+        let coordinator = makeCoordinator(asr: asr, target: target)
+
+        try await coordinator.begin()
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 0,
+            segmentText: "旧语音",
+            phase: .partial
+        ))
+        await settleCoordinator()
+
+        let ending = Task { @MainActor in
+            try? await coordinator.end()
+        }
+        await settleCoordinator()
+        target.appendManualText("用户输入")
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 1,
+            segmentText: "旧语音新结果",
+            phase: .final,
+            wireFinal: true
+        ))
+        asr.finishStream()
+        await settleCoordinator()
+        target.blockAcknowledgement = false
+        await ending.value
+
+        XCTAssertEqual(target.text, "草稿：用户输入")
         XCTAssertEqual(coordinator.state, .idle)
     }
 
@@ -111,9 +205,13 @@ final class SessionCoordinatorTests: XCTestCase {
         clock.advance(by: 120_000_000)
         await settleCoordinator()
 
-        XCTAssertEqual(target.text, "这是一句未完成的话")
+        XCTAssertNotEqual(target.text, "这是一句未完成的话")
         asr.finishStream()
+        await settleCoordinator()
+        clock.advance(by: 120_000_000)
         await ending.value
+
+        XCTAssertEqual(target.text, "这是一句未完成的话")
     }
 
     func testKeyboardPartialThenFinalIsAppendedWithoutReplacement() async throws {

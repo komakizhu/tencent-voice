@@ -2,6 +2,14 @@ import Foundation
 
 @MainActor
 final class TextInjector {
+    private enum InputPhase: String {
+        case live
+        case finalizing
+        case frozenByExternalEdit
+        case safeCopy
+        case closed
+    }
+
     private enum Mode: Equatable {
         case inactive
         case ax
@@ -21,11 +29,15 @@ final class TextInjector {
     private var lastDocumentText = ""
     private var lastProjectionText = ""
     private var lastSubmittedText = ""
+    // After an external edit, the complete projection before that edit is a
+    // frozen prefix. Only the suffix after it belongs to the new voice range.
+    private var mixedInputFrozenPrefix: String?
     // Revisions inside this tail are the normal fast path. Deeper revisions
     // still update immediately, but are counted separately because they select
     // a longer suffix before replacing it in one transaction.
     private let deepReplacementThreshold = 12
     private var mode: Mode = .inactive
+    private var inputPhase: InputPhase = .closed
     private(set) var writeCount = 0
     private(set) var backspaceCount = 0
     private(set) var deepReplacementCount = 0
@@ -89,10 +101,12 @@ final class TextInjector {
         do {
             let captured = try target.capture()
             snapshot = captured
+            inputPhase = .live
             ownedRange = captured.selection
             lastDocumentText = captured.text
             lastProjectionText = ""
             lastSubmittedText = ""
+            mixedInputFrozenPrefix = nil
             writeCount = 0
             backspaceCount = 0
             deepReplacementCount = 0
@@ -118,11 +132,13 @@ final class TextInjector {
         } catch TextTargetError.unsupported, TextTargetError.targetChanged, TextTargetError.writeFailed {
             resetForBegin()
             mode = .keyboardLiveTail
+            inputPhase = .live
             installKeyboardPacerIfNeeded()
         }
     }
 
     func apply(projection: ASRProjection) {
+        guard inputPhase != .closed else { return }
         guard projection.changed || projection.isFinal || projection.isStreamEnded else {
             return
         }
@@ -143,7 +159,16 @@ final class TextInjector {
         case .ax:
             applyAX(projection)
         case .keyboardLiveTail:
-            applyKeyboardLiveTail(projection)
+            do {
+                let candidateText = try prepareKeyboardCandidate(
+                    projection.text,
+                    previousText: previousText,
+                    projection: projection
+                )
+                applyKeyboardLiveTail(projection, candidateText: candidateText)
+            } catch {
+                enterSafeCopy(after: error)
+            }
         case .safeCopy, .disabledAfterError:
             lastProjectionText = projection.text
         case .inactive:
@@ -153,6 +178,8 @@ final class TextInjector {
 
     func beginStopping() {
         guard mode == .keyboardLiveTail, let keyboardPacer else { return }
+        inputPhase = .finalizing
+        recordDiagnostic("text_input_phase", ["phase": inputPhase.rawValue, "reason": "legacy_stopping"])
         do {
             try keyboardPacer.beginStopping()
         } catch {
@@ -160,18 +187,35 @@ final class TextInjector {
         }
     }
 
+    func beginFinalization() {
+        guard mode == .keyboardLiveTail else { return }
+        inputPhase = .finalizing
+        recordDiagnostic("text_input_phase", ["phase": inputPhase.rawValue, "reason": "asr_finalization_started"])
+        keyboardPacer?.beginFinalization()
+    }
+
     func finish(finalText: String) async throws {
         let completionText = finalText.isEmpty ? lastProjectionText : finalText
+        if inputPhase == .live {
+            inputPhase = .finalizing
+            recordDiagnostic("text_input_phase", ["phase": inputPhase.rawValue, "reason": "finish_without_explicit_finalization"])
+        }
 
         switch mode {
         case .keyboardLiveTail:
             do {
+                let candidateText = try prepareKeyboardCandidate(
+                    completionText,
+                    previousText: lastProjectionText,
+                    projection: nil
+                )
                 if let keyboardPacer {
-                    try await keyboardPacer.finish(candidate: completionText)
+                    try await keyboardPacer.finish(candidate: candidateText)
                 } else {
-                    try applyKeyboardCandidate(completionText)
+                    try applyKeyboardCandidate(candidateText)
                 }
-                try await keyboardWriter?.finish(completionText)
+                try await keyboardWriter?.finish(candidateText)
+                recordDiagnostic("text_input_phase", ["phase": inputPhase.rawValue, "reason": "finished"])
             } catch {
                 enterSafeCopy(after: error)
             }
@@ -188,11 +232,17 @@ final class TextInjector {
         switch mode {
         case .keyboardLiveTail:
             do {
+                let candidateText = try prepareKeyboardCandidate(
+                    completionText,
+                    previousText: lastProjectionText,
+                    projection: nil
+                )
                 if let keyboardPacer {
-                    try keyboardPacer.finishImmediately(candidate: completionText)
+                    try keyboardPacer.finishImmediately(candidate: candidateText)
                 } else {
-                    try applyKeyboardCandidate(completionText)
+                    try applyKeyboardCandidate(candidateText)
                 }
+                recordDiagnostic("text_input_phase", ["phase": inputPhase.rawValue, "reason": "finished_immediately"])
             } catch {
                 enterSafeCopy(after: error)
             }
@@ -251,10 +301,10 @@ final class TextInjector {
         }
     }
 
-    private func applyKeyboardLiveTail(_ projection: ASRProjection) {
+    private func applyKeyboardLiveTail(_ projection: ASRProjection, candidateText: String) {
         do {
             guard let keyboardPacer else {
-                try applyKeyboardCandidate(projection.text)
+                try applyKeyboardCandidate(candidateText)
                 return
             }
             let trigger: KeyboardCharacterPacer.Trigger = if projection.isStreamEnded {
@@ -264,10 +314,83 @@ final class TextInjector {
             } else {
                 .partial
             }
-            try keyboardPacer.accept(candidate: projection.text, trigger: trigger)
+            try keyboardPacer.accept(candidate: candidateText, trigger: trigger)
         } catch {
             enterSafeCopy(after: error)
         }
+    }
+
+    private func prepareKeyboardCandidate(
+        _ candidateText: String,
+        previousText: String,
+        projection: ASRProjection?
+    ) throws -> String {
+        if let acknowledging = target as? any KeyboardAcknowledgingTarget,
+           acknowledging.requiresKeyboardAcknowledgement {
+            switch try acknowledging.reconcileKeyboardStateForUserEdit() {
+            case .matched:
+                break
+            case .ownWriteInFlight:
+                recordDiagnostic("own_write_in_flight", [
+                    "candidateLengthCharacters": String(candidateText.count),
+                    "candidateLengthUTF16": String(candidateText.utf16.count),
+                    "segmentID": projection?.activeSegmentID.map(String.init) ?? "final",
+                    "revision": projection.map { String($0.revision) } ?? "final",
+                    "phase": inputPhase.rawValue
+                ])
+            case .externalEdit:
+                recordDiagnostic("external_edit", [
+                    "candidateLengthCharacters": String(candidateText.count),
+                    "candidateLengthUTF16": String(candidateText.utf16.count),
+                    "segmentID": projection?.activeSegmentID.map(String.init) ?? "final",
+                    "revision": projection.map { String($0.revision) } ?? "final",
+                    "phase": inputPhase.rawValue
+                ])
+                guard inputPhase != .finalizing else {
+                    inputPhase = .frozenByExternalEdit
+                    recordDiagnostic("text_input_phase", ["phase": inputPhase.rawValue, "reason": "external_edit_during_finalization"])
+                    throw TextTargetError.targetChanged
+                }
+                guard !(keyboardPacer?.hasPendingOutput ?? false),
+                      !(keyboardWriter?.hasPendingWork ?? false) else {
+                    recordDiagnostic("mixed_input_ambiguous", [
+                        "candidateLengthCharacters": String(candidateText.count),
+                        "candidateLengthUTF16": String(candidateText.utf16.count),
+                        "segmentID": projection?.activeSegmentID.map(String.init) ?? "final",
+                        "revision": projection.map { String($0.revision) } ?? "final",
+                        "reason": "voice_output_in_flight"
+                    ])
+                    throw TextTargetError.targetChanged
+                }
+                mixedInputFrozenPrefix = previousText
+                keyboardPacer?.resetForExternalEdit()
+                keyboardWriter?.resetForExternalEdit()
+                lastSubmittedText = ""
+                recordDiagnostic("mixed_input_rebased", [
+                    "frozenPrefixLengthCharacters": String(previousText.count),
+                    "frozenPrefixLengthUTF16": String(previousText.utf16.count),
+                    "candidateLengthCharacters": String(candidateText.count),
+                    "candidateLengthUTF16": String(candidateText.utf16.count),
+                    "segmentID": projection?.activeSegmentID.map(String.init) ?? "final",
+                    "revision": projection.map { String($0.revision) } ?? "final"
+                ])
+            }
+        }
+
+        guard let frozenPrefix = mixedInputFrozenPrefix else { return candidateText }
+        guard candidateText.hasPrefix(frozenPrefix) else {
+            recordDiagnostic("mixed_input_ambiguous", [
+                "frozenPrefixLengthCharacters": String(frozenPrefix.count),
+                "frozenPrefixLengthUTF16": String(frozenPrefix.utf16.count),
+                "candidateLengthCharacters": String(candidateText.count),
+                "candidateLengthUTF16": String(candidateText.utf16.count),
+                "segmentID": projection?.activeSegmentID.map(String.init) ?? "final",
+                "revision": projection.map { String($0.revision) } ?? "final",
+                "reason": "recognition_prefix_changed"
+            ])
+            throw TextTargetError.targetChanged
+        }
+        return String(candidateText.dropFirst(frozenPrefix.count))
     }
 
     private func applyKeyboardCandidate(_ candidateText: String) throws {
@@ -526,6 +649,7 @@ final class TextInjector {
         keyboardWriter?.cancel()
         keyboardPacer?.cancel()
         mode = safeCopyEnabled ? .safeCopy : .disabledAfterError
+        inputPhase = .safeCopy
         errorCount += 1
         degradationCode = DiagnosticErrorFormatter.code(for: error)
         degradationReason = DiagnosticErrorFormatter.message(for: error)
@@ -567,6 +691,8 @@ final class TextInjector {
         droppedDiagnosticCount = 0
         currentProjectionDiagnosticFields = [:]
         previousProjectionSegmentID = nil
+        mixedInputFrozenPrefix = nil
+        inputPhase = .closed
         mode = .inactive
     }
 
@@ -594,6 +720,8 @@ final class TextInjector {
         droppedDiagnosticCount = 0
         currentProjectionDiagnosticFields = [:]
         previousProjectionSegmentID = nil
+        mixedInputFrozenPrefix = nil
+        inputPhase = .closed
         mode = .inactive
     }
 }

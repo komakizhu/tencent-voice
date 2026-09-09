@@ -251,6 +251,11 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
                 "keyboard_caret_timeout": "旧版本只记录了 timeout，是否实际等待未知；不能把它当作已等待超时。",
                 "keyboard_caret_observed": "键盘输入后的目标状态已读回；本次反馈无需等待。",
                 "keyboard_focus_changed": "键盘输入期间焦点元素发生变化，已停止输入。",
+                "keyboard_confirmed_state_changed": "确认后的正文、选区或 AX 结构发生变化；未盲目重发，等待安全处理。",
+                "keyboard_user_edit_detected": "录音期间检测到当前 Codex 输入框被用户编辑；已固定旧语音内容并重新建立输入边界。",
+                "keyboard_user_edit_ambiguous": "录音期间输入框变化无法确认是可安全接续的用户编辑，已暂停写入。",
+                "keyboard_user_edit_read_failed": "录音期间无法可靠读回输入框变化，已暂停写入。",
+                "keyboard_state_rebased_after_user_edit": "已采用用户编辑后的正文和选区作为新的语音输入起点。",
                 "input_application_changed": "前台应用发生变化，已停止输入。",
                 "ax_focus_changed": "AX 文本更新期间焦点元素发生变化。",
                 "ax_document_mismatch": "AX 读回文本与预期不符；请结合上次写入返回码判断，可能涉及写入未生效、回滚、读回延迟或外部编辑。",
@@ -260,6 +265,8 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
                 "ax_coordinate_mapping_resolved": "已使用 AX 坐标文本确认当前输入框状态；报告只记录长度和映射来源，不记录正文。",
                 "ax_coordinate_mapping_retryable": "AXValue 暂时落后于已前进的选区，确认器按既有确认上限重读；未重复发送文字。",
                 "ax_coordinate_mapping_failed": "AX 文本与选区坐标无法安全统一，已停止继续写入；具体原因和长度信息已记录。",
+                "mixed_input_rebased": "用户编辑后已冻结旧语音投影，并从当前光标继续输入新的语音内容。",
+                "mixed_input_ambiguous": "识别修订跨越了已冻结的语音边界，未猜测新旧内容，已暂停自动写入。",
                 "ax_write_failed": "AX 写入接口返回失败，具体属性和返回码已记录。",
                 "ax_read_failed": "AX 读取接口返回失败，具体属性和返回码已记录。"
             ]

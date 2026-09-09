@@ -135,6 +135,102 @@ final class AcknowledgedKeyboardWriterTests: XCTestCase {
         XCTAssertEqual(clock, 10_000_000)
     }
 
+    func testValidatedStructuralAXChangeStillAcknowledgesSkillFirstCharacter() async throws {
+        let expected = KeyboardDocumentState(
+            text: "技能标签正文然",
+            selection: .init(location: "技能标签正文然".utf16.count, length: 0),
+            rawText: "技能标签正文然"
+        )
+        let rawObserved = "技能标签\n正文然\n"
+        let coordinateObserved = "技能标签正文然"
+        let resolved = try AXTextDocumentResolver.resolve(
+            rawText: rawObserved,
+            selection: .init(location: coordinateObserved.utf16.count, length: 0),
+            placeholderEvidence: AXPlaceholderEvidence(),
+            probe: AXTextCoordinateProbe { range in
+                guard range.location == 0,
+                      range.length >= 0,
+                      range.length <= coordinateObserved.utf16.count else {
+                    return nil
+                }
+                return (coordinateObserved as NSString).substring(
+                    with: NSRange(location: 0, length: range.length)
+                )
+            }
+        )
+        let observed = KeyboardDocumentState(
+            text: resolved.text,
+            selection: resolved.selection,
+            rawText: resolved.rawText,
+            mapping: resolved.mapping
+        )
+        var clock: UInt64 = 0
+        let actual = try await KeyboardWriteAcknowledgement.wait(
+            for: expected,
+            matches: { expected, observed in
+                observed.compare(to: expected, allowingStructuralRawDifference: true) == .matched
+            },
+            now: { clock },
+            sleep: { clock += $0 },
+            read: { observed }
+        )
+
+        XCTAssertEqual(actual.rawText, rawObserved)
+        XCTAssertEqual(actual.mapping, resolved.mapping)
+        XCTAssertEqual(clock, 0)
+    }
+
+    func testManualEditFreezesOldVoiceTailAndContinuesAtCurrentCaret() async throws {
+        let target = MixedInputKeyboardTarget()
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("原始语音", revision: 1))
+        await settle()
+        target.appendManualText("手动")
+        injector.apply(projection: projection("原始语音继续", revision: 2))
+        try await injector.finish(finalText: "原始语音继续")
+
+        XCTAssertEqual(target.text, "草稿：原始语音手动继续")
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertTrue(injector.drainDiagnostics().contains { $0.event == "mixed_input_rebased" })
+    }
+
+    func testManualEditWithChangedRecognitionPrefixStopsWithoutOverwritingUserText() async throws {
+        let target = MixedInputKeyboardTarget()
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("原始语音", revision: 1))
+        await settle()
+        target.appendManualText("手动")
+        injector.apply(projection: projection("识别回头覆盖", revision: 2))
+        try await injector.finish(finalText: "识别回头覆盖")
+
+        XCTAssertEqual(target.text, "草稿：原始语音手动")
+        XCTAssertEqual(injector.modeDescription, "disabled_after_error")
+        XCTAssertEqual(injector.degradationCode, "text_target_changed")
+    }
+
+    func testManualEditWhileVoiceOutputIsQueuedStopsWithoutDroppingIntoOldRange() async throws {
+        let target = MixedInputKeyboardTarget()
+        let clock = ManualKeyboardPacingClock()
+        let injector = TextInjector(target: target, keyboardSmoothing: .live, pacingClock: clock)
+
+        try injector.begin()
+        injector.apply(projection: projection("原始语音", revision: 1))
+        await settle()
+        target.appendManualText("手动")
+        injector.apply(projection: projection("原始语音继续", revision: 2))
+        try await injector.finish(finalText: "原始语音继续")
+
+        XCTAssertTrue(target.text.hasPrefix("草稿：原手动"))
+        XCTAssertFalse(target.text.contains("继续"))
+        XCTAssertEqual(injector.modeDescription, "disabled_after_error")
+        XCTAssertEqual(injector.degradationCode, "text_target_changed")
+    }
+
     func testUnresponsiveDocumentTimesOutWithoutAssumingSuccess() async {
         var clock: UInt64 = 0
         do {
@@ -170,9 +266,9 @@ final class AcknowledgedKeyboardWriterTests: XCTestCase {
     }
 
     private func settle() async { for _ in 0..<30 { await Task.yield() } }
-    private func projection(_ text: String) -> ASRProjection {
+    private func projection(_ text: String, revision: UInt64 = 1) -> ASRProjection {
         ASRProjection(committedText: "", activeSegmentText: text, activeSegmentID: 0,
-                      activeIsFinal: false, revision: 1, changed: true, isFinal: false)
+                      activeIsFinal: false, revision: revision, changed: true, isFinal: false)
     }
 }
 
@@ -221,5 +317,79 @@ private final class LegacyKeyboardView: TextTarget {
                  with text: String) throws -> TencentVoiceMVP.TextRange { throw TextTargetError.unsupported }
     func paste(_ text: String) throws { try target.paste(text) }
     func replaceTrailingText(_ previous: String, with text: String) throws { try target.replaceTrailingText(previous, with: text) }
+    func copyToClipboard(_ text: String) throws {}
+}
+
+@MainActor
+private final class MixedInputKeyboardTarget: KeyboardAcknowledgingTarget {
+    let requiresKeyboardAcknowledgement = true
+    private(set) var text = "草稿："
+    private var selection = TencentVoiceMVP.TextRange(location: 3, length: 0)
+    private var confirmedText = "草稿："
+    private var confirmedSelection = TencentVoiceMVP.TextRange(location: 3, length: 0)
+    private var pendingText: String?
+    private var pendingSelection: TencentVoiceMVP.TextRange?
+    private var hasManualEdit = false
+
+    func capture() throws -> TextSnapshot {
+        TextSnapshot(
+            text: text,
+            selection: selection,
+            targetApplication: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 1)
+        )
+    }
+
+    func replace(snapshot: TextSnapshot, range: TencentVoiceMVP.TextRange, expectedText: String, with text: String) throws -> TencentVoiceMVP.TextRange {
+        throw TextTargetError.unsupported
+    }
+
+    func paste(_ insertion: String) throws {
+        guard pendingText == nil,
+              text == confirmedText,
+              selection == confirmedSelection else {
+            throw TextTargetError.targetChanged
+        }
+        let mutable = NSMutableString(string: text)
+        mutable.replaceCharacters(in: NSRange(location: selection.location, length: selection.length), with: insertion)
+        pendingText = mutable as String
+        pendingSelection = TencentVoiceMVP.TextRange(location: selection.location + insertion.utf16.count, length: 0)
+    }
+
+    func replaceTrailingText(_ previousText: String, with insertion: String) throws {
+        guard pendingText == nil,
+              text == confirmedText,
+              selection == confirmedSelection,
+              text.hasSuffix(previousText) else {
+            throw TextTargetError.targetChanged
+        }
+        pendingText = String(text.dropLast(previousText.count)) + insertion
+        pendingSelection = TencentVoiceMVP.TextRange(location: pendingText?.utf16.count ?? 0, length: 0)
+    }
+
+    func acknowledgeKeyboardWrite() async throws {
+        try Task.checkCancellation()
+        guard let pendingText, let pendingSelection else { throw TextTargetError.writeFailed }
+        text = pendingText
+        selection = pendingSelection
+        confirmedText = text
+        confirmedSelection = selection
+        self.pendingText = nil
+        self.pendingSelection = nil
+    }
+
+    func reconcileKeyboardStateForUserEdit() throws -> KeyboardReconciliation {
+        guard hasManualEdit else { return .matched }
+        hasManualEdit = false
+        confirmedText = text
+        confirmedSelection = selection
+        return .externalEdit
+    }
+
+    func appendManualText(_ insertion: String) {
+        text.append(insertion)
+        selection = TencentVoiceMVP.TextRange(location: text.utf16.count, length: 0)
+        hasManualEdit = true
+    }
+
     func copyToClipboard(_ text: String) throws {}
 }

@@ -26,6 +26,29 @@ final class AXTextDocumentTests: XCTestCase {
         )
     }
 
+    func testPlaceholderMappingIsValidForKeyboardConfirmation() throws {
+        let raw = "\n添加可选评论…"
+        let resolved = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: 0, length: 0),
+            placeholderEvidence: AXPlaceholderEvidence(
+                markedTexts: ["添加可选评论…"]
+            ),
+            probe: prefixProbe("添加可选评论…")
+        )
+        let observed = KeyboardDocumentState(
+            text: resolved.text,
+            selection: resolved.selection,
+            rawText: resolved.rawText,
+            mapping: resolved.mapping
+        )
+
+        XCTAssertEqual(
+            observed.compare(to: observed, allowingStructuralRawDifference: true),
+            .matched
+        )
+    }
+
     func testPlaceholderLookingTextWithNoMarkerRemainsDraftText() throws {
         let raw = "添加可选评论…"
         let state = try AXTextDocumentResolver.resolve(

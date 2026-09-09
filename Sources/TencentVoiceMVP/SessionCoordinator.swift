@@ -28,6 +28,13 @@ enum SessionError: Error, LocalizedError {
     }
 }
 
+private enum ASRFinalizationPhase: String {
+    case listening
+    case finalizing
+    case finalized
+    case hardStopped
+}
+
 @MainActor
 protocol SessionCoordinating: AnyObject {
     var state: SessionState { get }
@@ -58,6 +65,7 @@ final class SessionCoordinator: SessionCoordinating {
     private var audioForwarder: AudioChunkForwarder?
     private var eventTask: Task<Void, Never>?
     private var latestProjection: ASRProjection?
+    private var asrStreamEnded = false
     private var finishSent = false
     private var asrReady = false
     private var audioRecovering = false
@@ -68,6 +76,7 @@ final class SessionCoordinator: SessionCoordinating {
     private var discardCount = 0
     private var errorCount = 0
     private var degradationWasLogged = false
+    private var asrFinalizationPhase: ASRFinalizationPhase = .listening
 
     init(
         asr: RealtimeASRClient,
@@ -118,12 +127,14 @@ final class SessionCoordinator: SessionCoordinating {
             }
             injector = newInjector
             latestProjection = nil
+            asrStreamEnded = false
             finishSent = false
             asrReady = false
             audioRecovering = false
             discardCount = 0
             errorCount = 0
             degradationWasLogged = false
+            asrFinalizationPhase = .listening
 
             let wordInfo = settings.engineModelType == TencentEnginePreset.largeV2.rawValue ? 0 : 1
             let configuration = TencentSessionConfiguration(
@@ -237,8 +248,10 @@ final class SessionCoordinator: SessionCoordinating {
             return
         }
         setState(.stopping)
+        asrFinalizationPhase = .finalizing
         log(event: "stop_requested")
-        injector?.beginStopping()
+        injector?.beginFinalization()
+        log(event: "asr_finalization_started")
         logDegradationIfNeeded(projection: latestProjection)
         let currentAudioForwarder = audioForwarder
         audio.stop()
@@ -264,6 +277,9 @@ final class SessionCoordinator: SessionCoordinating {
                 eventTask.cancel()
                 asr.cancel()
                 log(event: "finish_timeout")
+                log(event: "asr_finalization_timeout")
+            } else if asrStreamEnded {
+                log(event: "asr_finalization_stream_ended")
             }
         }
         finishTask?.cancel()
@@ -273,6 +289,7 @@ final class SessionCoordinator: SessionCoordinating {
         if let injector {
             do {
                 try await injector.finish(finalText: latestProjection?.text ?? "")
+                asrFinalizationPhase = .finalized
                 logDegradationIfNeeded(projection: latestProjection)
                 log(event: streamCompleted ? "finished" : "finished_timeout", projection: latestProjection)
                 injector.cancel()
@@ -294,6 +311,7 @@ final class SessionCoordinator: SessionCoordinating {
     }
 
     func cancel() {
+        asrFinalizationPhase = .hardStopped
         log(event: "cancel_requested")
         audioForwarder?.cancel()
         audio.stop()
@@ -310,6 +328,7 @@ final class SessionCoordinator: SessionCoordinating {
         guard self.sessionID == sessionID else { return }
         guard state == .listening || state == .stopping || state == .recovering else { return }
         if update.isStreamEnded {
+            asrStreamEnded = true
             if let projection = projectionAccumulator.apply(update) {
                 latestProjection = projection
                 injector?.apply(projection: projection)
@@ -351,6 +370,7 @@ final class SessionCoordinator: SessionCoordinating {
     private func handleASRError(_ error: Error, sessionID: UUID? = nil) {
         if let sessionID, self.sessionID != sessionID { return }
         guard state == .connecting || state == .listening || state == .recovering else { return }
+        asrFinalizationPhase = .hardStopped
         audio.stop()
         asr.cancel()
         errorCount += 1
@@ -451,6 +471,7 @@ final class SessionCoordinator: SessionCoordinating {
         audioForwarder = nil
         eventTask = nil
         latestProjection = nil
+        asrStreamEnded = false
         finishSent = false
         asrReady = false
         audioRecovering = false
@@ -458,6 +479,7 @@ final class SessionCoordinator: SessionCoordinating {
         discardCount = 0
         errorCount = 0
         degradationWasLogged = false
+        asrFinalizationPhase = .listening
         projectionAccumulator = ASRProjectionAccumulator()
     }
 
@@ -521,7 +543,8 @@ final class SessionCoordinator: SessionCoordinating {
         var metadata = [
             "sourceBuild": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
             "sourceAppPath": Bundle.main.bundlePath,
-            "writeCountMeaning": "submission_call_not_target_confirmation"
+            "writeCountMeaning": "submission_call_not_target_confirmation",
+            "asrFinalizationPhase": asrFinalizationPhase.rawValue
         ]
         if event == "safe_copy" || event == "input_error",
            let degradationOccurredAt = injector?.degradationOccurredAt,

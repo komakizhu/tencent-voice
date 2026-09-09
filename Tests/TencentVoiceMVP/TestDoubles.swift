@@ -50,6 +50,104 @@ final class FakeTextTarget: TextTarget {
 }
 
 @MainActor
+final class FinalizationAcknowledgingKeyboardTarget: KeyboardAcknowledgingTarget {
+    let requiresKeyboardAcknowledgement = true
+    private(set) var text = "草稿："
+    private var selection = TencentVoiceMVP.TextRange(location: "草稿：".utf16.count, length: 0)
+    private var confirmedText = "草稿："
+    private var confirmedSelection = TencentVoiceMVP.TextRange(location: "草稿：".utf16.count, length: 0)
+    private var pendingText: String?
+    private var pendingSelection: TencentVoiceMVP.TextRange?
+    private(set) var postCount = 0
+    var blockAcknowledgement = true
+
+    func capture() throws -> TextSnapshot {
+        TextSnapshot(
+            text: text,
+            selection: selection,
+            targetApplication: .init(
+                name: "Codex",
+                bundleIdentifier: "com.openai.codex",
+                processIdentifier: 1
+            )
+        )
+    }
+
+    func replace(
+        snapshot: TextSnapshot,
+        range: TencentVoiceMVP.TextRange,
+        expectedText: String,
+        with text: String
+    ) throws -> TencentVoiceMVP.TextRange {
+        throw TextTargetError.unsupported
+    }
+
+    func paste(_ insertion: String) throws {
+        guard pendingText == nil,
+              text == confirmedText,
+              selection == confirmedSelection else {
+            throw TextTargetError.targetChanged
+        }
+        let mutable = NSMutableString(string: text)
+        mutable.replaceCharacters(
+            in: NSRange(location: selection.location, length: selection.length),
+            with: insertion
+        )
+        pendingText = mutable as String
+        pendingSelection = TencentVoiceMVP.TextRange(
+            location: selection.location + insertion.utf16.count,
+            length: 0
+        )
+        postCount += 1
+    }
+
+    func replaceTrailingText(_ previousText: String, with insertion: String) throws {
+        guard pendingText == nil,
+              text == confirmedText,
+              selection == confirmedSelection,
+              text.hasSuffix(previousText) else {
+            throw TextTargetError.targetChanged
+        }
+        pendingText = String(text.dropLast(previousText.count)) + insertion
+        pendingSelection = TencentVoiceMVP.TextRange(
+            location: pendingText?.utf16.count ?? 0,
+            length: 0
+        )
+        postCount += 1
+    }
+
+    func acknowledgeKeyboardWrite() async throws {
+        while blockAcknowledgement {
+            try Task.checkCancellation()
+            await Task.yield()
+        }
+        try Task.checkCancellation()
+        guard text == confirmedText,
+              let pendingText,
+              let pendingSelection else {
+            throw TextTargetError.targetChanged
+        }
+        text = pendingText
+        selection = pendingSelection
+        confirmedText = text
+        confirmedSelection = selection
+        self.pendingText = nil
+        self.pendingSelection = nil
+    }
+
+    func reconcileKeyboardStateForUserEdit() throws -> KeyboardReconciliation {
+        pendingText == nil ? .matched : .ownWriteInFlight
+    }
+
+    func appendManualText(_ insertion: String) {
+        text.append(insertion)
+        selection = TencentVoiceMVP.TextRange(location: text.utf16.count, length: 0)
+    }
+
+    func copyToClipboard(_ text: String) throws {}
+}
+
+@MainActor
 final class ManualKeyboardPacingClock: KeyboardPacingClock {
     private struct Sleeper {
         let deadline: UInt64

@@ -7,12 +7,20 @@ private enum KeyboardDocumentStateReadError: Error {
     case unavailable
 }
 
+private struct PendingKeyboardReplacement {
+    let selected: KeyboardDocumentState
+    let insertion: String
+    let originalSelection: TextRange
+    let sessionGeneration: UInt64
+    let operationGeneration: UInt64
+}
+
 @MainActor
 final class AXTextTarget: KeyboardAcknowledgingTarget {
     private(set) var requiresKeyboardAcknowledgement = false
     private var confirmedKeyboardDocument: String?
     private var pendingKeyboardWrite: KeyboardDocumentState?
-    private var pendingKeyboardReplacement: (selected: KeyboardDocumentState, insertion: String)?
+    private var pendingKeyboardReplacement: PendingKeyboardReplacement?
     private var replacementWasSent = false
     private var confirmedKeyboardRawText: String?
     private var confirmedKeyboardMapping: AXTextCoordinateMapping?
@@ -20,6 +28,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
     private var codexPlaceholderEvidence: AXPlaceholderEvidence?
     private var codexAXValueFallbackAllowed = false
     private var keyboardGeneration: UInt64 = 0
+    private var keyboardOperationGeneration: UInt64 = 0
     private var isCodexTarget = false
     private var targetElement: AXUIElement?
     private var targetProcessID: pid_t?
@@ -86,6 +95,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
 
     func capture() throws -> TextSnapshot {
         keyboardGeneration &+= 1
+        keyboardOperationGeneration = 0
         pendingKeyboardWrite = nil
         pendingKeyboardReplacement = nil
         replacementWasSent = false
@@ -173,7 +183,11 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         }
         let text = codexState?.text ?? rawText ?? ""
         let selection = codexState?.selection ?? rawSelection
-        expectedKeyboardSelection = readableKeyboardSelection
+        // Once Codex's placeholder representation has been normalized, all
+        // subsequent keyboard receipts must use the same coordinate document
+        // as the confirmed text. Keeping the raw selection here would make an
+        // empty placeholder look like a non-empty logical range.
+        expectedKeyboardSelection = codexState?.selection ?? readableKeyboardSelection
         requiresKeyboardAcknowledgement = hasReadableAXTextState
         confirmedKeyboardDocument = if let codexState {
             codexState.text
@@ -337,8 +351,15 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
             let selected = KeyboardDocumentState(
                 text: document,
                 selection: replacementRange,
-                rawText: confirmedKeyboardRawText
+                rawText: confirmedKeyboardRawText,
+                mapping: confirmedKeyboardMapping
             )
+            let originalSelection = expectedKeyboardSelection ?? TextRange(
+                location: replacementRange.location + replacementRange.length,
+                length: 0
+            )
+            keyboardOperationGeneration &+= 1
+            let operationGeneration = keyboardOperationGeneration
             let usesAXSelection = targetElement.map {
                 isAttributeSettable($0, kAXSelectedTextRangeAttribute as CFString)
             } ?? false
@@ -347,7 +368,13 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
             } else {
                 try keyboardEventSender.selectTrailingText(previousText, processID: eventProcessID)
             }
-            pendingKeyboardReplacement = (selected, text)
+            pendingKeyboardReplacement = PendingKeyboardReplacement(
+                selected: selected,
+                insertion: text,
+                originalSelection: originalSelection,
+                sessionGeneration: keyboardGeneration,
+                operationGeneration: operationGeneration
+            )
             pendingKeyboardWrite = receipt
             recordDiagnostic("keyboard_selection_submitted", [
                 "route": usesAXSelection ? "ax_range" : "keyboard",
@@ -375,6 +402,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         guard let receipt = pendingKeyboardWrite else { return }
         let generation = keyboardGeneration
         let start = DispatchTime.now().uptimeNanoseconds
+        var lastObservedState: KeyboardDocumentState?
+        var lastComparison: KeyboardDocumentComparison?
         let read = { () throws -> KeyboardDocumentState in
             guard generation == self.keyboardGeneration else { throw CancellationError() }
             try self.ensureTargetApplicationIsFrontmost()
@@ -383,9 +412,11 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
                 throw TextTargetError.targetChanged
             }
             do {
-                return try KeyboardWriteAcknowledgement.readObservation {
+                let state = try KeyboardWriteAcknowledgement.readObservation {
                     try self.keyboardDocumentState(in: element, confirming: true)
                 }
+                lastObservedState = state
+                return state
             } catch KeyboardWriteReadError.retryable {
                 throw KeyboardWriteReadError.retryable
             } catch KeyboardDocumentStateReadError.retryable {
@@ -394,10 +425,22 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
                 throw TextTargetError.targetChanged
             }
         }
+        let matches: (KeyboardDocumentState, KeyboardDocumentState) -> Bool = { expected, observed in
+            let comparison = observed.compare(
+                to: expected,
+                allowingStructuralRawDifference: self.isCodexTarget
+            )
+            lastComparison = comparison
+            return comparison == .matched
+        }
         do {
+            let observed: KeyboardDocumentState
             if let replacement = pendingKeyboardReplacement {
-                try await KeyboardWriteAcknowledgement.replaceSelection(
-                    selected: replacement.selected, result: receipt, read: read
+                observed = try await KeyboardWriteAcknowledgement.replaceSelection(
+                    selected: replacement.selected,
+                    result: receipt,
+                    matches: matches,
+                    read: read
                 ) {
                     self.recordDiagnostic(
                         "keyboard_selection_acknowledged",
@@ -412,31 +455,40 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
                     )
                 }
             } else {
-                try await KeyboardWriteAcknowledgement.wait(for: receipt, read: read)
+                observed = try await KeyboardWriteAcknowledgement.wait(
+                    for: receipt,
+                    matches: matches,
+                    read: read
+                )
             }
             guard generation == keyboardGeneration else { throw CancellationError() }
-            confirmedKeyboardDocument = receipt.text
-            expectedKeyboardSelection = receipt.selection
-            if self.isCodexTarget, let resolved = self.lastResolvedCodexDocument {
-                confirmedKeyboardRawText = resolved.rawText
-                confirmedKeyboardMapping = resolved.mapping
-            } else {
-                confirmedKeyboardRawText = receipt.rawText
-                confirmedKeyboardMapping = nil
-            }
+            confirmedKeyboardDocument = observed.text
+            expectedKeyboardSelection = observed.selection
+            confirmedKeyboardRawText = observed.rawText
+            confirmedKeyboardMapping = observed.mapping
             pendingKeyboardWrite = nil
             pendingKeyboardReplacement = nil
             replacementWasSent = false
             recordDiagnostic("keyboard_write_acknowledged", [
                 "elapsedMilliseconds": String((DispatchTime.now().uptimeNanoseconds - start) / 1_000_000),
-                "documentMatches": "true", "selectionMatches": "true"
+                "documentMatches": "true",
+                "selectionMatches": "true",
+                "comparison": lastComparison?.rawValue ?? "matched",
+                "observedLengthUTF16": String(observed.text.utf16.count),
+                "observedRawLengthUTF16": String(observed.rawText?.utf16.count ?? 0)
             ], context: previousDiagnosticOperationContext)
         } catch {
             recordDiagnostic(
                 "keyboard_write_unconfirmed",
-                ["code": DiagnosticErrorFormatter.code(for: error)],
+                [
+                    "code": DiagnosticErrorFormatter.code(for: error),
+                    "comparison": lastComparison?.rawValue ?? "unreadable",
+                    "observedLengthUTF16": String(lastObservedState?.text.utf16.count ?? 0),
+                    "observedRawLengthUTF16": String(lastObservedState?.rawText?.utf16.count ?? 0)
+                ],
                 context: previousDiagnosticOperationContext
             )
+            recoverPendingSelectionIfSafe(generation: generation)
             throw error
         }
     }
@@ -518,7 +570,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
                 return KeyboardDocumentState(
                     text: document.text,
                     selection: document.selection,
-                    rawText: document.rawText
+                    rawText: document.rawText,
+                    mapping: document.mapping
                 )
             } catch KeyboardWriteReadError.retryable {
                 recordDiagnostic("ax_coordinate_mapping_retryable", [
@@ -543,7 +596,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
                     return KeyboardDocumentState(
                         text: document.text,
                         selection: document.selection,
-                        rawText: document.rawText
+                        rawText: document.rawText,
+                        mapping: document.mapping
                     )
                 }
                 recordCoordinateResolutionFailure(
@@ -620,13 +674,31 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         }
         if requiresKeyboardAcknowledgement {
             guard pendingKeyboardWrite == nil else { throw TextTargetError.writeFailed }
-            guard let currentState = try? keyboardDocumentState(in: currentElement),
-                  currentState.text == confirmedKeyboardDocument,
-                  currentState.selection == expectedKeyboardSelection,
-                  !isCodexTarget || currentState.rawText == confirmedKeyboardRawText else {
-                recordDiagnostic("keyboard_confirmed_state_changed")
+            guard let currentState = try? keyboardDocumentState(in: currentElement) else {
+                recordDiagnostic("keyboard_confirmed_state_changed", ["comparison": "unreadable"])
                 throw TextTargetError.targetChanged
             }
+            guard let expectedState = confirmedKeyboardState() else {
+                recordDiagnostic("keyboard_confirmed_state_changed", ["comparison": "unreadable"])
+                throw TextTargetError.targetChanged
+            }
+            let comparison = keyboardStateComparison(currentState, expected: expectedState)
+            guard comparison == .matched else {
+                recordDiagnostic(
+                    "keyboard_confirmed_state_changed",
+                    [
+                        "comparison": comparison.rawValue,
+                        "expectedDocumentLengthUTF16": String(expectedState.text.utf16.count),
+                        "currentDocumentLengthUTF16": String(currentState.text.utf16.count),
+                        "expectedSelectionLocation": String(expectedState.selection.location),
+                        "expectedSelectionLength": String(expectedState.selection.length),
+                        "currentSelectionLocation": String(currentState.selection.location),
+                        "currentSelectionLength": String(currentState.selection.length)
+                    ]
+                )
+                throw TextTargetError.targetChanged
+            }
+            commitConfirmedKeyboardState(currentState)
             return
         }
         if let expectedKeyboardSelection {
@@ -661,6 +733,135 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
                 guard recovered else { throw TextTargetError.targetChanged }
             }
         }
+    }
+
+    func reconcileKeyboardStateForUserEdit() throws -> KeyboardReconciliation {
+        guard requiresKeyboardAcknowledgement, isCodexTarget else { return .matched }
+        try ensureTargetApplicationIsFrontmost()
+        guard let targetElement else { return .matched }
+        let currentElement = try focusedElement()
+        guard CFEqual(currentElement, targetElement) else {
+            recordDiagnostic("keyboard_focus_changed")
+            throw TextTargetError.targetChanged
+        }
+        guard pendingKeyboardWrite == nil, pendingKeyboardReplacement == nil else {
+            recordDiagnostic("own_write_in_flight", [
+                "pendingReplacement": String(pendingKeyboardReplacement != nil),
+                "keyboardGeneration": String(keyboardGeneration)
+            ])
+            return .ownWriteInFlight
+        }
+        guard let currentState = try? keyboardDocumentState(in: currentElement),
+              let expectedState = confirmedKeyboardState() else {
+            recordDiagnostic("keyboard_user_edit_read_failed")
+            throw TextTargetError.targetChanged
+        }
+        let comparison = keyboardStateComparison(currentState, expected: expectedState)
+        guard comparison != .rawMappingUnavailable else {
+            recordDiagnostic("keyboard_user_edit_ambiguous", ["reason": "mapping_unavailable"])
+            throw TextTargetError.targetChanged
+        }
+        guard comparison != .matched else {
+            commitConfirmedKeyboardState(currentState)
+            return .matched
+        }
+
+        recordDiagnostic("keyboard_user_edit_detected", [
+            "comparison": comparison.rawValue,
+            "previousDocumentLengthUTF16": String(expectedState.text.utf16.count),
+            "currentDocumentLengthUTF16": String(currentState.text.utf16.count),
+            "previousSelectionLocation": String(expectedState.selection.location),
+            "previousSelectionLength": String(expectedState.selection.length),
+            "currentSelectionLocation": String(currentState.selection.location),
+            "currentSelectionLength": String(currentState.selection.length)
+        ])
+        commitConfirmedKeyboardState(currentState)
+        recordDiagnostic("keyboard_state_rebased_after_user_edit", [
+            "documentLengthUTF16": String(currentState.text.utf16.count),
+            "selectionLocation": String(currentState.selection.location),
+            "selectionLength": String(currentState.selection.length)
+        ])
+        return .externalEdit
+    }
+
+    private func recoverPendingSelectionIfSafe(generation: UInt64) {
+        guard let pending = pendingKeyboardReplacement else { return }
+        guard pending.sessionGeneration == generation,
+              generation == keyboardGeneration,
+              pending.operationGeneration == keyboardOperationGeneration else {
+            recordDiagnostic("selection_recovery_skipped", ["reason": "operation_generation_changed"])
+            return
+        }
+        guard !replacementWasSent else {
+            recordDiagnostic("selection_recovery_skipped", ["reason": "replacement_already_sent"])
+            return
+        }
+        guard let targetElement else {
+            recordDiagnostic("selection_recovery_skipped", ["reason": "target_unavailable"])
+            return
+        }
+
+        do {
+            try ensureTargetApplicationIsFrontmost()
+            let currentElement = try focusedElement()
+            guard CFEqual(currentElement, targetElement) else {
+                recordDiagnostic("selection_recovery_skipped", ["reason": "focus_changed"])
+                return
+            }
+            guard let currentState = try? keyboardDocumentState(in: currentElement) else {
+                recordDiagnostic("selection_recovery_skipped", ["reason": "read_failed"])
+                return
+            }
+            let comparison = keyboardStateComparison(currentState, expected: pending.selected)
+            guard comparison == .matched else {
+                recordDiagnostic("selection_recovery_skipped", ["reason": comparison.rawValue])
+                return
+            }
+            try setSelection(pending.originalSelection, on: currentElement)
+            guard readableSelection(in: currentElement) == pending.originalSelection else {
+                recordDiagnostic("selection_recovery_skipped", ["reason": "selection_not_restored"])
+                return
+            }
+            expectedKeyboardSelection = pending.originalSelection
+            pendingKeyboardReplacement = nil
+            pendingKeyboardWrite = nil
+            replacementWasSent = false
+            recordDiagnostic("selection_recovery_succeeded", [
+                "selectionLocation": String(pending.originalSelection.location),
+                "selectionLength": String(pending.originalSelection.length)
+            ])
+        } catch {
+            recordDiagnostic("selection_recovery_skipped", [
+                "reason": DiagnosticErrorFormatter.code(for: error)
+            ])
+        }
+    }
+
+    private func confirmedKeyboardState() -> KeyboardDocumentState? {
+        guard let confirmedKeyboardDocument, let expectedKeyboardSelection else { return nil }
+        return KeyboardDocumentState(
+            text: confirmedKeyboardDocument,
+            selection: expectedKeyboardSelection,
+            rawText: confirmedKeyboardRawText,
+            mapping: confirmedKeyboardMapping
+        )
+    }
+
+    private func keyboardStateComparison(
+        _ current: KeyboardDocumentState,
+        expected: KeyboardDocumentState
+    ) -> KeyboardDocumentComparison {
+        current.compare(
+            to: expected,
+            allowingStructuralRawDifference: isCodexTarget
+        )
+    }
+
+    private func commitConfirmedKeyboardState(_ state: KeyboardDocumentState) {
+        confirmedKeyboardDocument = state.text
+        expectedKeyboardSelection = state.selection
+        confirmedKeyboardRawText = state.rawText
+        confirmedKeyboardMapping = state.mapping
     }
 
     private func ensureTargetApplicationIsFrontmost() throws {

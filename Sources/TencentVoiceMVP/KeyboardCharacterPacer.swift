@@ -313,6 +313,7 @@ final class KeyboardCharacterPacer {
     private var visibleText = ""
     private var pending: [PendingCharacter] = []
     private var hasSubmittedCharacter = false
+    private var finalizing = false
     private var stopping = false
     private var isFlushing = false
     private var queueEmptySinceNanoseconds: UInt64?
@@ -320,6 +321,12 @@ final class KeyboardCharacterPacer {
     private var partialCadenceNanoseconds: Double
     private var lastPartialArrivalNanoseconds: UInt64?
     private var lastError: Error?
+
+    var hasPendingOutput: Bool {
+        !pending.isEmpty || runnerTask != nil || desiredText != visibleText
+    }
+
+    var isFinalizing: Bool { finalizing }
 
     init(
         configuration: KeyboardPacingConfiguration,
@@ -343,6 +350,7 @@ final class KeyboardCharacterPacer {
         visibleText = ""
         pending = []
         hasSubmittedCharacter = false
+        finalizing = false
         stopping = false
         isFlushing = false
         queueEmptySinceNanoseconds = nil
@@ -369,22 +377,31 @@ final class KeyboardCharacterPacer {
                 if candidateChanged {
                     try startFlush()
                 }
-            } else {
+            } else if !finalizing {
                 ensureNormalRunner(at: now)
             }
         case .segmentFinal, .streamEnd:
-            if !isFlushing || candidateChanged {
+            if !finalizing && (!isFlushing || candidateChanged) {
                 try startFlush()
             }
         }
     }
 
     func beginStopping() throws {
+        finalizing = false
         stopping = true
         try startFlush()
     }
 
+    /// Marks the ASR shutdown window without changing keyboard pacing. Final
+    /// recognition updates must still be able to revise the in-flight tail.
+    func beginFinalization() {
+        guard !stopping else { return }
+        finalizing = true
+    }
+
     func finish(candidate: String) async throws {
+        finalizing = false
         stopping = true
         try accept(candidate: candidate, trigger: .streamEnd)
         while true {
@@ -401,6 +418,7 @@ final class KeyboardCharacterPacer {
     }
 
     func finishImmediately(candidate: String) throws {
+        finalizing = false
         stopping = true
         invalidateRunner()
         try reconcile(candidate: candidate, now: clock.nowNanoseconds)
@@ -422,6 +440,23 @@ final class KeyboardCharacterPacer {
         visibleText = ""
         queueEmptySinceNanoseconds = nil
         isFlushing = false
+        finalizing = false
+        lastError = nil
+    }
+
+    func resetForExternalEdit() {
+        invalidateRunner()
+        pending = []
+        desiredText = ""
+        visibleText = ""
+        hasSubmittedCharacter = false
+        finalizing = false
+        stopping = false
+        isFlushing = false
+        queueEmptySinceNanoseconds = nil
+        currentIntervalNanoseconds = configuration.initialCharacterIntervalNanoseconds
+        partialCadenceNanoseconds = Double(configuration.defaultPartialCadenceNanoseconds)
+        lastPartialArrivalNanoseconds = nil
         lastError = nil
     }
 
