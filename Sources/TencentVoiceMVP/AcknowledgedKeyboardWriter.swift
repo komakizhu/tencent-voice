@@ -12,10 +12,22 @@ protocol KeyboardAcknowledgingTarget: TextTarget {
     var requiresKeyboardAcknowledgement: Bool { get }
     func acknowledgeKeyboardWrite() async throws
     func reconcileKeyboardStateForUserEdit() throws -> KeyboardReconciliation
+    func writeKeyboardText(previousText: String, with text: String) async throws
 }
 
 extension KeyboardAcknowledgingTarget {
     func reconcileKeyboardStateForUserEdit() throws -> KeyboardReconciliation { .matched }
+
+    // Targets that have not adopted the atomic preflight/send entry point keep
+    // the existing synchronous send and acknowledgement lifecycle.
+    func writeKeyboardText(previousText: String, with text: String) async throws {
+        if previousText.isEmpty {
+            try paste(text)
+        } else {
+            try replaceTrailingText(previousText, with: text)
+        }
+        try await acknowledgeKeyboardWrite()
+    }
 }
 
 enum KeyboardWriteReadError: Error, Equatable {
@@ -63,14 +75,26 @@ struct KeyboardDocumentState: Equatable {
                 }
                 return .matched
             }
+            let textUTF16 = Array(text.utf16)
             guard mapping.coordinateDocumentLength == text.utf16.count,
                   mapping.rawDocumentLength == rawText?.utf16.count,
                   mapping.rawBoundaryOffsets.count == text.utf16.count + 1,
                   mapping.rawBoundaryOffsets.first == 0,
                   mapping.rawBoundaryOffsets.last == rawText?.utf16.count,
-                  mapping.rawBoundaryOffsets.allSatisfy({ $0 >= 0 && $0 <= mapping.rawDocumentLength }),
-                  zip(mapping.rawBoundaryOffsets, mapping.rawBoundaryOffsets.dropFirst()).allSatisfy({ $0 <= $1 }) else {
+                  mapping.rawBoundaryOffsets.enumerated().allSatisfy({ index, offset in
+                      if offset >= 0 {
+                          return offset <= mapping.rawDocumentLength
+                      }
+                      guard index > 0, index < text.utf16.count else { return false }
+                      return textUTF16[index - 1] >= 0xD800 && textUTF16[index - 1] <= 0xDBFF
+                          && textUTF16[index] >= 0xDC00 && textUTF16[index] <= 0xDFFF
+                  }) else {
                 return .rawMappingUnavailable
+            }
+            var previousOffset = 0
+            for offset in mapping.rawBoundaryOffsets where offset >= 0 {
+                guard offset >= previousOffset else { return .rawMappingUnavailable }
+                previousOffset = offset
             }
             return .matched
         }
@@ -96,8 +120,17 @@ enum KeyboardWriteAcknowledgement {
     static func readObservation(_ read: () throws -> KeyboardDocumentState) throws -> KeyboardDocumentState {
         do {
             return try read()
-        } catch is AXTextDocumentResolutionError {
-            throw KeyboardWriteReadError.retryable
+        } catch let error as AXTextDocumentResolutionError {
+            // A coordinate read can be transient while a renderer publishes a
+            // new accessibility tree. Invalid ranges, bounds and mappings are
+            // terminal observations and must reach the caller unchanged.
+            switch error {
+            case .coordinateReadUnavailable, .coordinateTextMismatch:
+                throw KeyboardWriteReadError.retryable
+            case .invalidSelection, .coordinateLengthMismatch,
+                    .selectionOutOfBounds, .selectedRangeUnavailable:
+                throw error
+            }
         }
     }
 
@@ -161,9 +194,16 @@ enum KeyboardWriteAcknowledgement {
 // Intermediate candidates may be coalesced, but a posted edit is never retried.
 @MainActor
 final class AcknowledgedKeyboardWriter {
+    struct OperationContext {
+        let diagnostic: TextInputDiagnosticContext
+        let onDispatch: () -> Void
+        let onFinish: (_ status: String, _ error: Error?) -> Void
+    }
+
     private let target: any KeyboardAcknowledgingTarget
     private let onCommit: (String, String) -> Void
     private let onFailure: (Error) -> Void
+    private let operationContextProvider: ((String, String) -> OperationContext?)?
     private var desiredText = ""
     private(set) var confirmedText = ""
     private var runner: Task<Void, Never>?
@@ -177,10 +217,12 @@ final class AcknowledgedKeyboardWriter {
 
     init(target: any KeyboardAcknowledgingTarget,
          onCommit: @escaping (String, String) -> Void,
-         onFailure: @escaping (Error) -> Void) {
+         onFailure: @escaping (Error) -> Void,
+         operationContextProvider: ((String, String) -> OperationContext?)? = nil) {
         self.target = target
         self.onCommit = onCommit
         self.onFailure = onFailure
+        self.operationContextProvider = operationContextProvider
     }
 
     func accept(_ candidate: String) throws {
@@ -206,12 +248,27 @@ final class AcknowledgedKeyboardWriter {
                     let prefix = sharedTextPrefix(previous, submitted)
                     let previousTail = String(previous.dropFirst(prefix.count))
                     let newTail = String(submitted.dropFirst(prefix.count))
-                    if previousTail.isEmpty {
-                        try self.target.paste(newTail)
-                    } else {
-                        try self.target.replaceTrailingText(previousTail, with: newTail)
+                    let operation = self.operationContextProvider?(previous, submitted)
+                    if let operation {
+                        self.target.setDiagnosticOperation(operation.diagnostic)
+                        operation.onDispatch()
                     }
-                    try await self.target.acknowledgeKeyboardWrite()
+                    do {
+                        try await self.target.writeKeyboardText(
+                            previousText: previousTail,
+                            with: newTail
+                        )
+                        operation?.onFinish("acknowledged", nil)
+                    } catch is CancellationError {
+                        operation?.onFinish("cancelled", nil)
+                        if operation != nil { self.target.setDiagnosticOperation(nil) }
+                        throw CancellationError()
+                    } catch {
+                        operation?.onFinish("unconfirmed", error)
+                        if operation != nil { self.target.setDiagnosticOperation(nil) }
+                        throw error
+                    }
+                    if operation != nil { self.target.setDiagnosticOperation(nil) }
                     try Task.checkCancellation()
                     guard self.runnerGeneration == generation else { throw CancellationError() }
                     self.confirmedText = submitted

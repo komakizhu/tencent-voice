@@ -35,9 +35,28 @@ final class AXConfirmationRecoveryTests: XCTestCase {
         XCTAssertEqual(clock, 30_010_000_000)
     }
 
-    func testEveryInconsistentSnapshotRemainsUnconfirmedUntilDeadline() async {
-        for error in [AXTextDocumentResolutionError.invalidSelection, .coordinateReadUnavailable,
-                      .coordinateLengthMismatch, .coordinateTextMismatch, .selectionOutOfBounds,
+    func testTransientCoordinateReadRemainsUnconfirmedUntilDeadline() async {
+        for error in [AXTextDocumentResolutionError.coordinateReadUnavailable,
+                      .coordinateTextMismatch] {
+            var clock: UInt64 = 0
+            do {
+                try await KeyboardWriteAcknowledgement.wait(
+                    for: .init(text: "甲", selection: .init(location: 1, length: 0)),
+                    timeoutNanoseconds: 20_000_000, now: { clock }, sleep: { clock += $0 }
+                ) {
+                    try KeyboardWriteAcknowledgement.readObservation { throw error }
+                }
+                XCTFail("A transient inconsistent snapshot must never confirm delivery")
+            } catch {
+                XCTAssertEqual((error as? TextTargetError)?.diagnosticCode, "text_target_write_failed")
+            }
+            XCTAssertEqual(clock, 20_000_000)
+        }
+    }
+
+    func testInvalidCoordinateSnapshotRemainsTerminal() async {
+        for error in [AXTextDocumentResolutionError.invalidSelection,
+                      .coordinateLengthMismatch, .selectionOutOfBounds,
                       .selectedRangeUnavailable] {
             var clock: UInt64 = 0
             do {
@@ -47,11 +66,13 @@ final class AXConfirmationRecoveryTests: XCTestCase {
                 ) {
                     try KeyboardWriteAcknowledgement.readObservation { throw error }
                 }
-                XCTFail("An inconsistent snapshot must never confirm delivery")
+                XCTFail("An invalid coordinate snapshot must stop confirmation immediately")
+            } catch let observed as AXTextDocumentResolutionError {
+                XCTAssertEqual(observed, error)
             } catch {
-                XCTAssertEqual((error as? TextTargetError)?.diagnosticCode, "text_target_write_failed")
+                XCTFail("Unexpected error: \(error)")
             }
-            XCTAssertEqual(clock, 20_000_000)
+            XCTAssertEqual(clock, 0)
         }
     }
 
@@ -71,5 +92,37 @@ final class AXConfirmationRecoveryTests: XCTestCase {
             try KeyboardWriteAcknowledgement.readObservation { state }
         }
         XCTAssertEqual(sleeps, 0)
+    }
+
+    func testMatchingObservationReturnsItsCoordinateMapping() async throws {
+        let mapping = AXTextCoordinateMapping(
+            source: .axStringForRange,
+            rawDocumentLength: 4,
+            coordinateDocumentLength: 3,
+            omittedStructuralSeparatorCount: 1,
+            rawBoundaryOffsets: [0, 2, 3, 4],
+            rawPlaceholderRange: nil
+        )
+        let expected = KeyboardDocumentState(
+            text: "😀好",
+            selection: .init(location: 3, length: 0),
+            rawText: "😀\n好"
+        )
+        let observed = try await KeyboardWriteAcknowledgement.wait(
+            for: expected,
+            matches: { expected, observed in
+                observed.compare(to: expected, allowingStructuralRawDifference: true) == .matched
+            },
+            read: {
+                .init(
+                    text: expected.text,
+                    selection: expected.selection,
+                    rawText: expected.rawText,
+                    mapping: mapping
+                )
+            }
+        )
+
+        XCTAssertEqual(observed.mapping, mapping)
     }
 }

@@ -155,9 +155,11 @@ final class ManualKeyboardPacingClock: KeyboardPacingClock {
     }
 
     private(set) var nowNanoseconds: UInt64 = 0
+    private(set) var sleepCallCount = 0
     private var sleepers: [UUID: Sleeper] = [:]
 
     func sleep(nanoseconds: UInt64) async throws {
+        sleepCallCount += 1
         let deadline = nowNanoseconds + nanoseconds
         guard deadline > nowNanoseconds else { return }
         let id = UUID()

@@ -2,6 +2,39 @@ import Foundation
 
 @MainActor
 final class TextInjector {
+    private final class KeyboardWriteOperationState {
+        var fields: [String: String]
+
+        init(fields: [String: String]) {
+            self.fields = fields
+        }
+
+        func markDispatch() {
+            let timestamp = TextInputDiagnosticClock.milliseconds()
+            fields["operationStatus"] = "dispatching"
+            fields["dispatchStartedMonotonicMilliseconds"] = String(timestamp)
+        }
+
+        func finish(status: String, error: Error?) -> [String: String] {
+            let timestamp = TextInputDiagnosticClock.milliseconds()
+            fields["dispatchEndedMonotonicMilliseconds"] = String(timestamp)
+            fields["operationCompletedMonotonicMilliseconds"] = String(timestamp)
+            fields["operationStatus"] = status
+            fields["targetCompletionConfirmed"] = String(status == "acknowledged")
+            fields["localDispatchCompleted"] = String(status != "cancelled")
+            if status == "acknowledged" {
+                fields["feedbackObservedMonotonicMilliseconds"] = String(timestamp)
+            } else {
+                fields["feedbackObservedMonotonicMilliseconds"] = "unknown"
+            }
+            if let error {
+                fields["failureCode"] = DiagnosticErrorFormatter.code(for: error)
+                fields["operationFailedMonotonicMilliseconds"] = String(timestamp)
+            }
+            return fields
+        }
+    }
+
     private enum InputPhase: String {
         case live
         case finalizing
@@ -468,6 +501,13 @@ final class TextInjector {
                 },
                 onFailure: { [weak self] error in
                     self?.enterSafeCopy(after: error)
+                },
+                operationContextProvider: { [weak self] previous, submitted in
+                    guard let self else { return nil }
+                    return self.makeKeyboardWriterOperation(
+                        previousText: previous,
+                        desiredText: submitted
+                    )
                 }
             )
         }
@@ -488,6 +528,69 @@ final class TextInjector {
             }
         )
         keyboardPacer?.beginSession()
+    }
+
+    private func makeKeyboardWriterOperation(
+        previousText: String,
+        desiredText: String
+    ) -> AcknowledgedKeyboardWriter.OperationContext {
+        let operationID = nextOperationID + 1
+        nextOperationID = operationID
+        let created = TextInputDiagnosticClock.milliseconds()
+        let commonPrefix = sharedTextPrefix(previousText, desiredText)
+        let previousTail = String(previousText.dropFirst(commonPrefix.count))
+        let replacementTail = String(desiredText.dropFirst(commonPrefix.count))
+        var fields = currentProjectionDiagnosticFields
+        let operationFields: [String: String] = [
+            "operationID": String(operationID),
+            "operationType": previousTail.isEmpty ? "append" : "tail_replacement",
+            "inputModeBeforeOperation": modeDescription,
+            "operationStatus": "queued",
+            "operationCreatedMonotonicMilliseconds": String(created),
+            "operationQueuedMonotonicMilliseconds": String(created),
+            "desiredLengthCharacters": String(desiredText.count),
+            "desiredLengthUTF16": String(desiredText.utf16.count),
+            "submittedLengthCharacters": String(previousText.count),
+            "submittedLengthUTF16": String(previousText.utf16.count),
+            "submittedLengthAfterCharacters": String(desiredText.count),
+            "submittedLengthAfterUTF16": String(desiredText.utf16.count),
+            "observedLengthCharacters": "unknown",
+            "observedLengthUTF16": "unknown",
+            "commonPrefixLengthCharacters": String(commonPrefix.count),
+            "commonPrefixLengthUTF16": String(commonPrefix.utf16.count),
+            "previousTailLengthCharacters": String(previousTail.count),
+            "previousTailLengthUTF16": String(previousTail.utf16.count),
+            "replacementTailLengthCharacters": String(replacementTail.count),
+            "replacementTailLengthUTF16": String(replacementTail.utf16.count),
+            "characterUnit": "Character",
+            "utf16Unit": "UTF16",
+            "plannedSelectionUnit": "UTF16",
+            "plannedSelectionLocation": String(previousText.utf16.count),
+            "plannedSelectionLength": String(previousTail.utf16.count),
+            "expectedEndLocation": String(desiredText.utf16.count),
+            "writeCountMeaning": "submission_call_not_target_confirmation"
+        ]
+        fields.merge(operationFields) { _, new in new }
+
+        let state = KeyboardWriteOperationState(fields: fields)
+        let context = TextInputDiagnosticContext(
+            operationID: operationID,
+            operationType: fields["operationType"] ?? "append",
+            fields: fields
+        )
+        return AcknowledgedKeyboardWriter.OperationContext(
+            diagnostic: context,
+            onDispatch: { [state] in
+                state.markDispatch()
+            },
+            onFinish: { [weak self, state] status, error in
+                guard let self else { return }
+                self.recordDiagnostic(
+                    "input_operation",
+                    state.finish(status: status, error: error)
+                )
+            }
+        )
     }
 
     private func appendPacedText(_ text: String) throws {

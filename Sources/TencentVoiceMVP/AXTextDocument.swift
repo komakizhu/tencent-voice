@@ -50,9 +50,9 @@ struct AXPlaceholderEvidence: Equatable, Sendable {
 }
 
 struct AXTextCoordinateProbe {
-    let read: (TextRange) -> String?
+    let read: (TextRange) throws -> String?
 
-    init(read: @escaping (TextRange) -> String?) {
+    init(read: @escaping (TextRange) throws -> String?) {
         self.read = read
     }
 }
@@ -147,7 +147,7 @@ enum AXTextDocumentResolver {
             )
         }
 
-        guard let coordinate = readCoordinateText(rawText: rawText, probe: probe) else {
+        guard let coordinate = try readCoordinateText(rawText: rawText, probe: probe) else {
             throw AXTextDocumentResolutionError.coordinateReadUnavailable
         }
         guard coordinate.text.utf16.count == coordinate.length else {
@@ -157,7 +157,7 @@ enum AXTextDocumentResolver {
               selection.length <= coordinate.length - selection.location else {
             throw AXTextDocumentResolutionError.selectionOutOfBounds
         }
-        if selection.length > 0, probe.read(selection) == nil {
+        if selection.length > 0, try probe.read(selection) == nil {
             throw AXTextDocumentResolutionError.selectedRangeUnavailable
         }
 
@@ -288,8 +288,8 @@ enum AXTextDocumentResolver {
     private static func readCoordinateText(
         rawText: String,
         probe: AXTextCoordinateProbe
-    ) -> (length: Int, text: String)? {
-        guard let empty = probe.read(.init(location: 0, length: 0)), empty.isEmpty else {
+    ) throws -> (length: Int, text: String)? {
+        guard let empty = try probe.read(.init(location: 0, length: 0)), empty.isEmpty else {
             return nil
         }
 
@@ -307,7 +307,7 @@ enum AXTextDocumentResolver {
         // shortest and require the returned text to have the requested size.
         for omittedLength in 0...separatorLength {
             let candidate = rawLength - omittedLength
-            guard let text = probe.read(.init(location: 0, length: candidate)),
+            guard let text = try probe.read(.init(location: 0, length: candidate)),
                   text.utf16.count == candidate else {
                 continue
             }
