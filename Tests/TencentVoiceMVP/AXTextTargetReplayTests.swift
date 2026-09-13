@@ -196,6 +196,157 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertEqual(acknowledgement.fields["receiptRepresentationTransition"], "trailing_newline_collapsed")
     }
 
+    func testRealAXReplayHandlesMultipleEmptyParagraphsBeforeRestartedSession() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "草稿",
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        let sender = ReplayKeyboardEventSender(access: access)
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target, keyboardSmoothing: .live, pacingClock: clock)
+
+        try injector.begin()
+        injector.apply(projection: projection("第一句话", revision: 1))
+        await finish(injector, finalText: "第一句话", advancing: clock)
+        let prefix = "草稿第一句话"
+        let emptyParagraphCount = 3
+        let beforeRestart = prefix + String(repeating: "\n", count: emptyParagraphCount)
+        let afterFirst = prefix
+            + String(repeating: "\n", count: emptyParagraphCount - 1)
+            + "乙"
+        let afterSecond = afterFirst + "后"
+
+        // The first finish represents stopping the recording. The following
+        // snapshot is the document after three manual Shift+Return presses.
+        access.rawText = beforeRestart
+        access.coordinateOverride = beforeRestart
+        access.selection = .init(location: beforeRestart.utf16.count - 1, length: 0)
+        access.writeSnapshots = [
+            .init(
+                rawText: afterFirst,
+                coordinateText: afterFirst,
+                selection: .init(location: afterFirst.utf16.count, length: 0)
+            ),
+            .init(
+                rawText: afterSecond,
+                coordinateText: afterSecond,
+                selection: .init(location: afterSecond.utf16.count, length: 0)
+            )
+        ]
+        let postsBeforeRestart = sender.appendPosts
+
+        try injector.begin()
+        injector.apply(projection: projection("乙", revision: 1))
+        await finish(injector, finalText: "乙", advancing: clock)
+        injector.apply(projection: projection("乙后", revision: 2))
+        await finish(injector, finalText: "乙后", advancing: clock)
+
+        XCTAssertEqual(access.rawText, afterSecond)
+        XCTAssertEqual(sender.appendPosts, postsBeforeRestart + 2)
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+    }
+
+    func testRealAXReplayHandlesTwoEmptyParagraphsFromChromiumSnapshot() async throws {
+        // Independently sampled from macOS AX on Chromium 152.0.7977.84:
+        // <p>甲</p><p><br></p><p><br></p> -> <p>甲</p><p><br></p><p>乙</p>.
+        // Unlike the one-newline case, AXValue loses the final placeholder LF.
+        let access = ReplayAXTextTargetAccess(
+            text: "甲\n\n",
+            selection: .init(location: 2, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.coordinateOverride = "甲\n\n"
+        access.writeSnapshots = [
+            .init(rawText: "甲\n乙", coordinateText: "甲\n乙", selection: .init(location: 3, length: 0)),
+            .init(rawText: "甲\n乙丙", coordinateText: "甲\n乙丙", selection: .init(location: 4, length: 0))
+        ]
+        let sender = ReplayKeyboardEventSender(access: access)
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target, keyboardSmoothing: .live, pacingClock: clock)
+        try injector.begin()
+        injector.apply(projection: projection("乙", revision: 1))
+        await finish(injector, finalText: "乙", advancing: clock)
+        injector.apply(projection: projection("乙丙", revision: 2))
+        await finish(injector, finalText: "乙丙", advancing: clock)
+
+        XCTAssertEqual(access.rawText, "甲\n乙丙", "speech must continue beyond the first character")
+        XCTAssertEqual(sender.appendPosts, 2, "each growth is posted once")
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+    }
+
+    func testRealAXReplayHandlesArbitraryTrailingEmptyParagraphCount() async throws {
+        for emptyParagraphCount in [2, 3, 4, 8, 32, 128] {
+            let prefix = "草稿第一句"
+            let trailingSeparators = String(repeating: "\n", count: emptyParagraphCount)
+            let firstRawText = prefix + trailingSeparators
+            let afterFirstText = prefix
+                + String(repeating: "\n", count: emptyParagraphCount - 1)
+                + "乙"
+            let afterSecondText = afterFirstText + "丙"
+            let access = ReplayAXTextTargetAccess(
+                text: firstRawText,
+                selection: .init(location: firstRawText.utf16.count - 1, length: 0),
+                application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+            )
+            access.coordinateOverride = firstRawText
+            access.writeSnapshots = [
+                .init(
+                    rawText: afterFirstText,
+                    coordinateText: afterFirstText,
+                    selection: .init(location: afterFirstText.utf16.count, length: 0)
+                ),
+                .init(
+                    rawText: afterSecondText,
+                    coordinateText: afterSecondText,
+                    selection: .init(location: afterSecondText.utf16.count, length: 0)
+                )
+            ]
+            let sender = ReplayKeyboardEventSender(access: access)
+            let clock = ManualKeyboardPacingClock()
+            let target = AXTextTarget(
+                access: access,
+                keyboardEventSender: sender,
+                writeTiming: .init(
+                    now: { clock.nowNanoseconds },
+                    sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+                ),
+                acknowledgementTimeoutNanoseconds: 20_000_000
+            )
+            let injector = TextInjector(target: target, keyboardSmoothing: .live, pacingClock: clock)
+
+            try injector.begin()
+            injector.apply(projection: projection("乙", revision: 1))
+            await finish(injector, finalText: "乙", advancing: clock)
+            injector.apply(projection: projection("乙丙", revision: 2))
+            await finish(injector, finalText: "乙丙", advancing: clock)
+
+            XCTAssertEqual(access.rawText, afterSecondText, "failed at (emptyParagraphCount) trailing empty paragraphs")
+            XCTAssertEqual(sender.appendPosts, 2, "failed at (emptyParagraphCount) trailing empty paragraphs")
+            XCTAssertEqual(injector.errorCount, 0, "failed at (emptyParagraphCount) trailing empty paragraphs")
+            XCTAssertEqual(injector.modeDescription, "keyboard_live_tail", "failed at (emptyParagraphCount) trailing empty paragraphs")
+        }
+    }
+
     func testRealAXReplayRejectsTransitionWithDifferentRawDocument() async throws {
         let access = ReplayAXTextTargetAccess(
             text: "草稿\n",
@@ -641,6 +792,12 @@ private enum ReplayTargetChange: Equatable {
     case focus
 }
 
+private struct ReplayAXSnapshot {
+    let rawText: String
+    let coordinateText: String
+    let selection: ReplayTextRange
+}
+
 @MainActor
 private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     let element = AXUIElementCreateApplication(9001)
@@ -659,10 +816,13 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var coordinateIncludesStructuralSeparators = false
     var collapseStructuralSeparatorsAfterNextWrite = false
     var transitionRawOverride: String?
+    var coordinateOverride: String?
+    var writeSnapshots: [ReplayAXSnapshot] = []
     private(set) var textReadCount = 0
     private(set) var coordinateReadCount = 0
 
     var coordinateText: String {
+        if let coordinateOverride { return coordinateOverride }
         if coordinateIncludesStructuralSeparators {
             return rawText
         }
@@ -769,6 +929,13 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     }
 
     func applyReplacement(_ text: String, range: ReplayTextRange) {
+        if !writeSnapshots.isEmpty {
+            let snapshot = writeSnapshots.removeFirst()
+            rawText = snapshot.rawText
+            coordinateOverride = snapshot.coordinateText
+            selection = snapshot.selection
+            return
+        }
         var rawRange = rawRange(for: range)
         let rawUTF16 = Array(rawText.utf16)
         let movesInsertionAfterTrailingNewline = collapseStructuralSeparatorsAfterNextWrite

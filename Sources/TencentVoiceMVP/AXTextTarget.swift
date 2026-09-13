@@ -778,6 +778,13 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
             return nil
         }
 
+        let documentTrailingNewlineCount = trailingNewlineCount(in: document)
+        let rawTrailingNewlineCount = trailingNewlineCount(in: rawDocument)
+        guard documentTrailingNewlineCount > 0,
+              documentTrailingNewlineCount == rawTrailingNewlineCount else {
+            return nil
+        }
+
         let alternateSelection = TextRange(
             location: range.location + text.utf16.count,
             length: 0
@@ -799,10 +806,29 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         )
 
         let alternateRaw = NSMutableString(string: rawDocument)
-        alternateRaw.replaceCharacters(
-            in: NSRange(location: rawRange.location + 1, length: 0),
-            with: text
-        )
+        if rawTrailingNewlineCount == 1 {
+            // With one empty paragraph the AXValue line feed is the separator
+            // before the new paragraph, so the inserted text follows it.
+            alternateRaw.replaceCharacters(
+                in: NSRange(location: rawRange.location + 1, length: 0),
+                with: text
+            )
+        } else {
+            // With multiple empty paragraphs Chromium drops only the final
+            // placeholder line feed. Keep all preceding paragraph separators,
+            // insert before that marker, then remove exactly that marker.
+            alternateRaw.replaceCharacters(
+                in: NSRange(location: rawRange.location, length: 0),
+                with: text
+            )
+            let removedMarkerLocation = rawRange.location + text.utf16.count
+            guard utf16Unit(at: removedMarkerLocation, in: alternateRaw as String) == 0x0A else {
+                return nil
+            }
+            alternateRaw.deleteCharacters(
+                in: NSRange(location: removedMarkerLocation, length: 1)
+            )
+        }
         let alternateText = alternateCoordinate as String
         let alternateRawText = alternateRaw as String
         let probe = AXTextCoordinateProbe { requestedRange in
@@ -845,6 +871,16 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         let units = Array(text.utf16)
         guard offset < units.count else { return nil }
         return units[offset]
+    }
+
+    private func trailingNewlineCount(in text: String) -> Int {
+        let units = Array(text.utf16)
+        var count = 0
+        for unit in units.reversed() {
+            guard unit == 0x0A else { break }
+            count += 1
+        }
+        return count
     }
 
     private func isStructuralSeparator(_ scalar: UnicodeScalar) -> Bool {
