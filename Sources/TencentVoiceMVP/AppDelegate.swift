@@ -22,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let rimeInstallationID: String
     private var settingsWindowController: SettingsWindowController?
     private var rimeDictionaryWindowController: RimeDictionaryWindowController?
+    private var rimeConflictWindowController: RimeConflictWindowController?
     private var usageMonitorTask: Task<Void, Never>?
     private var rimeThemeSelectionTask: Task<Void, Never>?
     private var rimeSyncTask: Task<Void, Never>?
@@ -157,10 +158,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             onSyncAllConfiguration: { [weak self] in
                 self?.syncAllConfiguration()
+            },
+            onManageRimeConflicts: { [weak self] in
+                self?.showRimeConflicts()
+            },
+            onRefreshRimeConflicts: { [weak self] in
+                self?.refreshRimeConflictCount()
             }
         )
         menu.update(autoStartEnabled: loginItemManager.isEnabled)
         refreshRimeThemes()
+        refreshRimeConflictCount()
         registerHotkey()
         localUsageStore.migrateLegacyUnscopedUsage(to: TencentEnginePreset.standard.rawValue)
         _ = try? sharedUsageStore.recoverAbandonedSessions()
@@ -441,6 +449,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.begin()
     }
 
+    private func showRimeConflicts() {
+        if let existing = rimeConflictWindowController, existing.window?.isVisible == true {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+            existing.window?.makeKeyAndOrderFront(nil)
+            existing.window?.orderFrontRegardless()
+            existing.begin()
+            return
+        }
+        let controller = RimeConflictWindowController(reviewCoordinator: rimeConfigurationCoordinator)
+        controller.onConflictsChanged = { [weak self] in
+            self?.refreshRimeConflictCount()
+        }
+        rimeConflictWindowController = controller
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        controller.showWindow(nil)
+        controller.window?.center()
+        controller.window?.makeKeyAndOrderFront(nil)
+        controller.window?.orderFrontRegardless()
+        controller.begin()
+    }
+
+    private func refreshRimeConflictCount() {
+        do {
+            menu.update(rimeConflictCount: try rimeConfigurationCoordinator.configurationConflictPreviews().count)
+        } catch {
+            menu.update(rimeConflictCount: nil)
+        }
+    }
+
     private func syncRimeDictionary() {
         guard rimeSyncTask == nil else { return }
         menu.update(syncStatus: "Rime 词库同步 1/3：准备目录…")
@@ -530,12 +569,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             switch result {
             case let .success(report):
                 let changedCount = report.changedFiles.count + report.deletedFiles.count
-                let conflictMessage = report.conflicts.isEmpty
-                    ? ""
-                    : " · \(report.conflicts.count) 个文件冲突，已暂停"
                 menu.update(syncStatus: "\(operation) 3/3：刷新 Rime…")
                 refreshRimeThemes()
-                menu.update(syncStatus: "\(success) · \(changedCount) 项变更\(conflictMessage)")
+                refreshRimeConflictCount()
+                if !report.conflicts.isEmpty {
+                    let reloadMessage = report.reloadSucceeded
+                        ? ""
+                        : "；配置已保存，生效失败：\(report.reloadError ?? "未知重载错误")"
+                    menu.update(syncStatus: "部分同步完成，\(report.conflicts.count) 个文件待处理 · \(changedCount) 项变更\(reloadMessage)")
+                } else if !report.reloadSucceeded {
+                    menu.update(syncStatus: "配置已保存，生效失败：\(report.reloadError ?? "未知重载错误")")
+                } else {
+                    menu.update(syncStatus: "\(success) · \(changedCount) 项变更")
+                }
             case let .failure(error):
                 menu.update(syncStatus: "\(operation)失败：\(error.localizedDescription)")
             }

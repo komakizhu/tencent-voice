@@ -26,6 +26,31 @@ struct RimeSyncMain {
             try printReport(makeEngine(options: options).status())
         case "sync":
             try printReport(makeEngine(options: options).sync(dryRun: options.dryRun))
+        case "conflicts":
+            try printConflicts(makeEngine(options: options).conflictPreviews())
+        case "resolve":
+            guard let path = options.path, let choice = options.choice else {
+                throw usageError("resolve 需要 --path 和 --choose")
+            }
+            let resolution: RimeConflictResolution
+            switch choice {
+            case "local": resolution = .keepLocal
+            case "shared": resolution = .keepShared
+            case "merge":
+                guard let text = options.text else {
+                    throw usageError("resolve --choose merge 需要 --text")
+                }
+                resolution = .merge(text)
+            default:
+                throw usageError("resolve --choose 只能是 local、shared 或 merge")
+            }
+            try printReport(
+                makeEngine(options: options).resolveConflict(
+                    path: path,
+                    resolution: resolution,
+                    expectedVersion: options.expectedVersion
+                )
+            )
         case "verify":
             let result = RimeVerifier().verify(configuration: makeConfiguration(options: options))
             if result.isValid {
@@ -105,14 +130,55 @@ struct RimeSyncMain {
     }
 
     private static func printReport(_ report: SyncReport) {
+        let status: String
+        if !report.conflicts.isEmpty {
+            status = "partial"
+        } else if !report.reloadSucceeded {
+            status = "saved-reload-failed"
+        } else {
+            status = "complete"
+        }
+        print("status: \(status)")
         print("changed: \(report.changedFiles.count)")
         report.changedFiles.forEach { print("  \($0)") }
         print("deleted: \(report.deletedFiles.count)")
         report.deletedFiles.forEach { print("  \($0)") }
         print("conflicts: \(report.conflicts.count)")
         report.conflicts.forEach { print("  \($0)") }
+        report.conflictDetails.forEach {
+            print("  reason[\($0.relativePath)]: \($0.reason.rawValue) (\($0.reason.displayName)), nodes=\($0.nodeIDs.joined(separator: ","))")
+        }
+        if !report.autoRecoveredFiles.isEmpty {
+            print("auto-recovered: \(report.autoRecoveredFiles.count)")
+            report.autoRecoveredFiles.forEach { print("  \($0)") }
+        }
+        if !report.reloadSucceeded {
+            print("reload: failed")
+            if let reloadError = report.reloadError { print("  \(reloadError)") }
+        }
         if !report.backupID.isEmpty { print("backup: \(report.backupID)") }
         print("userdb-sync: \(report.userDictionarySyncSucceeded ? "OK" : "not run")")
+    }
+
+    private static func printConflicts(_ previews: [RimeConflictPreview]) {
+        print("conflicts: \(previews.count)")
+        for preview in previews {
+            print("\(preview.relativePath): \(preview.reason.rawValue) (\(preview.reason.displayName))")
+            print("  nodes: \(preview.variants.map(\.nodeID).joined(separator: ","))")
+            print("  version: \(preview.versionToken)")
+            if let localText = preview.localText {
+                print("  local:")
+                print(localText, terminator: localText.hasSuffix("\n") ? "" : "\n")
+            }
+            if let sharedText = preview.sharedText {
+                print("  shared:")
+                print(sharedText, terminator: sharedText.hasSuffix("\n") ? "" : "\n")
+            }
+            if let suggestedMerge = preview.suggestedMerge {
+                print("  suggested-merge:")
+                print(suggestedMerge, terminator: suggestedMerge.hasSuffix("\n") ? "" : "\n")
+            }
+        }
     }
 
     private static func usageError(_ message: String = "") -> Error {
@@ -127,6 +193,8 @@ struct RimeSyncMain {
       RimeSync configure [--rime-dir <目录>] [--shared-root <目录>] [--installation-id <id>]
       RimeSync status [--rime-dir <目录>] [--shared-root <目录>]
       RimeSync sync [--dry-run] [--rime-dir <目录>] [--shared-root <目录>]
+      RimeSync conflicts [--rime-dir <目录>] [--shared-root <目录>]
+      RimeSync resolve --path <相对路径> --choose local|shared|merge [--text <文本>] [--expected-version <版本>] [--rime-dir <目录>] [--shared-root <目录>]
       RimeSync verify [--rime-dir <目录>] [--shared-root <目录>]
       RimeSync restore --backup <id> [--rime-dir <目录>] [--shared-root <目录>]
 
@@ -146,6 +214,10 @@ private struct CLIOptions {
     let captureOnly: Bool
     let dryRun: Bool
     let backupID: String?
+    let path: String?
+    let choice: String?
+    let text: String?
+    let expectedVersion: String?
 
     init(arguments: [String]) throws {
         let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
@@ -160,6 +232,10 @@ private struct CLIOptions {
         var captureOnly = false
         var dryRun = false
         var backup: String?
+        var path: String?
+        var choice: String?
+        var text: String?
+        var expectedVersion: String?
 
         var index = 0
         while index < arguments.count {
@@ -176,6 +252,10 @@ private struct CLIOptions {
             case "--workspace": workspace = try Self.value(arguments, index: &index, for: argument).asURL()
             case "--source-installation-id": sourceInstallationID = try Self.value(arguments, index: &index, for: argument)
             case "--backup": backup = try Self.value(arguments, index: &index, for: argument)
+            case "--path": path = try Self.value(arguments, index: &index, for: argument)
+            case "--choose": choice = try Self.value(arguments, index: &index, for: argument)
+            case "--text": text = try Self.value(arguments, index: &index, for: argument)
+            case "--expected-version": expectedVersion = try Self.value(arguments, index: &index, for: argument)
             default: throw RimeSyncError.unsupportedOperation("未知参数：\(argument)")
             }
             index += 1
@@ -191,6 +271,10 @@ private struct CLIOptions {
         self.captureOnly = captureOnly
         self.dryRun = dryRun
         self.backupID = backup
+        self.path = path
+        self.choice = choice
+        self.text = text
+        self.expectedVersion = expectedVersion
     }
 
     private static func value(_ arguments: [String], index: inout Int, for option: String) throws -> String {
