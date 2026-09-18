@@ -1461,6 +1461,23 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
         return try ordinarySync.sync(dryRun: false)
     }
 
+    public func configurationConflictPreviews() throws -> [RimeConflictPreview] {
+        try ordinarySync.conflictPreviews()
+    }
+
+    @discardableResult
+    public func resolveConfigurationConflict(
+        path: String,
+        resolution: RimeConflictResolution,
+        expectedVersion: String? = nil
+    ) throws -> SyncReport {
+        try ordinarySync.resolveConflict(
+            path: path,
+            resolution: resolution,
+            expectedVersion: expectedVersion
+        )
+    }
+
     /// Rebuild the audit cache from snapshots that already exist in the
     /// shared directory.  This intentionally does not stop Squirrel, invoke
     /// `--sync`, create a runtime backup, or run ordinary resource sync.

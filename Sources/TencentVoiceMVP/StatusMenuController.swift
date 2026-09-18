@@ -1,7 +1,7 @@
 import AppKit
 
 @MainActor
-final class StatusMenuController: NSObject {
+final class StatusMenuController: NSObject, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private var usageMenuItemView: UsageMenuItemView?
     private var settingsMenuItem: NSMenuItem?
@@ -16,7 +16,10 @@ final class StatusMenuController: NSObject {
     private var onSyncRimeDictionary: (() -> Void)?
     private var onSyncRimeSkin: (() -> Void)?
     private var onSyncAllConfiguration: (() -> Void)?
+    private var onManageRimeConflicts: (() -> Void)?
+    private var onRefreshRimeConflicts: (() -> Void)?
     private var rimeSyncMenuItems: [NSMenuItem] = []
+    private var rimeConflictMenuItem: NSMenuItem?
     private var syncStatusMenuItem: NSMenuItem?
     private var syncStatusMenuItemView: SyncStatusMenuItemView?
     private(set) var statusText = "就绪"
@@ -47,6 +50,7 @@ final class StatusMenuController: NSObject {
 
     func makeMenu() -> NSMenu {
         let menu = NSMenu()
+        menu.delegate = self
         let usageView = UsageMenuItemView(text: "模型：计算中…\n用量：计算中…")
         let usage = NSMenuItem()
         usage.view = usageView
@@ -79,6 +83,10 @@ final class StatusMenuController: NSObject {
         syncAllConfiguration.target = self
         syncAllConfiguration.toolTip = "同步全部 Rime 稳定配置；实时用户词库仍使用“同步 Rime 词库”"
         menu.addItem(syncAllConfiguration)
+        let conflicts = NSMenuItem(title: "处理配置冲突…", action: #selector(manageRimeConflictsPressed), keyEquivalent: "")
+        conflicts.target = self
+        conflicts.toolTip = "查看、比较并处理仍处于暂停状态的配置文件"
+        menu.addItem(conflicts)
         let settings = NSMenuItem(title: "设置…", action: #selector(settingsPressed), keyEquivalent: ",")
         settings.target = self
         let record = NSMenuItem(title: "开始录音", action: #selector(toggleRecordingPressed), keyEquivalent: "")
@@ -96,7 +104,8 @@ final class StatusMenuController: NSObject {
         recordMenuItem = record
         autoStartMenuItem = autoStart
         rimeThemeMenuItem = rimeTheme
-        rimeSyncMenuItems = [syncDictionary, syncSkin, syncAllConfiguration]
+        rimeSyncMenuItems = [syncDictionary, syncSkin, syncAllConfiguration, conflicts]
+        rimeConflictMenuItem = conflicts
         syncStatusMenuItem = syncStatus
         syncStatusMenuItemView = syncStatusView
         return menu
@@ -145,6 +154,16 @@ final class StatusMenuController: NSObject {
         rimeSyncMenuItems.forEach { $0.isEnabled = !rimeSyncInProgress }
     }
 
+    func update(rimeConflictCount: Int?) {
+        guard let rimeConflictCount else {
+            rimeConflictMenuItem?.title = "处理配置冲突…（读取失败）"
+            return
+        }
+        rimeConflictMenuItem?.title = rimeConflictCount > 0
+            ? "处理配置冲突…（\(rimeConflictCount)）"
+            : "处理配置冲突…"
+    }
+
     func configure(
         onSettings: @escaping () -> Void,
         onToggleRecording: @escaping () -> Void,
@@ -153,7 +172,9 @@ final class StatusMenuController: NSObject {
         onManageRimeDictionary: @escaping () -> Void,
         onSyncRimeDictionary: @escaping () -> Void,
         onSyncRimeSkin: @escaping () -> Void,
-        onSyncAllConfiguration: @escaping () -> Void
+        onSyncAllConfiguration: @escaping () -> Void,
+        onManageRimeConflicts: @escaping () -> Void,
+        onRefreshRimeConflicts: @escaping () -> Void
     ) {
         self.onSettings = onSettings
         self.onToggleRecording = onToggleRecording
@@ -163,6 +184,8 @@ final class StatusMenuController: NSObject {
         self.onSyncRimeDictionary = onSyncRimeDictionary
         self.onSyncRimeSkin = onSyncRimeSkin
         self.onSyncAllConfiguration = onSyncAllConfiguration
+        self.onManageRimeConflicts = onManageRimeConflicts
+        self.onRefreshRimeConflicts = onRefreshRimeConflicts
     }
 
     func update(rimeThemes snapshot: RimeThemeSnapshot) {
@@ -223,6 +246,14 @@ final class StatusMenuController: NSObject {
         onSyncAllConfiguration?()
     }
 
+    @objc private func manageRimeConflictsPressed() {
+        onManageRimeConflicts?()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        onRefreshRimeConflicts?()
+    }
+
     func uninstall() {
         removeStatusItem()
         onSettings = nil
@@ -233,6 +264,8 @@ final class StatusMenuController: NSObject {
         onSyncRimeDictionary = nil
         onSyncRimeSkin = nil
         onSyncAllConfiguration = nil
+        onManageRimeConflicts = nil
+        onRefreshRimeConflicts = nil
     }
 
     private func removeStatusItem() {
@@ -248,6 +281,7 @@ final class StatusMenuController: NSObject {
         rimeThemeMenuItem = nil
         syncStatusMenuItem = nil
         syncStatusMenuItemView = nil
+        rimeConflictMenuItem = nil
         rimeSyncMenuItems = []
     }
 

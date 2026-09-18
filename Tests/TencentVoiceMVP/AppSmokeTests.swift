@@ -40,14 +40,18 @@ final class AppSmokeTests: XCTestCase {
 
         let titles = menu.items.map(\.title)
         let syncTitles = titles.filter {
-            ["同步 Rime 词库", "同步 Rime 皮肤", "一键同步所有配置"].contains($0)
+            ["同步 Rime 词库", "同步 Rime 皮肤", "一键同步所有配置", "处理配置冲突…"].contains($0)
         }
 
         XCTAssertEqual(
             syncTitles,
-            ["同步 Rime 词库", "同步 Rime 皮肤", "一键同步所有配置"]
+            ["同步 Rime 词库", "同步 Rime 皮肤", "一键同步所有配置", "处理配置冲突…"]
         )
         XCTAssertFalse(titles.contains("同步 Rime 所有配置"))
+        controller.update(rimeConflictCount: 2)
+        XCTAssertTrue(menu.items.contains { $0.title == "处理配置冲突…（2）" })
+        controller.update(rimeConflictCount: nil)
+        XCTAssertTrue(menu.items.contains { $0.title == "处理配置冲突…（读取失败）" })
     }
 
     func testStatusMenuContainsAutoStartToggle() throws {
@@ -67,7 +71,7 @@ final class AppSmokeTests: XCTestCase {
     func testStatusMenuDisablesAllRimeSyncActionsWhileBusy() {
         let controller = StatusMenuController()
         let menu = controller.makeMenu()
-        let titles = ["同步 Rime 词库", "同步 Rime 皮肤", "一键同步所有配置"]
+        let titles = ["同步 Rime 词库", "同步 Rime 皮肤", "一键同步所有配置", "处理配置冲突…"]
 
         controller.update(rimeSyncInProgress: true)
         XCTAssertTrue(
