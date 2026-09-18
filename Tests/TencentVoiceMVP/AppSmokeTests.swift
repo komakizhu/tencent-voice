@@ -4,9 +4,82 @@ import RimeSyncCore
 
 @MainActor
 final class AppSmokeTests: XCTestCase {
+    func testMicrophoneButtonRequestsOnlyMicrophoneAndRefreshesResult() async throws {
+        for grant in [true, false] {
+            var authorized = false
+            var requested: [PrivacyPermission] = []
+            var opened: [PrivacyPermission] = []
+            var resets = 0
+            let checker = SystemPrivacyPermissionChecker(
+                microphoneStatus: { authorized ? .authorized : .notDetermined },
+                accessibilityStatus: { true },
+                postEventStatus: { true },
+                inputMonitoringStatus: { true },
+                openSettings: { opened.append($0); return true },
+                requestPermission: { permission, completion in
+                    requested.append(permission)
+                    authorized = grant
+                    completion(grant)
+                },
+                resetPermissions: { resets += 1; return true }
+            )
+            let controller = SettingsWindowController(
+                settings: AppSettings(), credentials: nil,
+                onSave: { _, _ in }, permissionChecker: checker
+            )
+            let button = try XCTUnwrap(flatten(controller.window?.contentView)
+                .compactMap { $0 as? NSButton }
+                .first { $0.title == "打开设置" && $0.tag == PrivacyPermission.microphone.rawValue })
+            button.performClick(nil)
+            for _ in 0..<10 { await Task.yield() }
+            XCTAssertEqual(requested, [.microphone])
+            XCTAssertEqual(opened, grant ? [] : [.microphone])
+            XCTAssertEqual(resets, 0)
+            XCTAssertTrue(button.isEnabled)
+            if grant {
+                XCTAssertTrue(flatten(controller.window?.contentView)
+                    .compactMap { $0 as? NSTextField }
+                    .contains { $0.stringValue.contains("麦克风已允许；") })
+            }
+        }
+    }
+
+    func testSettingsWindowExplainsRecordingStartPermissionFailure() throws {
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .notDetermined },
+            accessibilityStatus: { true },
+            postEventStatus: { true },
+            inputMonitoringStatus: { true }
+        )
+        let controller = SettingsWindowController(
+            settings: AppSettings(),
+            credentials: TencentCredentials(appID: "app", secretID: "id", secretKey: "key"),
+            onSave: { _, _ in },
+            permissionChecker: checker
+        )
+
+        controller.showRecordingStartFailure(SessionError.microphoneDenied)
+
+        XCTAssertTrue(
+            flatten(controller.window?.contentView)
+                .compactMap { $0 as? NSTextField }
+                .contains { $0.stringValue == RecordingStartFeedback.message(for: SessionError.microphoneDenied) }
+        )
+    }
+
     func testStatusMenuControllerCanBeCreated() {
         let controller = StatusMenuController()
         XCTAssertEqual(controller.statusText, "就绪")
+    }
+
+    func testStatusMenuReturnsToStartAfterRecordingStartFailure() {
+        let controller = StatusMenuController()
+        let menu = controller.makeMenu()
+
+        controller.update(status: RecordingStartFeedback.message(for: SessionError.microphoneDenied))
+
+        XCTAssertEqual(menu.items.first { $0.title == "开始录音" }?.title, "开始录音")
+        XCTAssertNil(menu.items.first { $0.title == "停止录音" })
     }
 
     func testStatusMenuDisplaysSyncProgress() {
@@ -167,8 +240,21 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertTrue(credentialFields.allSatisfy { !($0.toolTip ?? "").isEmpty })
 
         let popups = flatten(contentView).compactMap { $0 as? NSPopUpButton }
-        XCTAssertEqual(popups.count, 2)
+        XCTAssertEqual(popups.count, 3)
         XCTAssertTrue(popups.allSatisfy { !($0.toolTip ?? "").isEmpty })
+        guard let shortcutPresetPopup = popups.first(where: { popup in
+            popup.itemArray.contains { $0.title == "F5（屏蔽 macOS 听写）" }
+        }) else {
+            XCTFail("找不到快捷键预设下拉框")
+            return
+        }
+        let shortcutPresetTitles = shortcutPresetPopup.itemArray.map(\.title)
+        XCTAssertTrue(shortcutPresetTitles.contains("F5（屏蔽 macOS 听写）"))
+        XCTAssertTrue(shortcutPresetTitles.contains("Esc"))
+        XCTAssertTrue(shortcutPresetTitles.contains("Home"))
+        XCTAssertTrue(shortcutPresetTitles.contains("Page Up"))
+        XCTAssertTrue(shortcutPresetTitles.contains("Page Down"))
+        XCTAssertFalse(shortcutPresetTitles.contains { $0.localizedCaseInsensitiveContains("delete") })
 
         let controls = flatten(contentView).compactMap { $0 as? NSButton }
         XCTAssertTrue(controls.contains { $0.title == "自动保存诊断日志" })
@@ -437,6 +523,48 @@ final class AppSmokeTests: XCTestCase {
             flatten(contentView)
                 .compactMap { $0 as? NSTextField }
                 .contains { $0.stringValue == "设置已保存" }
+        )
+    }
+
+    func testSettingsWindowSavesSelectedShortcutPreset() throws {
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .authorized },
+            accessibilityStatus: { true },
+            postEventStatus: { true },
+            inputMonitoringStatus: { true }
+        )
+        var savedSettings: AppSettings?
+        let controller = SettingsWindowController(
+            settings: AppSettings(),
+            credentials: TencentCredentials(appID: "app", secretID: "id", secretKey: "key"),
+            onSave: { settings, _ in savedSettings = settings },
+            permissionChecker: checker
+        )
+        let contentView = try XCTUnwrap(controller.window?.contentView)
+        let popup = try XCTUnwrap(
+            flatten(contentView)
+                .compactMap { $0 as? NSPopUpButton }
+                .first { $0.itemTitles.contains("Page Down") }
+        )
+        popup.selectItem(withTitle: "Page Down")
+        guard let action = popup.action else {
+            XCTFail("快捷键预设下拉框没有绑定操作")
+            return
+        }
+        XCTAssertTrue(NSApp.sendAction(action, to: popup.target, from: popup))
+
+        let saveButton = try XCTUnwrap(
+            flatten(contentView)
+                .compactMap { $0 as? NSButton }
+                .first { $0.title == "保存设置" }
+        )
+        saveButton.performClick(nil)
+
+        XCTAssertEqual(savedSettings?.shortcut, ShortcutPreset.pageDown.shortcut)
+        XCTAssertTrue(
+            flatten(contentView)
+                .compactMap { $0 as? NSTextField }
+                .contains { $0.stringValue == "Page Down" }
         )
     }
 

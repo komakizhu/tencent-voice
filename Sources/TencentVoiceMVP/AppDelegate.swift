@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let settingsStore: UserDefaultsSettingsStore
     private let credentialStore: PersistentCredentialStore
     private let hotkeyManager: CarbonHotkeyManager
+    private let nativeF5Remapper: NativeF5Remapper
     private let menu: StatusMenuController
     private let loginItemManager: LoginItemManager
     private let coordinator: SessionCoordinator
@@ -24,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var rimeDictionaryWindowController: RimeDictionaryWindowController?
     private var rimeConflictWindowController: RimeConflictWindowController?
     private var usageMonitorTask: Task<Void, Never>?
+    private var nativeF5MonitorTask: Task<Void, Never>?
     private var rimeThemeSelectionTask: Task<Void, Never>?
     private var rimeSyncTask: Task<Void, Never>?
     private var cachedCredentials: TencentCredentials?
@@ -35,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             perUserFallback: LocalYAMLCredentialStore()
         )
         let hotkeyManager = CarbonHotkeyManager()
+        let nativeF5Remapper = NativeF5Remapper()
         let menu = StatusMenuController()
         let loginItemManager = LoginItemManager()
         let localUsageStore = LocalUsageStore()
@@ -78,6 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.settingsStore = settingsStore
         self.credentialStore = credentialStore
         self.hotkeyManager = hotkeyManager
+        self.nativeF5Remapper = nativeF5Remapper
         self.menu = menu
         self.loginItemManager = loginItemManager
         self.localUsageStore = localUsageStore
@@ -170,6 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshRimeThemes()
         refreshRimeConflictCount()
         registerHotkey()
+        startNativeF5Monitor()
         localUsageStore.migrateLegacyUnscopedUsage(to: TencentEnginePreset.standard.rawValue)
         _ = try? sharedUsageStore.recoverAbandonedSessions()
         migrateLocalUsageIfNeeded()
@@ -223,11 +228,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        nativeF5MonitorTask?.cancel()
         usageMonitorTask?.cancel()
         rimeThemeSelectionTask?.cancel()
         rimeSyncTask?.cancel()
         rimeDictionaryWindowController?.close()
         hotkeyManager.unregister()
+        if !nativeF5Remapper.restoreIfOwned() {
+            sessionLogger.recordDiagnosticAction("hotkey_native_f5_restore_failed", fields: [
+                "errorCode": "hotkey_native_f5_remap_unavailable",
+                "errorMessage": "退出时无法恢复 macOS 原生按键映射"
+            ])
+        }
         endTrackedUsageSession()
         coordinator.cancel()
         menu.uninstall()
@@ -237,6 +249,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let settings = settingsStore.load()
         menu.update(shortcut: settings.shortcut)
         do {
+            try synchronizeNativeF5(for: settings.shortcut)
             try hotkeyManager.register(
                 settings.shortcut,
                 onPress: { [weak self] in
@@ -248,11 +261,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             menu.update(status: "就绪 · \(ShortcutFormatter.string(for: settings.shortcut))")
         } catch {
+            _ = nativeF5Remapper.restoreIfOwned()
             sessionLogger.recordDiagnosticAction("hotkey_registration_failed", fields: [
                 "errorCode": DiagnosticErrorFormatter.code(for: error),
                 "errorMessage": DiagnosticErrorFormatter.message(for: error)
             ])
             menu.update(status: "错误：\(error.localizedDescription)")
+        }
+    }
+
+    private func synchronizeNativeF5(for shortcut: Shortcut) throws {
+        guard nativeF5Remapper.synchronize(shouldApply: shortcut.isNativeF5Preset) else {
+            throw HotkeyError.nativeF5RemapUnavailable
+        }
+    }
+
+    private func startNativeF5Monitor() {
+        nativeF5MonitorTask = Task { @MainActor [weak self] in
+            var reportedFailure = false
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: 5_000_000_000) }
+                catch { return }
+                guard let self else { return }
+                // Only the foreground login session owns hardware mappings.
+                let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+                guard session?["kCGSSessionOnConsoleKey"] as? Bool == true,
+                      self.settingsStore.load().shortcut.isNativeF5Preset else { continue }
+                let ready = self.nativeF5Remapper.synchronize(shouldApply: true)
+                if !ready && !reportedFailure {
+                    self.sessionLogger.recordDiagnosticAction("hotkey_native_f5_remap_unavailable")
+                    self.menu.update(status: "错误：听写键映射失效，请检查其他键盘工具的映射")
+                }
+                reportedFailure = !ready
+            }
         }
     }
 
@@ -281,6 +322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             credentials: credentials,
             onSave: { [weak self] newSettings, newCredentials in
                 guard let self else { return }
+                let previousSettings = settingsStore.load()
                 // Credentials must be persisted before attempting a potentially conflicting hotkey.
                 try credentialStore.save(newCredentials)
                 cachedCredentials = newCredentials
@@ -289,13 +331,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     for: newCredentials,
                     engineModelType: newSettings.engineModelType
                 )
-                try hotkeyManager.register(
-                    newSettings.shortcut,
-                    onPress: { [weak self] in
-                        Task { @MainActor [weak self] in await self?.toggleRecording() }
-                    },
-                    onRelease: {}
-                )
+                do {
+                    try synchronizeNativeF5(for: newSettings.shortcut)
+                    try hotkeyManager.register(
+                        newSettings.shortcut,
+                        onPress: { [weak self] in
+                            Task { @MainActor [weak self] in await self?.toggleRecording() }
+                        },
+                        onRelease: {}
+                    )
+                } catch {
+                    _ = nativeF5Remapper.synchronize(
+                        shouldApply: previousSettings.shortcut.isNativeF5Preset
+                    )
+                    throw error
+                }
                 settingsStore.save(newSettings)
                 menu.setVisible(!newSettings.hideMenuBarIcon)
                 if !newSettings.hideMenuBarIcon {
@@ -671,7 +721,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func beginRecording() async {
         let engineModelType = settingsStore.load().engineModelType
-        try? await coordinator.begin()
+        do {
+            try await coordinator.begin()
+        } catch {
+            handleRecordingStartFailure(error)
+            return
+        }
         guard coordinator.state == .listening || coordinator.state == .recovering,
               let credentials = loadCredentials() else { return }
         activeUsageSessionID = try? sharedUsageStore.beginSession(
@@ -679,6 +734,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             engineModelType: engineModelType
         )
         updateLocalUsageDisplay()
+    }
+
+    private func handleRecordingStartFailure(_ error: Error) {
+        let errorCode = DiagnosticErrorFormatter.code(for: error)
+        let errorMessage = DiagnosticErrorFormatter.message(for: error)
+        sessionLogger.recordDiagnosticAction("recording_start_failed", fields: [
+            "errorCode": errorCode,
+            "errorMessage": errorMessage
+        ])
+        menu.update(status: RecordingStartFeedback.message(for: error))
+        guard RecordingStartFeedback.shouldShowSettings(for: error) else { return }
+        showSettings()
+        settingsWindowController?.showRecordingStartFailure(error)
     }
 
     private func loadCredentials() -> TencentCredentials? {

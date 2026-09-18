@@ -9,7 +9,7 @@
 	<key>CFBundleIconFile</key>
 	<string>AppIcon.icns</string>
 	<key>CFBundleIdentifier</key>
-	<string>local.tencent-voice-mvp</string>
+	<string>local.onekey.iflyvoice</string>
 	<key>CFBundleName</key>
 	<string>Rime Voice</string>
 	<key>CFBundlePackageType</key>

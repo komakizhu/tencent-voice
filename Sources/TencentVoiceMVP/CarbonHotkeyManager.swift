@@ -15,11 +15,14 @@ protocol HotkeyManaging: AnyObject {
 
 enum HotkeyError: Error, LocalizedError {
     case invalidShortcut
+    case nativeF5RemapUnavailable
     case hotkeyUnavailable(OSStatus)
 
     var errorDescription: String? {
         switch self {
         case .invalidShortcut: return "这个快捷键不能使用"
+        case .nativeF5RemapUnavailable:
+            return "无法屏蔽 macOS 原生听写，F5 预设未生效"
         case let .hotkeyUnavailable(status): return "快捷键注册失败（\(status)）"
         }
     }
@@ -28,6 +31,8 @@ enum HotkeyError: Error, LocalizedError {
         switch self {
         case .invalidShortcut:
             return "hotkey_invalid_shortcut"
+        case .nativeF5RemapUnavailable:
+            return "hotkey_native_f5_remap_unavailable"
         case let .hotkeyUnavailable(status):
             return "hotkey_unavailable_\(status)"
         }
@@ -89,14 +94,18 @@ private final class HotkeyEventTapContext: @unchecked Sendable {
             return Unmanaged.passUnretained(event)
         }
 
-        guard type == .keyDown || type == .keyUp else {
+        guard let input = makeInput(type: type, event: event) else {
             return Unmanaged.passUnretained(event)
         }
 
-        let keyCode = UInt32(event.getIntegerValueField(.keyboardEventKeycode))
         let result: (HotkeyEventAction, (@Sendable () -> Void)?) = {
             lock.lock()
-            let action = processor.process(type: type, keyCode: keyCode, flags: event.flags)
+            let action = processor.process(
+                isDown: input.isDown,
+                isRepeat: input.isRepeat,
+                keyCode: input.keyCode,
+                flags: input.flags
+            )
             let callback: (@Sendable () -> Void)?
             switch action {
             case .press:
@@ -118,6 +127,46 @@ private final class HotkeyEventTapContext: @unchecked Sendable {
             return nil
         case .pass:
             return Unmanaged.passUnretained(event)
+        }
+    }
+
+    private func makeInput(
+        type: CGEventType,
+        event: CGEvent
+    ) -> (isDown: Bool, isRepeat: Bool, keyCode: UInt32, flags: CGEventFlags)? {
+        switch type {
+        case .keyDown:
+            return (
+                isDown: true,
+                isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0,
+                keyCode: UInt32(event.getIntegerValueField(.keyboardEventKeycode)),
+                flags: event.flags
+            )
+        case .keyUp:
+            return (
+                isDown: false,
+                isRepeat: false,
+                keyCode: UInt32(event.getIntegerValueField(.keyboardEventKeycode)),
+                flags: event.flags
+            )
+        case _ where type.rawValue == SystemKeyEventDecoder.systemDefinedEventTypeRawValue:
+            guard let nsEvent = NSEvent(cgEvent: event),
+                  let systemEvent = SystemKeyEventDecoder.decode(
+                      subtype: nsEvent.subtype.rawValue,
+                      data1: Int64(nsEvent.data1),
+                      timestampNanoseconds: event.timestamp,
+                      eventTag: event.getIntegerValueField(.eventSourceUserData)
+                  ) else {
+                return nil
+            }
+            return (
+                isDown: systemEvent.isDown,
+                isRepeat: systemEvent.isRepeat,
+                keyCode: systemEvent.keyCode,
+                flags: event.flags
+            )
+        default:
+            return nil
         }
     }
 
@@ -148,10 +197,11 @@ private final class ActiveHotkeyEventTap {
         )
         let eventMask =
             (CGEventMask(1) << CGEventMask(CGEventType.keyDown.rawValue)) |
-            (CGEventMask(1) << CGEventMask(CGEventType.keyUp.rawValue))
+            (CGEventMask(1) << CGEventMask(CGEventType.keyUp.rawValue)) |
+            (CGEventMask(1) << CGEventMask(SystemKeyEventDecoder.systemDefinedEventTypeRawValue))
 
         guard let tap = CGEvent.tapCreate(
-            tap: .cgAnnotatedSessionEventTap,
+            tap: .cgSessionEventTap,
             place: .headInsertEventTap,
             options: .defaultTap,
             eventsOfInterest: eventMask,

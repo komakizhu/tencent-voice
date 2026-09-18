@@ -8,6 +8,43 @@ struct Shortcut: Codable, Equatable, Sendable {
 
     static let defaultCommand0 = Shortcut(keyCode: UInt32(kVK_ANSI_0), modifiers: UInt32(cmdKey))
     static let defaultF5 = Shortcut(keyCode: UInt32(kVK_F5), modifiers: 0)
+
+    var isNativeF5Preset: Bool {
+        self == Shortcut.defaultF5
+    }
+}
+
+enum ShortcutPreset: String, CaseIterable, Equatable, Sendable {
+    case f5
+    case escape
+    case home
+    case pageUp
+    case pageDown
+
+    var shortcut: Shortcut {
+        switch self {
+        case .f5:
+            return .defaultF5
+        case .escape:
+            return Shortcut(keyCode: UInt32(kVK_Escape), modifiers: 0)
+        case .home:
+            return Shortcut(keyCode: UInt32(kVK_Home), modifiers: 0)
+        case .pageUp:
+            return Shortcut(keyCode: UInt32(kVK_PageUp), modifiers: 0)
+        case .pageDown:
+            return Shortcut(keyCode: UInt32(kVK_PageDown), modifiers: 0)
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .f5: return "F5（屏蔽 macOS 听写）"
+        case .escape: return "Esc"
+        case .home: return "Home"
+        case .pageUp: return "Page Up"
+        case .pageDown: return "Page Down"
+        }
+    }
 }
 
 enum ShortcutValidator {
@@ -17,11 +54,15 @@ enum ShortcutValidator {
         UInt32(kVK_F11), UInt32(kVK_F12), UInt32(kVK_F13), UInt32(kVK_F14), UInt32(kVK_F15),
         UInt32(kVK_F16), UInt32(kVK_F17), UInt32(kVK_F18), UInt32(kVK_F19), UInt32(kVK_F20)
     ]
+    private static let standaloneKeyCodes: Set<UInt32> = [
+        UInt32(kVK_Escape), UInt32(kVK_Home), UInt32(kVK_PageUp), UInt32(kVK_PageDown)
+    ]
 
     static func isAllowed(_ shortcut: Shortcut) -> Bool {
         let isFunctionKey = functionKeyCodes.contains(shortcut.keyCode)
+        let isStandaloneKey = standaloneKeyCodes.contains(shortcut.keyCode)
         let hasModifier = shortcut.modifiers != 0
-        return isFunctionKey || hasModifier
+        return isFunctionKey || isStandaloneKey || hasModifier
     }
 }
 
@@ -49,6 +90,10 @@ enum ShortcutFormatter {
         case UInt32(kVK_F18): keyName = "F18"
         case UInt32(kVK_F19): keyName = "F19"
         case UInt32(kVK_F20): keyName = "F20"
+        case UInt32(kVK_Escape): keyName = "Esc"
+        case UInt32(kVK_Home): keyName = "Home"
+        case UInt32(kVK_PageUp): keyName = "Page Up"
+        case UInt32(kVK_PageDown): keyName = "Page Down"
         case UInt32(kVK_ANSI_A)...UInt32(kVK_ANSI_Z):
             keyName = String(UnicodeScalar(UInt8(shortcut.keyCode) + Character("A").asciiValue!))
         default:
@@ -97,6 +142,10 @@ enum ShortcutFormatter {
         case UInt32(kVK_F18): return String(UnicodeScalar(NSF18FunctionKey)!)
         case UInt32(kVK_F19): return String(UnicodeScalar(NSF19FunctionKey)!)
         case UInt32(kVK_F20): return String(UnicodeScalar(NSF20FunctionKey)!)
+        case UInt32(kVK_Escape): return String(UnicodeScalar(0x1B)!)
+        case UInt32(kVK_Home): return String(UnicodeScalar(NSHomeFunctionKey)!)
+        case UInt32(kVK_PageUp): return String(UnicodeScalar(NSPageUpFunctionKey)!)
+        case UInt32(kVK_PageDown): return String(UnicodeScalar(NSPageDownFunctionKey)!)
         default: return "键码 \(shortcut.keyCode)"
         }
     }
