@@ -16,6 +16,36 @@ final class ShortcutTests: XCTestCase {
         XCTAssertEqual(Shortcut.defaultF5, Shortcut(keyCode: UInt32(kVK_F5), modifiers: 0))
     }
 
+    func testShortcutPresetsContainRequestedKeysWithoutDelete() {
+        XCTAssertEqual(
+            ShortcutPreset.allCases.map(\.shortcut),
+            [
+                Shortcut(keyCode: UInt32(kVK_F5), modifiers: 0),
+                Shortcut(keyCode: UInt32(kVK_Escape), modifiers: 0),
+                Shortcut(keyCode: UInt32(kVK_Home), modifiers: 0),
+                Shortcut(keyCode: UInt32(kVK_PageUp), modifiers: 0),
+                Shortcut(keyCode: UInt32(kVK_PageDown), modifiers: 0)
+            ]
+        )
+        XCTAssertEqual(
+            ShortcutPreset.allCases.map(\.displayName),
+            ["F5（屏蔽 macOS 听写）", "Esc", "Home", "Page Up", "Page Down"]
+        )
+        XCTAssertFalse(ShortcutPreset.allCases.map(\.displayName).contains { $0.localizedCaseInsensitiveContains("delete") })
+    }
+
+    func testPresetSpecialKeysAreAllowedWithoutModifiers() {
+        XCTAssertTrue(ShortcutPreset.allCases.allSatisfy { ShortcutValidator.isAllowed($0.shortcut) })
+    }
+
+    func testShortcutFormatterNamesPresetSpecialKeys() {
+        XCTAssertEqual(ShortcutFormatter.string(for: ShortcutPreset.f5.shortcut), "F5")
+        XCTAssertEqual(ShortcutFormatter.string(for: ShortcutPreset.escape.shortcut), "Esc")
+        XCTAssertEqual(ShortcutFormatter.string(for: ShortcutPreset.home.shortcut), "Home")
+        XCTAssertEqual(ShortcutFormatter.string(for: ShortcutPreset.pageUp.shortcut), "Page Up")
+        XCTAssertEqual(ShortcutFormatter.string(for: ShortcutPreset.pageDown.shortcut), "Page Down")
+    }
+
     func testShortcutRoundTripsThroughJSON() throws {
         let shortcut = Shortcut(keyCode: UInt32(kVK_F5), modifiers: UInt32(optionKey))
         let data = try JSONEncoder().encode(shortcut)

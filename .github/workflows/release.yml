@@ -27,6 +27,7 @@ jobs:
       - name: Build app
         env:
           CODESIGN_IDENTITY: "-"
+          TVMVP_ALLOW_ADHOC_SIGNING: "1"
           TVMVP_DISPLAY_NAME: Rime Voice
           TVMVP_PUBLIC_RELEASE: "1"
         run: ./scripts/build-app.sh

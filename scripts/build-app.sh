@@ -4,6 +4,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PRODUCT_NAME="TencentVoiceMVP"
 SIGNING_IDENTITY="${CODESIGN_IDENTITY:-OneKeyIFlyVoice Local Code Signing v4}"
+ALLOW_ADHOC_SIGNING="${TVMVP_ALLOW_ADHOC_SIGNING:-0}"
 PACING_PRESET="${TVMVP_PACING_PRESET:-balanced}"
 PUBLIC_RELEASE="${TVMVP_PUBLIC_RELEASE:-0}"
 INFO_PLIST="$PROJECT_DIR/Resources/Info.plist"
@@ -18,6 +19,21 @@ case "$PUBLIC_RELEASE" in
     exit 1
     ;;
 esac
+
+case "$ALLOW_ADHOC_SIGNING" in
+0|1)
+    ;;
+*)
+    echo "TVMVP_ALLOW_ADHOC_SIGNING must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "$SIGNING_IDENTITY" == "-" && "$ALLOW_ADHOC_SIGNING" != "1" ]]; then
+    echo "refusing to build an ad hoc-signed app for local use" >&2
+    echo "use the stable local signing identity, or set TVMVP_ALLOW_ADHOC_SIGNING=1 for CI-only artifacts" >&2
+    exit 1
+fi
 
 SWIFT_DEFINITIONS=()
 case "$PACING_PRESET" in
@@ -158,6 +174,13 @@ else
         exit 1
     fi
     codesign --force --deep --sign "$SIGNING_IDENTITY" "$APP_DIR" >/dev/null
+fi
+
+codesign --verify --deep --strict "$APP_DIR"
+if [[ "$SIGNING_IDENTITY" != "-" ]] \
+    && /usr/bin/codesign -d -r- "$APP_DIR" 2>&1 | rg -q 'cdhash|adhoc'; then
+    echo "stable signing identity did not produce a stable designated requirement" >&2
+    exit 1
 fi
 
 echo "Built $APP_DIR (pacing: $PACING_PRESET)"

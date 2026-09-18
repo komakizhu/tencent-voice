@@ -110,10 +110,11 @@ final class StatusMenuController: NSObject {
     func update(status: String) {
         statusText = status
         let isIdle = status.contains("就绪")
+        let isError = status.hasPrefix("错误：") || status.hasPrefix("无法开始录音：")
         let isStopping = status.contains("收尾中")
         recordMenuItem?.title = isStopping
             ? "收尾中…"
-            : (isIdle ? "开始录音" : "停止录音")
+            : (isIdle || isError ? "开始录音" : "停止录音")
         recordMenuItem?.isEnabled = !isStopping
     }
 

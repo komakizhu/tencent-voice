@@ -35,13 +35,30 @@ struct HotkeyEventProcessor {
     ) -> HotkeyEventAction {
         switch type {
         case .keyDown:
-            guard keyCode == shortcut.keyCode else {
-                return .pass
-            }
+            return process(isDown: true, isRepeat: false, keyCode: keyCode, flags: flags)
+        case .keyUp:
+            return process(isDown: false, isRepeat: false, keyCode: keyCode, flags: flags)
+        default:
+            return .pass
+        }
+    }
 
+    mutating func process(
+        isDown: Bool,
+        isRepeat: Bool,
+        keyCode: UInt32,
+        flags: CGEventFlags
+    ) -> HotkeyEventAction {
+        guard keyCode == shortcut.keyCode else {
+            return .pass
+        }
+
+        if isDown {
             // Once the matching key is down, consume repeat events even if
-            // the system changes the modifier flags between deliveries.
-            if isPressed, pressedKeyCode == keyCode {
+            // the system changes the modifier flags between deliveries. A
+            // repeat without its initial press is also consumed so that a
+            // native system key cannot leak through to macOS.
+            if isRepeat || (isPressed && pressedKeyCode == keyCode) {
                 return .consume
             }
 
@@ -52,21 +69,17 @@ struct HotkeyEventProcessor {
             isPressed = true
             pressedKeyCode = keyCode
             return .press
+        }
 
-        case .keyUp:
-            // Key-up events do not reliably retain the modifier flags. The
-            // recorded press is the source of truth for releasing the toggle.
-            guard isPressed, pressedKeyCode == keyCode else {
-                return .pass
-            }
-
-            isPressed = false
-            pressedKeyCode = nil
-            return .release
-
-        default:
+        // Key-up events do not reliably retain the modifier flags. The
+        // recorded press is the source of truth for releasing the toggle.
+        guard isPressed, pressedKeyCode == keyCode else {
             return .pass
         }
+
+        isPressed = false
+        pressedKeyCode = nil
+        return .release
     }
 
     private static func carbonModifiers(from flags: CGEventFlags) -> UInt32 {
