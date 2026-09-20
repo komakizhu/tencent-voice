@@ -630,6 +630,7 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
     }
 
     public func conflictPreviews() throws -> [RimeConflictPreview] {
+        try reconcileIdenticalPendingConflicts()
         let localRecords = try currentLocalRecords()
         let manifest = try RimeManifest.loading(from: configuration.manifestURL, fileManager: fileManager)
         let paths = Set(manifest.pausedPaths).union(manifest.conflicts.keys)
@@ -643,6 +644,45 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
             )
             guard let record else { return nil }
             return try makePreview(record: record, localRecords: localRecords)
+        }
+    }
+
+    /// Retire pending records whose known current versions are already
+    /// identical. This only updates manifest metadata; it never changes file
+    /// contents or chooses between different versions.
+    private func reconcileIdenticalPendingConflicts() throws {
+        let lock = DirectoryLock(lockURL: configuration.lockURL, fileManager: fileManager)
+        try lock.withLock {
+            let localRecords = try currentLocalRecords()
+            var manifest = try RimeManifest.loading(from: configuration.manifestURL, fileManager: fileManager)
+            let paths = Set(manifest.pausedPaths).union(manifest.conflicts.keys)
+                .filter { RimeResourcePolicy.isAllowed(relativePath: $0) }
+                .sorted()
+            var changed = false
+
+            for path in paths {
+                guard let conflict = conflictRecord(
+                    for: path,
+                    manifest: manifest,
+                    localRecords: localRecords
+                ), let recovery = try automaticRecovery(
+                    for: conflict,
+                    localRecords: localRecords
+                ), !recovery.countsAsChange else {
+                    continue
+                }
+                manifest.records[path] = recovery.record
+                manifest.pausedPaths.remove(path)
+                manifest.conflicts.removeValue(forKey: path)
+                for nodeID in recovery.nodeIDs {
+                    manifest.nodes[nodeID, default: [:]][path] = recovery.record.changingOwner(to: nodeID)
+                }
+                changed = true
+            }
+
+            guard changed else { return }
+            try manifest.saving(to: configuration.manifestURL, fileManager: fileManager)
+            try SharedDirectoryLayout.makeGroupWritable(configuration.manifestURL, fileManager: fileManager)
         }
     }
 
@@ -1103,12 +1143,46 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
         for conflict: RimeConflictRecord,
         localRecords: [String: FileRecord]
     ) throws -> AutomaticRecovery? {
-        // Legacy artifacts are deliberately conservative. They may contain
-        // two versions, but not enough trustworthy history to auto-choose.
-        guard conflict.reason != .historical,
-              let sharedRecord = conflict.sharedRecord,
+        // Legacy artifacts are deliberately conservative when their contents
+        // still differ or their evidence is incomplete. Equal current
+        // content is safe to reconcile because no version choice is needed.
+        guard let sharedRecord = conflict.sharedRecord,
               sharedRecord.state == .present else {
             return nil
+        }
+
+        // A historical record can still contain stale snapshots from an
+        // older node. If this account's current file is byte-for-byte equal
+        // to the current shared file, there is no active choice left for
+        // this account to make. Retire the stale history instead of showing
+        // it as a pending conflict.
+        if conflict.reason == .historical,
+           let localRecord = localRecords[conflict.relativePath],
+           localRecord.state == .present,
+           let localData = try? localData(for: localRecord),
+           let sharedData = try? sharedData(for: sharedRecord),
+           dataMatches(localData, record: localRecord),
+           dataMatches(sharedData, record: sharedRecord),
+           localData == sharedData {
+            let record = makeRecord(
+                path: conflict.relativePath,
+                data: sharedData,
+                owner: configuration.nodeID,
+                modifiedNanoseconds: max(
+                    localRecord.modifiedNanoseconds,
+                    sharedRecord.modifiedNanoseconds,
+                    nowNanoseconds()
+                )
+            )
+            let participantIDs = Set(conflict.nodeRecords.keys)
+                .union([configuration.nodeID])
+                .union([sharedRecord.owner])
+            return AutomaticRecovery(
+                record: record,
+                data: sharedData,
+                nodeIDs: Array(participantIDs).sorted(),
+                countsAsChange: false
+            )
         }
 
         var nodeRecords = conflict.nodeRecords
@@ -1152,6 +1226,11 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
                 countsAsChange: changed
             )
         }
+
+        // A historical artifact with different current content still needs
+        // an explicit user choice because its original baseline is not
+        // trustworthy.
+        guard conflict.reason != .historical else { return nil }
 
         // If this account already equals the shared version while another
         // node still differs, do not let this account clear that node's

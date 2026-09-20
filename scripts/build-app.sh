@@ -140,10 +140,13 @@ else
 fi
 BIN_DIR="$(swift build -c release --show-bin-path)"
 BIN_PATH="$BIN_DIR/$PRODUCT_NAME"
-if [[ ! -x "$BIN_PATH" ]]; then
+if [[ ! -f "$BIN_PATH" ]]; then
     echo "release binary not found: $BIN_PATH" >&2
     exit 1
 fi
+# Some shared workspace filesystems drop executable bits when Swift writes the
+# binary. Restore it before the bundle is assembled so Finder can launch it.
+chmod +x "$BIN_PATH"
 
 CURRENT_BUILD="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$PROJECT_DIR/Resources/Info.plist")"
 if [[ ! "$CURRENT_BUILD" =~ ^[0-9]+$ ]]; then
@@ -156,6 +159,7 @@ echo "Bundle build: $CURRENT_BUILD -> $NEXT_BUILD"
 
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/$PRODUCT_NAME"
+chmod +x "$APP_DIR/Contents/MacOS/$PRODUCT_NAME"
 cp "$PROJECT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$PROJECT_DIR/Resources/brand-kit-graphite/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 cp "$PROJECT_DIR/Resources/brand-kit-graphite/statusbar-matched.png" "$APP_DIR/Contents/Resources/statusbar-matched.png"

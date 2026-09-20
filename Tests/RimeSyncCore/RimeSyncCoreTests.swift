@@ -419,6 +419,65 @@ final class RimeSyncCoreTests: XCTestCase {
         XCTAssertNotNil(saved.conflicts[path])
     }
 
+    func testHistoricalConflictWithMatchingCurrentContentAutoResolves() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let local = root.appendingPathComponent("local/Rime", isDirectory: true)
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        let path = "squirrel.custom.yaml"
+        let text = "patch:\n  schema_list:\n    - schema: luna_pinyin\n"
+        let staleText = "patch:\n  schema_list:\n    - schema: old_schema\n"
+        try write(text, to: local.appendingPathComponent(path))
+        try write(text, to: shared.appendingPathComponent("config/nodes/mac").appendingPathComponent(path))
+        try write(staleText, to: shared.appendingPathComponent("config/nodes/old").appendingPathComponent(path))
+
+        let localRecord = try XCTUnwrap(RimeFileInventory(root: local).scan(owner: "mac2").first)
+        let sharedRecord = FileRecord.present(
+            path: path,
+            modifiedNanoseconds: localRecord.modifiedNanoseconds,
+            byteCount: Int64(text.utf8.count),
+            sha256: digest(text),
+            owner: "mac"
+        )
+        let staleRecord = FileRecord.present(
+            path: path,
+            modifiedNanoseconds: localRecord.modifiedNanoseconds - 1,
+            byteCount: Int64(staleText.utf8.count),
+            sha256: digest(staleText),
+            owner: "old"
+        )
+        let historical = RimeConflictRecord(
+            relativePath: path,
+            nodeRecords: ["mac2": localRecord, "mac": sharedRecord, "old": staleRecord],
+            sharedRecord: sharedRecord,
+            reason: .historical
+        )
+        try RimeManifest(
+            records: [path: sharedRecord],
+            nodes: ["mac2": [path: localRecord], "mac": [path: sharedRecord], "old": [path: staleRecord]],
+            pausedPaths: [path],
+            conflicts: [path: historical]
+        ).saving(to: shared.appendingPathComponent("config/manifest.json"))
+
+        let engine = DefaultRimeSyncEngine(
+            configuration: SyncConfiguration(
+                localRimeDirectory: local,
+                sharedRoot: shared,
+                installationID: "mac2-main",
+                nodeID: "mac2"
+            ),
+            maintenance: FakeMaintenance()
+        )
+
+        XCTAssertTrue(try engine.conflictPreviews().isEmpty)
+        let saved = try RimeManifest.loading(from: shared.appendingPathComponent("config/manifest.json"))
+        XCTAssertFalse(saved.pausedPaths.contains(path))
+        XCTAssertNil(saved.conflicts[path])
+
+        let report = try engine.sync()
+        XCTAssertEqual(report.conflicts, [])
+    }
+
     func testRepeatedConflictTracksLocalDeletionWithoutFailingToSaveConflict() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
