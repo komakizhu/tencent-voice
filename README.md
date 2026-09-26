@@ -33,10 +33,11 @@
 ```bash
 swift test
 ./scripts/build-app.sh
-codesign --verify --deep --strict "dist/Rime Voice.app"
+build_number=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist)
+codesign --verify --deep --strict "dist/Rime Voice Build${build_number}.app"
 ```
 
-本地构建默认在设置页显示版本号和 Build 号；公开发布由 GitHub Actions 使用 `TVMVP_PUBLIC_RELEASE=1` 构建，设置页只显示版本号。安装脚本明确使用本地构建模式。
+每次构建都会把递增后的 Build 号写入 `.app` 文件名（例如 `Rime Voice Build97.app`）；设置页始终只显示版本号。GitHub Actions 发布包也采用同一文件名规则。安装脚本为保留 macOS 应用身份，仍将构建产物安装到固定路径 `/Applications/Rime Voice.app`。
 
 这是个人本地 macOS 应用，没有 Windows 兼容目标，也没有自动上传或发布流程。
 

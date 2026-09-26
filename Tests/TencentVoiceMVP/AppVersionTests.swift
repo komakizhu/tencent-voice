@@ -2,13 +2,14 @@ import XCTest
 @testable import TencentVoiceMVP
 
 final class AppVersionTests: XCTestCase {
-    func testDisplayTextIncludesVersionAndBuild() {
+    func testDisplayTextNeverShowsBuildNumber() {
         XCTAssertEqual(
             AppVersion.displayText(for: [
                 "CFBundleShortVersionString": "0.1.1",
-                "CFBundleVersion": "2"
+                "CFBundleVersion": "97",
+                "RimeVoiceShowBuild": true
             ]),
-            "当前版本：0.1.1（build 2）"
+            "当前版本：0.1.1"
         )
     }
 
@@ -19,14 +20,4 @@ final class AppVersionTests: XCTestCase {
         )
     }
 
-    func testDisplayTextOmitsBuildForPublicRelease() {
-        XCTAssertEqual(
-            AppVersion.displayText(for: [
-                "CFBundleShortVersionString": "0.1.1",
-                "CFBundleVersion": "2",
-                "RimeVoiceShowBuild": false
-            ]),
-            "当前版本：0.1.1"
-        )
-    }
 }

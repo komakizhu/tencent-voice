@@ -357,7 +357,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         permissionResetButton.action = #selector(resetPermissionsPressed)
         permissionResetButton.toolTip = "清除 Rime Voice 的全部 macOS 权限记录，打开隐私设置，从头重新授权。"
         statusLabel.toolTip = "显示当前设置页操作、权限、连接测试、快捷键和导出结果。"
-        versionLabel.toolTip = "显示当前应用版本和构建号。"
+        versionLabel.toolTip = "显示当前应用版本。"
         let buttons = NSStackView(views: [statusLabel, NSView(), saveButton])
         buttons.distribution = .fill
         buttons.alignment = .centerY

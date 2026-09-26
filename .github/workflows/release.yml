@@ -29,20 +29,23 @@ jobs:
           CODESIGN_IDENTITY: "-"
           TVMVP_ALLOW_ADHOC_SIGNING: "1"
           TVMVP_DISPLAY_NAME: Rime Voice
-          TVMVP_PUBLIC_RELEASE: "1"
         run: ./scripts/build-app.sh
 
       - name: Verify app bundle
         run: |
-          codesign --verify --deep --strict "dist/Rime Voice.app"
-          test -x "dist/Rime Voice.app/Contents/MacOS/TencentVoiceMVP"
+          BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist)"
+          APP_PATH="dist/Rime Voice Build${BUILD_NUMBER}.app"
+          codesign --verify --deep --strict "$APP_PATH"
+          test -x "$APP_PATH/Contents/MacOS/TencentVoiceMVP"
 
       - name: Package release assets
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
+          BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist)"
+          APP_PATH="dist/Rime Voice Build${BUILD_NUMBER}.app"
           archive="dist/Rime-Voice-${TAG_NAME}.zip"
-          ditto -c -k --sequesterRsrc --keepParent "dist/Rime Voice.app" "$archive"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$archive"
           shasum -a 256 "$archive" > "${archive}.sha256"
 
       - name: Upload release assets

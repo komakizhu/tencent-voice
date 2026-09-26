@@ -6,19 +6,13 @@ PRODUCT_NAME="TencentVoiceMVP"
 SIGNING_IDENTITY="${CODESIGN_IDENTITY:-OneKeyIFlyVoice Local Code Signing v4}"
 ALLOW_ADHOC_SIGNING="${TVMVP_ALLOW_ADHOC_SIGNING:-0}"
 PACING_PRESET="${TVMVP_PACING_PRESET:-balanced}"
-PUBLIC_RELEASE="${TVMVP_PUBLIC_RELEASE:-0}"
 INFO_PLIST="$PROJECT_DIR/Resources/Info.plist"
-BUNDLE_SHORT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST")"
-BUNDLE_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO_PLIST")"
-
-case "$PUBLIC_RELEASE" in
-0|1)
-    ;;
-*)
-    echo "TVMVP_PUBLIC_RELEASE must be 0 or 1" >&2
+CURRENT_BUILD="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$INFO_PLIST")"
+if [[ ! "$CURRENT_BUILD" =~ ^[0-9]+$ ]]; then
+    echo "CFBundleVersion must be a non-negative integer: $CURRENT_BUILD" >&2
     exit 1
-    ;;
-esac
+fi
+NEXT_BUILD=$((CURRENT_BUILD + 1))
 
 case "$ALLOW_ADHOC_SIGNING" in
 0|1)
@@ -84,9 +78,9 @@ esac
 if [[ -n "${TVMVP_OUTPUT_APP:-}" ]]; then
     APP_DIR="$TVMVP_OUTPUT_APP"
 elif [[ "$PACING_PRESET" == "balanced" ]]; then
-    APP_DIR="$PROJECT_DIR/dist/Rime Voice.app"
+    APP_DIR="$PROJECT_DIR/dist/Rime Voice Build${NEXT_BUILD}.app"
 else
-    APP_DIR="$PROJECT_DIR/dist/presets/Rime Voice-$BUNDLE_SHORT_VERSION-build$BUNDLE_BUILD-$PACING_PRESET.app"
+    APP_DIR="$PROJECT_DIR/dist/presets/Rime Voice Build${NEXT_BUILD}-$PACING_PRESET.app"
 fi
 
 EXTERNAL_VOLUME="/Volumes/T7_1T"
@@ -171,6 +165,10 @@ if [[ "$APP_NAME" == "." || "$APP_NAME" == ".." || "$APP_NAME" != *.app ]]; then
     echo "output app must be an .app bundle: $APP_DIR" >&2
     exit 1
 fi
+if [[ "$APP_NAME" != *"Build${NEXT_BUILD}"*.app ]]; then
+    echo "output app name must include Build${NEXT_BUILD}: $APP_NAME" >&2
+    exit 1
+fi
 case "$APP_PARENT" in
     "$DIST_ROOT"|"$DIST_ROOT"/*)
         APP_DIR="$APP_PARENT"
@@ -227,12 +225,6 @@ fi
 # binary. Restore it before the bundle is assembled so Finder can launch it.
 chmod +x "$BIN_PATH"
 
-CURRENT_BUILD="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$PROJECT_DIR/Resources/Info.plist")"
-if [[ ! "$CURRENT_BUILD" =~ ^[0-9]+$ ]]; then
-    echo "CFBundleVersion must be a non-negative integer: $CURRENT_BUILD" >&2
-    exit 1
-fi
-NEXT_BUILD=$((CURRENT_BUILD + 1))
 /usr/bin/plutil -replace CFBundleVersion -string "$NEXT_BUILD" "$PROJECT_DIR/Resources/Info.plist"
 echo "Bundle build: $CURRENT_BUILD -> $NEXT_BUILD"
 
@@ -243,11 +235,6 @@ cp "$PROJECT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$PROJECT_DIR/Resources/brand-kit-graphite/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 cp "$PROJECT_DIR/Resources/brand-kit-graphite/statusbar-matched.png" "$APP_DIR/Contents/Resources/statusbar-matched.png"
 plutil -replace CFBundleDisplayName -string "$DISPLAY_NAME" "$APP_DIR/Contents/Info.plist"
-if [[ "$PUBLIC_RELEASE" == "1" ]]; then
-    plutil -replace RimeVoiceShowBuild -bool false "$APP_DIR/Contents/Info.plist"
-else
-    plutil -replace RimeVoiceShowBuild -bool true "$APP_DIR/Contents/Info.plist"
-fi
 if [[ "$SIGNING_IDENTITY" == "-" ]]; then
     codesign --force --deep --sign - "$APP_DIR" >/dev/null
 else
