@@ -210,7 +210,8 @@ final class RimeDictionaryWindowController: NSWindowController, NSTableViewDataS
     private var cachedFilterResult: RimeAuditFilterResult?
     private var selectedIDs = Set<String>()
     private var isWorking = false
-    private var lastSyncDescription = "上次同步：未知"
+    var hasPendingOperation: Bool { isWorking }
+    private var lastSyncDescription = "上次本机快照：未知"
 
     private enum PreferenceKey {
         static let view = "rime.audit.view"
@@ -262,7 +263,10 @@ final class RimeDictionaryWindowController: NSWindowController, NSTableViewDataS
 
         configureExportMenu()
         searchField.toolTip = "按词条或编码筛选当前快照"
-        reviewButton.toolTip = "只读取上次同步保存的快照，不执行备份或同步"
+        reviewButton.title = reviewCoordinator.storageMode == .local ? "刷新本机快照" : "重新读取"
+        reviewButton.toolTip = reviewCoordinator.storageMode == .local
+            ? "备份并读取当前账户自己的学习词条；不会同步或写入共享目录"
+            : "只读取上次保存的快照，不执行备份或同步"
 
         configureSlider(commitSlider, action: #selector(commitBandChanged))
         configureSlider(heatSlider, action: #selector(heatBandChanged))
@@ -500,16 +504,20 @@ final class RimeDictionaryWindowController: NSWindowController, NSTableViewDataS
         guard !isWorking else { return }
         isWorking = true
         setControlsEnabled(false)
-        statusLabel.stringValue = rebuild ? "正在读取已同步快照并更新审核数据…" : "正在读取已保存的审核数据…"
+        statusLabel.stringValue = rebuild
+            ? (reviewCoordinator.storageMode == .local ? "正在备份并读取本机学习词条…" : "正在读取已同步快照并更新审核数据…")
+            : "正在读取已保存的审核数据…"
         let coordinator = reviewCoordinator
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
                 let result: RimeAuditBatch
                 if rebuild {
-                    result = try coordinator.refreshAuditFromPublishedSnapshots()
+                    result = coordinator.storageMode == .local
+                        ? try coordinator.prepareAudit()
+                        : try coordinator.refreshAuditFromPublishedSnapshots()
                 } else {
                     guard let stored = try coordinator.latestBatch() else {
-                        throw RimeSyncError.unsupportedOperation("尚未有已同步审核数据，请先在菜单栏点击“同步 Rime 词库”")
+                        throw RimeSyncError.unsupportedOperation("尚无审核数据，请刷新本机快照")
                     }
                     result = stored
                 }
@@ -525,7 +533,7 @@ final class RimeDictionaryWindowController: NSWindowController, NSTableViewDataS
                     self.cachedFilterQuery = nil
                     self.cachedFilterResult = nil
                     self.proposalsByEntryID = proposals
-                    self.lastSyncDescription = syncDate.map { "上次同步：\(Self.dateFormatter.string(from: $0))" } ?? "上次同步：未知"
+                    self.lastSyncDescription = syncDate.map { "上次本机快照：\(Self.dateFormatter.string(from: $0))" } ?? "本机审核快照已更新"
                     self.selectedIDs.removeAll()
                     self.refreshFilter()
                 }
@@ -562,7 +570,7 @@ final class RimeDictionaryWindowController: NSWindowController, NSTableViewDataS
     @objc private func commitBandChanged() { refreshFilter() }
     @objc private func heatBandChanged() { refreshFilter() }
     @objc private func activityBandChanged() { refreshFilter() }
-    @objc private func reviewPressed() { loadAudit(rebuild: false) }
+    @objc private func reviewPressed() { loadAudit(rebuild: reviewCoordinator.storageMode == .local) }
     @objc private func selectAllPressed() { toggleSelectAll() }
 
     func controlTextDidChange(_ notification: Notification) {

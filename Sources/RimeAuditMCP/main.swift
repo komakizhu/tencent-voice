@@ -2,11 +2,8 @@ import Foundation
 import MCP
 import RimeSyncCore
 
-/// Read-only bridge between an AI client and the Rime audit batch.
-///
-/// The only mutating operation exposed here is submitting a proposal to the
-/// shared review JSON.  Applying a proposal, writing a managed dictionary,
-/// creating a tombstone, and restoring a backup remain menu-bar UI actions.
+/// Per-account bridge to the Rime audit cache. Proposals are stored in the
+/// current user's private Application Support directory, never in shared data.
 private final class RimeAuditMCPService: @unchecked Sendable {
     private let options: RimeAuditMCPOptions
     private let fileManager: FileManager
@@ -17,7 +14,7 @@ private final class RimeAuditMCPService: @unchecked Sendable {
         self.fileManager = fileManager
         let configuration = SyncConfiguration(
             localRimeDirectory: options.localRimeDirectory,
-            sharedRoot: options.sharedRoot,
+            sharedRoot: options.localStateRoot,
             installationID: options.installationID
         )
         let maintenance = SquirrelMaintenance()
@@ -26,7 +23,8 @@ private final class RimeAuditMCPService: @unchecked Sendable {
             maintenance: maintenance,
             reloader: maintenance,
             ordinarySync: DefaultRimeSyncEngine(configuration: configuration, maintenance: maintenance, fileManager: fileManager),
-            fileManager: fileManager
+            fileManager: fileManager,
+            storageMode: .local
         )
     }
 
@@ -351,15 +349,15 @@ private struct PreviewOutput: Codable {
 
 private struct RimeAuditMCPOptions {
     let localRimeDirectory: URL
-    let sharedRoot: URL
+    let localStateRoot: URL
     let installationID: String
 
     init(arguments: [String]) throws {
         let environmentHome = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
         var local = URL(fileURLWithPath: environmentHome)
             .appendingPathComponent("Library/Rime", isDirectory: true)
-        var shared = URL(fileURLWithPath: "/Users/Shared/RimeSync", isDirectory: true)
-        var installation = "mac2-main"
+        let localState = RimeLocalReviewStorage.defaultRoot()
+        var installation: String?
 
         var index = 0
         while index < arguments.count {
@@ -369,9 +367,7 @@ private struct RimeAuditMCPOptions {
                 guard index < arguments.count else { throw Self.usageError("--rime-dir 缺少值") }
                 local = URL(fileURLWithPath: NSString(string: arguments[index]).expandingTildeInPath)
             case "--shared-root":
-                index += 1
-                guard index < arguments.count else { throw Self.usageError("--shared-root 缺少值") }
-                shared = URL(fileURLWithPath: NSString(string: arguments[index]).expandingTildeInPath)
+                throw Self.usageError("--shared-root 已停用；审核状态只存储在当前账户 Application Support")
             case "--installation-id":
                 index += 1
                 guard index < arguments.count else { throw Self.usageError("--installation-id 缺少值") }
@@ -386,14 +382,17 @@ private struct RimeAuditMCPOptions {
             }
             index += 1
         }
+        if installation == nil {
+            installation = try RimeInstallationFile.loading(from: local.appendingPathComponent("installation.yaml"))?.installationID
+        }
         self.localRimeDirectory = local.standardizedFileURL
-        self.sharedRoot = shared.standardizedFileURL
-        self.installationID = installation
+        self.localStateRoot = localState.standardizedFileURL
+        self.installationID = installation ?? "local-main"
     }
 
     private static func usageError(_ message: String) -> Error {
         RimeSyncError.unsupportedOperation(
-            "\(message)。用法：RimeAuditMCP [--rime-dir <目录>] [--shared-root <目录>] [--installation-id <id>]"
+            "\(message)。用法：RimeAuditMCP [--rime-dir <目录>] [--installation-id <id>]"
         )
     }
 }

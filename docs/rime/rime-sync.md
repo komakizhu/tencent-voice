@@ -1,86 +1,19 @@
-# Rime 双账户迁移与同步工具
+# Rime 手动配置存档
 
-这个工具只面向当前 Mac，不修改 Squirrel 引擎，也不接入 Ollama、DeepSeek 或网络热词服务。`mac` 与 `mac2` 各自保留独立的 `~/Library/Rime`；普通配置通过共享 manifest 做双向增量同步，个人词频由 TencentVoiceMVP 的“Rime 词库管理”逐条审核后写入独立受控词库。
+Rime Voice 不再自动跨账户同步配置。需要迁移到另一台 Mac 或另一个 macOS 账户时，在菜单栏使用“导出所有配置…”和“导入所有配置…”。这两个入口交换的是经过白名单筛选的便携存档，不会读写旧的 `/Users/Shared/RimeSync`。
 
-## 首次迁移
+存档为单个 `.rimevoiceconfig` 文件，含格式版本、路径清单、文件大小与 SHA-256 校验。它覆盖 `custom_phrase.txt`、皮肤、方案 YAML、词典、Lua、OpenCC、语法模型、配置助手及受控长期词典 `rime_managed.dict.yaml`。导入前会完整校验并在可滚动清单中展示所有新增、替换和相同项；目标账户未列入存档的文件会保留，确认后先备份受影响文件，再写入并重新加载 Rime。若存档包含 Lua 或配置助手脚本，会额外要求确认来源可信。若写入或重新加载失败，程序恢复文件和本机审核状态并重新加载；中断后下次启动会提示恢复导入前版本，不会把缺少归档载荷的部分导入标记为完成。全部内容相同的重复导入不会重写、备份或重新加载。
 
-个人词库审核不再使用会自动合并远端数据的 Squirrel 原生“同步用户数据”。管理器只发布当前账户的快照，使用 `rime_dict_manager --backup rime_ice`，因此远端快照不会在审核前进入当前 userdb：
+存档明确排除 `installation.yaml`、`build/`、`sync/`、实时 `.userdb`、日志、凭据、机器身份、共享审核历史和审核缓存。导入保留目标账户自己的 installation ID 与其余本机数据。长期词典文件会迁移，但词库审核历史不会跟随账户迁移。
 
-```sh
-"/Library/Input Methods/Squirrel.app/Contents/MacOS/rime_dict_manager" --backup rime_ice
-```
+## 本机词库维护
 
-如果只想先把稳定资源提取到工作区、不动共享目录，可以使用 `--capture-only`。这不会读取或写入 userdb 快照。
+“Rime 词库管理…”仍只管理当前账户。打开窗口只读取当前账户已有的审核数据，不生成快照或修改 `installation.yaml`。只有用户明确点击“刷新本机快照”时，程序才先在当前账户 Application Support 下保存本机备份，然后把本机 `installation.yaml` 的 `sync_dir` 指向当前账户私有快照目录（保留已有 `installation_id`），再生成本机审核快照。它不会调用 Squirrel `--sync`，不会合并其他账户的 userdb 快照，也不会重建实时 `.userdb`。审核缓存与备份存放在 `~/Library/Application Support/Rime Voice/Review`；旧共享审核数据保持原样，不自动迁入。
 
-然后在本仓库根目录执行：
+手动审核与加词仍可修改当前账户的受控长期词典并重新加载 Rime。导入包含 `rime_managed.dict.yaml` 的存档后，会用导入词典重建本机审核词条状态，避免旧审核缓存把导入内容改回去。若导入的主词典需要挂接受控词典，程序会在同一可回滚事务中保存并更新 `rime_ice.dict.yaml`。
 
-```sh
-./scripts/rime-sync bootstrap \
-  --source /Users/Shared/RimeMigration-20260904/Rime \
-  --workspace "$PWD/rime"
-```
+## 旧命令
 
-这一步会把稳定资源保存到工作区，并初始化 `/Users/Shared/RimeSync`。`build/`、`trash/`、Windows 的 `weasel.yaml`、实时 `.userdb` 和旧同步快照不会进入工作区。`rime_ice.userdb.txt` 会进入共享的 Rime 原生 userdb 快照目录；`luna_pinyin` 与 `wanxiang_entry` 会进入 `legacy-userdata` 隔离档案。
+`RimeSync status`、`conflicts` 和 `verify` 仅保留只读历史诊断能力。默认诊断目录是当前账户的 `~/Library/Application Support/Rime Voice/Review`；查看旧共享数据时，必须显式指定 `--shared-root /Users/Shared/RimeSync`，例如 `RimeSync status --shared-root /Users/Shared/RimeSync`。该选项只改变只读诊断的数据来源，不会启用写入。`configure`、`sync`、`resolve` 和 `restore` 已停用；`bootstrap` 仅允许 `--capture-only`，不会初始化共享目录或安装配置。`scripts/rime-refresh-snapshot` 也已停用，改用词库管理窗口里的“刷新本机快照”。不会自动清理旧共享目录、UUID 节点或历史文件。
 
-确认共享结构和资源无误后，再为当前账户安装：
-
-```sh
-./scripts/rime-sync bootstrap \
-  --source /Users/Shared/RimeMigration-20260904/Rime \
-  --workspace "$PWD/rime" \
-  --install \
-  --rime-dir "$HOME/Library/Rime" \
-  --installation-id mac2-main
-```
-
-安装会写入当前账户的 `installation.yaml`，其中 `installation_id` 使用当前账户的稳定 ID，`sync_dir` 固定为 `/Users/Shared/RimeSync/rime-userdata`。它不会复制实时 `.userdb`，避免两个 Squirrel 进程直接争用同一个数据库。
-
-源账户 `mac` 需要在自己的登录会话中把已有安装指向同一个快照目录；不需要把 `mac` 的实时目录复制给 `mac2`：
-
-```sh
-./scripts/rime-sync configure \
-  --rime-dir "$HOME/Library/Rime" \
-  --installation-id af672354-60fc-458a-9254-b0a39c8132ea \
-  --node mac
-```
-
-## 日常命令
-
-```sh
-./scripts/rime-sync status
-./scripts/rime-sync sync --dry-run
-./scripts/rime-sync sync
-./scripts/rime-sync verify
-./scripts/rime-sync restore --backup <备份ID>
-```
-
-`RimeSync sync` 只同步普通稳定资源：创建完整备份、扫描 YAML/Lua/OpenCC/受控词库，并以当前账户上一次同步看到的版本为共同基线做三方增量合并。不同位置的修改会合并到同一文件；同一片段重叠修改、缺少共同基线或两边内容不同且修改时间完全相同会进入冲突，不会用一方静默覆盖另一方。合并结果用原子替换落盘，最后在配置改变时调用 Squirrel `--reload`。它不会调用 Squirrel `--sync`，因此不会绕过审核导入远端 userdb。每个账户默认保留最近 10 份备份；词库维护界面可将数量改为任意正整数，设置从下一次创建备份时生效。`--dry-run` 不创建锁、不调用 Squirrel、不写 manifest 或文件。
-
-TencentVoice 状态栏菜单中的“同步 Rime 皮肤”只同步 `squirrel.custom.yaml`；“同步 Rime 所有配置”和“一键同步所有配置”同步全部普通稳定资源。它们不会把实时 `.userdb` 直接放入共享目录；实时用户词库仍使用单独的“同步 Rime 词库”。如果当前账户还没有 `~/Library/Rime`，配置同步会先建立该账户自己的目录和安装标识，再从共享节点拉取资源。
-
-个人词库维护在 TencentVoiceMVP 菜单栏的“Rime 词库管理…”中完成。管理器打开后只读取最近一次“同步 Rime 词库”生成的审核缓存，不再发布快照、合并 userdb 或重复备份，因此打开 4.7 万条记录会更快。需要交换两个账户的 userdb 时，单独点击菜单栏的“同步 Rime 词库”；它执行 Squirrel 原生同步、创建备份、重新生成当前快照并更新审核缓存。首次读取只建立历史基线，不自动清空或重建 4.7 万条记录。后续只把新增、`c` 增长、疑似噪音和待确认记录放入建议视图。界面使用标准多行选择、全选当前结果和清除选择，不再为每条历史记录创建复选框；累计次数、有效热度和最近活动使用五档滑块，低频或陈旧记录默认隐藏但不会自动删除。
-
-“最近活动”只依据管理器观察到的 `c` 增长时间。首次导入的历史快照没有可靠的日历时间，会显示“历史未知”；在后续同步中实际观察到某词的 `c` 增长后，它才会出现在近一周、近一月等时间范围内。快照中的 `d/t` 重写本身不会被误判为新的输入活动。
-
-人工动作包括保留动态学习、加入长期记忆、删除错误学习、本次跳过、永久忽略和需要人工确认。长期记忆写入独立的 `rime_managed.dict.yaml`，静态权重固定为 1，实际候选排序仍由 `rime_ice.userdb` 动态学习决定；`custom_phrase.txt` 不会被改写。删除错误学习使用 librime 负 `c` 墓碑，当前账户立即处理，另一账户在下次打开管理器时处理；永久忽略会持续生效。
-
-窗口的“导出”菜单可以输出 RFC 4180 CSV、TXT、Markdown 和 JSON，均只包含当前筛选结果，供人工或 AI 离线分析；也可以导入带批次、快照摘要和稳定 ID 的 AI 提案。提案只进入待审核区，最终仍由窗口确认。工作区还提供只读的 stdio MCP server，详见 [rime-audit-mcp.md](rime-audit-mcp.md)；它没有直接应用 userdb 或恢复备份的工具。
-
-同一文件的修改片段重叠、没有共同基线，或两边内容不同且文件修改时间完全相同，会把本地版本、共享版本和可用的基线记录写入 `config/conflicts/<备份ID>/`，保留当前生效文件并将该路径加入 `pausedPaths`；不会静默覆盖。人工处理完冲突后，再从 manifest 中移除对应的 `pausedPaths` 条目并重新运行 `sync`。
-
-## 两个账户
-
-在 `mac` 账户执行时保留源安装 ID：
-
-```sh
-./scripts/rime-sync sync \
-  --rime-dir /Users/mac/Library/Rime \
-  --installation-id af672354-60fc-458a-9254-b0a39c8132ea \
-  --node mac
-```
-
-在 `mac2` 账户执行时使用 `mac2-main` 和 `--node mac2`。两个账户都可以访问 `/Users/Shared/RimeSync`，但不要把该目录直接设置成任一账户的实时 `~/Library/Rime`。
-
-工具会把共享目录及其节点目录设置为 `staff` 组可读写并启用 setgid（目录权限 `2770`）；manifest 会设置为组可写，确保两个账户都能推进同步。若系统管理员策略禁止普通用户修改组属性，需要先由管理员确认 `/Users/Shared` 的所属组为 `staff`。
-
-每次审核应用或恢复前都会创建完整备份，默认保留最近 10 份；可在恢复备份窗口中按账户设置任意正整数，设置从下一次创建备份时生效。恢复界面会列出当前仍保留的全部备份，并在恢复失败时恢复应用前状态。首次审核只登记基线，不重建或清空当前 `userdb`。两个账户不会直接共用实时 `.userdb`，共享的是快照、审核状态和生成规则；另一账户在自己下次打开词库管理时处理跨节点动作并生成本地受控词库。
+Mac1 的实际配置和输入效果仍须在 Mac1 登录会话中另行验收。共享副本或导出的存档不能代替对目标账户实时 Rime 目录的验证。

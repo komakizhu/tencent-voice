@@ -43,6 +43,7 @@ public struct SyncConfiguration: Sendable {
 public struct SyncReport: Equatable, Sendable {
     public let changedFiles: [String]
     public let deletedFiles: [String]
+    public let operations: [SyncFileOperation]
     public let conflicts: [String]
     public let conflictDetails: [RimeConflictSummary]
     public let autoRecoveredFiles: [String]
@@ -60,10 +61,17 @@ public struct SyncReport: Equatable, Sendable {
         backupID: String = "",
         userDictionarySyncSucceeded: Bool = false,
         reloadSucceeded: Bool = true,
-        reloadError: String? = nil
+        reloadError: String? = nil,
+        operations: [SyncFileOperation] = []
     ) {
         self.changedFiles = changedFiles.sorted()
         self.deletedFiles = deletedFiles.sorted()
+        self.operations = operations.sorted {
+            if $0.relativePath == $1.relativePath {
+                return $0.kind.rawValue < $1.kind.rawValue
+            }
+            return $0.relativePath < $1.relativePath
+        }
         self.conflicts = conflicts.sorted()
         self.conflictDetails = conflictDetails.sorted { $0.relativePath < $1.relativePath }
         self.autoRecoveredFiles = autoRecoveredFiles.sorted()
@@ -630,7 +638,6 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
     }
 
     public func conflictPreviews() throws -> [RimeConflictPreview] {
-        try reconcileIdenticalPendingConflicts()
         let localRecords = try currentLocalRecords()
         let manifest = try RimeManifest.loading(from: configuration.manifestURL, fileManager: fileManager)
         let paths = Set(manifest.pausedPaths).union(manifest.conflicts.keys)
@@ -644,45 +651,6 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
             )
             guard let record else { return nil }
             return try makePreview(record: record, localRecords: localRecords)
-        }
-    }
-
-    /// Retire pending records whose known current versions are already
-    /// identical. This only updates manifest metadata; it never changes file
-    /// contents or chooses between different versions.
-    private func reconcileIdenticalPendingConflicts() throws {
-        let lock = DirectoryLock(lockURL: configuration.lockURL, fileManager: fileManager)
-        try lock.withLock {
-            let localRecords = try currentLocalRecords()
-            var manifest = try RimeManifest.loading(from: configuration.manifestURL, fileManager: fileManager)
-            let paths = Set(manifest.pausedPaths).union(manifest.conflicts.keys)
-                .filter { RimeResourcePolicy.isAllowed(relativePath: $0) }
-                .sorted()
-            var changed = false
-
-            for path in paths {
-                guard let conflict = conflictRecord(
-                    for: path,
-                    manifest: manifest,
-                    localRecords: localRecords
-                ), let recovery = try automaticRecovery(
-                    for: conflict,
-                    localRecords: localRecords
-                ), !recovery.countsAsChange else {
-                    continue
-                }
-                manifest.records[path] = recovery.record
-                manifest.pausedPaths.remove(path)
-                manifest.conflicts.removeValue(forKey: path)
-                for nodeID in recovery.nodeIDs {
-                    manifest.nodes[nodeID, default: [:]][path] = recovery.record.changingOwner(to: nodeID)
-                }
-                changed = true
-            }
-
-            guard changed else { return }
-            try manifest.saving(to: configuration.manifestURL, fileManager: fileManager)
-            try SharedDirectoryLayout.makeGroupWritable(configuration.manifestURL, fileManager: fileManager)
         }
     }
 
@@ -715,18 +683,13 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
                 localRecords: localRecords,
                 manifest: manifest
             )
-            let participantIDs = Set(conflict.nodeRecords.keys)
-                .union([configuration.nodeID])
-                .union(conflict.sharedRecord.map { [$0.owner] } ?? [])
             let record = makeRecord(
                 path: path,
                 data: selected.data,
                 owner: configuration.nodeID,
                 state: selected.state
             )
-            for nodeID in participantIDs {
-                manifest.nodes[nodeID, default: [:]][path] = record.changingOwner(to: nodeID)
-            }
+            manifest.nodes[configuration.nodeID, default: [:]][path] = record
             manifest.records[path] = record
             manifest.pausedPaths.remove(path)
             manifest.conflicts.removeValue(forKey: path)
@@ -736,7 +699,7 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
                 action: .reconcile(
                     record: record,
                     data: selected.data,
-                    nodeIDs: Array(participantIDs).sorted(),
+                    operation: operation(for: resolution, state: selected.state),
                     countsAsChange: true
                 )
             )
@@ -839,7 +802,7 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
             case publish(FileRecord)
             case pull(FileRecord)
             case merge(record: FileRecord, data: Data)
-            case reconcile(record: FileRecord, data: Data, nodeIDs: [String], countsAsChange: Bool)
+            case reconcile(record: FileRecord, data: Data, operation: SyncOperationKind, countsAsChange: Bool)
             case baseline(FileRecord)
             case conflict(RimeConflictRecord)
         }
@@ -898,7 +861,7 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
                             action: .reconcile(
                                 record: recovery.record,
                                 data: recovery.data,
-                                nodeIDs: recovery.nodeIDs,
+                                operation: .merge,
                                 countsAsChange: recovery.countsAsChange
                             )
                         )
@@ -907,9 +870,7 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
                     manifest.records[path] = recovery.record
                     manifest.pausedPaths.remove(path)
                     manifest.conflicts.removeValue(forKey: path)
-                    for nodeID in recovery.nodeIDs {
-                        manifest.nodes[nodeID, default: [:]][path] = recovery.record.changingOwner(to: nodeID)
-                    }
+                    manifest.nodes[configuration.nodeID, default: [:]][path] = recovery.record
                     nodeRecords[path] = recovery.record
                     continue
                 }
@@ -1135,7 +1096,6 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
     private struct AutomaticRecovery {
         let record: FileRecord
         let data: Data
-        let nodeIDs: [String]
         let countsAsChange: Bool
     }
 
@@ -1151,40 +1111,6 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
             return nil
         }
 
-        // A historical record can still contain stale snapshots from an
-        // older node. If this account's current file is byte-for-byte equal
-        // to the current shared file, there is no active choice left for
-        // this account to make. Retire the stale history instead of showing
-        // it as a pending conflict.
-        if conflict.reason == .historical,
-           let localRecord = localRecords[conflict.relativePath],
-           localRecord.state == .present,
-           let localData = try? localData(for: localRecord),
-           let sharedData = try? sharedData(for: sharedRecord),
-           dataMatches(localData, record: localRecord),
-           dataMatches(sharedData, record: sharedRecord),
-           localData == sharedData {
-            let record = makeRecord(
-                path: conflict.relativePath,
-                data: sharedData,
-                owner: configuration.nodeID,
-                modifiedNanoseconds: max(
-                    localRecord.modifiedNanoseconds,
-                    sharedRecord.modifiedNanoseconds,
-                    nowNanoseconds()
-                )
-            )
-            let participantIDs = Set(conflict.nodeRecords.keys)
-                .union([configuration.nodeID])
-                .union([sharedRecord.owner])
-            return AutomaticRecovery(
-                record: record,
-                data: sharedData,
-                nodeIDs: Array(participantIDs).sorted(),
-                countsAsChange: false
-            )
-        }
-
         var nodeRecords = conflict.nodeRecords
         if let local = localRecords[conflict.relativePath] {
             nodeRecords[configuration.nodeID] = local
@@ -1192,7 +1118,6 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
         guard !nodeRecords.isEmpty else { return nil }
 
         var dataByIdentity: [String: Data] = [:]
-        var participantIDs = Set<String>()
         var timestamps: [Int64] = [sharedRecord.modifiedNanoseconds]
         for (nodeID, record) in nodeRecords {
             guard record.state == .present,
@@ -1200,7 +1125,6 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
                   dataMatches(data, record: record) else {
                 return nil
             }
-            participantIDs.insert(nodeID)
             timestamps.append(record.modifiedNanoseconds)
             dataByIdentity[record.contentIdentity] = data
         }
@@ -1208,7 +1132,6 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
               dataMatches(sharedData, record: sharedRecord) else {
             return nil
         }
-        participantIDs.insert(sharedRecord.owner)
         dataByIdentity[sharedRecord.contentIdentity] = sharedData
 
         if dataByIdentity.count == 1, let data = dataByIdentity.values.first {
@@ -1222,7 +1145,6 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
             return AutomaticRecovery(
                 record: record,
                 data: data,
-                nodeIDs: Array(participantIDs).sorted(),
                 countsAsChange: changed
             )
         }
@@ -1270,7 +1192,6 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
         return AutomaticRecovery(
             record: record,
             data: data,
-            nodeIDs: Array(participantIDs).sorted(),
             countsAsChange: true
         )
     }
@@ -1413,6 +1334,20 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
         }
     }
 
+    private func operation(
+        for resolution: RimeConflictResolution,
+        state: FileState
+    ) -> SyncOperationKind {
+        switch resolution {
+        case .keepLocal:
+            return state == .tombstone ? .deleteShared : .upload
+        case .keepShared:
+            return state == .tombstone ? .deleteLocal : .download
+        case .merge:
+            return .merge
+        }
+    }
+
     private func makeRecord(
         path: String,
         data: Data,
@@ -1470,12 +1405,10 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
                 urls.insert(try localURL(for: item.path))
                 urls.insert(try nodeURL(for: item.path, nodeID: configuration.nodeID))
                 urls.insert(try baselineURL(for: item.path, nodeID: configuration.nodeID))
-            case let .reconcile(_, _, nodeIDs, _):
+            case .reconcile:
                 urls.insert(try localURL(for: item.path))
-                for nodeID in nodeIDs {
-                    urls.insert(try nodeURL(for: item.path, nodeID: nodeID))
-                    urls.insert(try baselineURL(for: item.path, nodeID: nodeID))
-                }
+                urls.insert(try nodeURL(for: item.path, nodeID: configuration.nodeID))
+                urls.insert(try baselineURL(for: item.path, nodeID: configuration.nodeID))
             case .baseline:
                 urls.insert(try baselineURL(for: item.path, nodeID: configuration.nodeID))
             case .conflict:
@@ -1552,21 +1485,12 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
                 try AtomicFileStore.write(data, to: localDestination, fileManager: fileManager)
                 try AtomicFileStore.write(data, to: nodeDestination, fileManager: fileManager)
                 try writeBaseline(data, for: record)
-            case let .reconcile(record, data, nodeIDs, _):
+            case let .reconcile(record, data, _, _):
                 let localDestination = try AtomicFileStore.safeURL(root: configuration.localRimeDirectory, relativePath: item.path)
                 try apply(record: record, data: data, destination: localDestination)
-                for nodeID in nodeIDs {
-                    let nodeRoot = configuration.sharedConfigRoot
-                        .appendingPathComponent("nodes", isDirectory: true)
-                        .appendingPathComponent(nodeID, isDirectory: true)
-                    let nodeDestination = try AtomicFileStore.safeURL(root: nodeRoot, relativePath: item.path)
-                    try apply(record: record, data: data, destination: nodeDestination)
-                    try updateBaseline(
-                        record: record.changingOwner(to: nodeID),
-                        source: nodeDestination,
-                        nodeID: nodeID
-                    )
-                }
+                let nodeDestination = try AtomicFileStore.safeURL(root: configuration.nodeDirectory, relativePath: item.path)
+                try apply(record: record, data: data, destination: nodeDestination)
+                try updateBaseline(record: record, source: nodeDestination)
             case let .baseline(record):
                 let source = try AtomicFileStore.safeURL(root: configuration.localRimeDirectory, relativePath: item.path)
                 try updateBaseline(record: record, source: source)
@@ -1740,6 +1664,28 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
         reloadSucceeded: Bool = true,
         reloadError: String? = nil
     ) -> SyncReport {
+        let operations = plan.items.compactMap { item -> SyncFileOperation? in
+            switch item.action {
+            case let .publish(record):
+                return SyncFileOperation(
+                    relativePath: item.path,
+                    kind: record.state == .tombstone ? .deleteShared : .upload
+                )
+            case let .pull(record):
+                return SyncFileOperation(
+                    relativePath: item.path,
+                    kind: record.state == .tombstone ? .deleteLocal : .download
+                )
+            case .merge:
+                return SyncFileOperation(relativePath: item.path, kind: .merge)
+            case let .reconcile(_, _, operation, countsAsChange):
+                return countsAsChange
+                    ? SyncFileOperation(relativePath: item.path, kind: operation)
+                    : nil
+            case .baseline, .conflict:
+                return nil
+            }
+        }
         let changed = plan.items.compactMap { item -> String? in
             switch item.action {
             case .baseline, .conflict:
@@ -1783,7 +1729,8 @@ public final class DefaultRimeSyncEngine: RimeSyncEngine {
             backupID: backupID,
             userDictionarySyncSucceeded: userDictionarySyncSucceeded,
             reloadSucceeded: reloadSucceeded,
-            reloadError: reloadError
+            reloadError: reloadError,
+            operations: operations
         )
     }
 

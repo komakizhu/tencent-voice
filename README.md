@@ -1,6 +1,6 @@
 # Rime Voice
 
-这是一个只面向当前这台 macOS 的独立试用版：点击一次全局快捷键开始录音，再点击一次停止，腾讯实时语音识别结果会尽量实时改写到当前文本输入框。停止后会继续等待最多 3 秒，让最后一个语音片段完成修正；这段时间不会重新上屏整段文字。腾讯 ASR 会话与 Rime 管理是两个独立模块，Rime 管理负责稳定配置同步、快照审核和受控词库同步，不改变 ASR 数据管路。
+这是一个只面向当前这台 macOS 的独立试用版：点击一次全局快捷键开始录音，再点击一次停止，腾讯实时语音识别结果会尽量实时改写到当前文本输入框。停止后会继续等待最多 3 秒，让最后一个语音片段完成修正；这段时间不会重新上屏整段文字。腾讯 ASR 会话与 Rime 管理是两个独立模块，Rime 管理提供手动配置存档迁移、本机快照审核和受控词库维护，不改变 ASR 数据管路。
 
 ## 使用
 
@@ -40,13 +40,11 @@ codesign --verify --deep --strict "dist/Rime Voice.app"
 
 这是个人本地 macOS 应用，没有 Windows 兼容目标，也没有自动上传或发布流程。
 
-## Rime 双账户迁移与同步
+## Rime 跨账户配置迁移
 
-本仓库同时包含仅面向 macOS 的 `RimeSync` Swift 命令行工具，以及 Rime Voice 菜单栏中的“Rime 词库管理”。命令行工具负责稳定配置的双向同步；菜单栏模块负责生成 `rime_ice` 快照、逐条审核、手动添加和维护独立的 `rime_managed.dict.yaml`，不会调用绕过审核的原生远端合并。使用方式、备份、冲突暂停和回滚说明见 [docs/rime/rime-sync.md](docs/rime/rime-sync.md)。
+Rime Voice 提供“导出所有配置…”与“导入所有配置…”两个手动迁移入口。导入前完整校验存档并预览逐文件新增、替换和相同项；确认后备份受影响文件、保留目标账户独有文件，并在失败时回滚。存档可以携带 `custom_phrase.txt`、皮肤、方案、词典、Lua、OpenCC、语法模型和受控长期词库，但不包含 `installation.yaml`、实时 `.userdb`、机器身份或审核历史。流程与回滚说明见 [docs/rime/rime-sync.md](docs/rime/rime-sync.md)。
 
-状态栏菜单还提供“同步 Rime 皮肤”和“一键同步所有配置”。前者只同步 `squirrel.custom.yaml`；后者同步 YAML、Lua、OpenCC 和皮肤等稳定 Rime 资源，不直接共享两个账户的实时 `.userdb`。实时用户词库仍通过单独的“同步 Rime 词库”处理；Rime Voice 的权限、快捷键和账户级应用设置也不会被一键覆盖。
-
-同一个稳定配置文件在两个账户同时修改时，工具会以两边上一次同步共同看到的版本为基线做三方增量合并；不同片段会合并，同一片段重叠、没有共同基线或时间完全相同则暂停为冲突，不会直接用较晚版本覆盖。实时词库由 Squirrel 的原生同步按词条处理。
+“Rime 词库管理”保留为本机工具：打开窗口只读取当前账户已有的审核数据；只有明确点击“刷新本机快照”才会先备份本地状态，再将本机 `sync_dir` 设为私有目录并生成快照。审核缓存和备份保存在当前账户的 Application Support；不会调用 Squirrel `--sync` 或读取另一账户快照。旧的自动同步、冲突解决和共享快照脚本已停用，旧共享数据保持不动。
 
 凭证现在保存在 `/Users/Shared/TencentVoiceMVP/tencent-credentials.yaml`，共享目录归 macOS 的 `staff` 组管理，文件权限为组内账户可读写（0660），因此把应用放在 `/Applications` 后，两个 macOS 用户只要填写的是同一组 AppID、SecretId、SecretKey，就会自动读到同一份凭证。首次读取凭证或打开“设置…”时，会把当前用户旧的 `~/Library/Application Support/TencentVoiceMVP/tencent-credentials.yaml` 或旧 Keychain 凭证迁移到共享文件；共享 YAML 是明文文件，属于同一 `staff` 组的本机账户都可能读取，请勿同步到云盘或提交到 Git。
 

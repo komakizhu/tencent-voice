@@ -209,11 +209,46 @@ public enum RimeConflictResolution: Equatable, Sendable {
     case merge(String)
 }
 
+public enum SyncOperationKind: String, Equatable, Hashable, Sendable {
+    case upload
+    case download
+    case merge
+    case deleteLocal
+    case deleteShared
+
+    public var displayName: String {
+        switch self {
+        case .upload: return "上传"
+        case .download: return "下载"
+        case .merge: return "合并"
+        case .deleteLocal: return "删除本地"
+        case .deleteShared: return "删除共享"
+        }
+    }
+}
+
+public struct SyncFileOperation: Equatable, Sendable {
+    public let relativePath: String
+    public let kind: SyncOperationKind
+
+    public init(relativePath: String, kind: SyncOperationKind) {
+        self.relativePath = relativePath
+        self.kind = kind
+    }
+}
+
 public enum RimeResourcePolicy {
     public static let skinConfigurationPath = "squirrel.custom.yaml"
 
     private static let excludedTopLevelNames: Set<String> = [
         "build", "trash", "sync", "weasel.yaml", "installation.yaml", "user.yaml"
+    ]
+    private static let credentialNameTokens: Set<String> = [
+        "credential", "credentials", "secret", "secrets", "token", "tokens",
+        "password", "passwords", "passwd", "auth", "authentication", "authorization", "oauth"
+    ]
+    private static let credentialNameCompounds: Set<String> = [
+        "apikey", "accesskey", "privatekey", "sshkey", "clientsecret"
     ]
 
     public static func isAllowed(relativePath: String) -> Bool {
@@ -223,29 +258,46 @@ public enum RimeResourcePolicy {
         }
 
         let components = path.split(separator: "/").map(String.init)
-        guard let topLevel = components.first else { return false }
-        guard !excludedTopLevelNames.contains(topLevel) else { return false }
-        guard !components.contains(where: { $0 == ".DS_Store" || $0.hasSuffix(".userdb") }) else {
+        let canonicalComponents = components.map(canonicalResourceName)
+        guard let topLevel = canonicalComponents.first else { return false }
+        guard !canonicalComponents.contains(where: isCredentialPathComponent) else { return false }
+        guard !excludedTopLevelNames.contains(where: { canonicalResourceName($0) == topLevel }) else { return false }
+        guard !canonicalComponents.contains(where: { $0 == ".ds_store" || $0.hasSuffix(".userdb") }) else {
             return false
         }
-        guard !path.hasSuffix(".userdb.txt") else { return false }
-        guard !path.hasSuffix(".log") else { return false }
+        let canonicalPath = canonicalComponents.joined(separator: "/")
+        guard !canonicalPath.hasSuffix(".userdb.txt") else { return false }
+        guard !canonicalPath.hasSuffix(".log") else { return false }
         // This file is generated from the shared audit state.  Letting the
         // ordinary configuration sync manage it would race with the audit
         // coordinator and could silently resurrect a rejected entry.
-        guard path != "rime_managed.dict.yaml" else { return false }
+        guard canonicalPath != canonicalResourceName("rime_managed.dict.yaml") else { return false }
 
         if ["cn_dicts", "en_dicts", "wanxiang_dicts", "lua", "opencc", "rime-mate-config"].contains(topLevel) {
             return true
         }
-        if topLevel == "Rime配置助手.command" {
+        if topLevel == canonicalResourceName("Rime配置助手.command") {
             return components.count == 1
         }
-        if topLevel == "wanxiang-lts-zh-hans.gram" {
+        if topLevel == canonicalResourceName("wanxiang-lts-zh-hans.gram") {
             return components.count == 1
         }
         guard components.count == 1 else { return false }
         return topLevel.hasSuffix(".yaml") || topLevel.hasSuffix(".dict.yaml") || topLevel.hasSuffix(".txt")
+    }
+
+    private static func canonicalResourceName(_ name: String) -> String {
+        name.precomposedStringWithCanonicalMapping
+            .folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .precomposedStringWithCanonicalMapping
+    }
+
+    private static func isCredentialPathComponent(_ component: String) -> Bool {
+        let tokens = component.split { !$0.isLetter && !$0.isNumber }.map(String.init)
+        guard !tokens.isEmpty else { return false }
+        if tokens.contains(where: { credentialNameTokens.contains($0) }) { return true }
+        let compact = tokens.joined()
+        return credentialNameCompounds.contains(where: { compact.contains($0) })
     }
 }
 

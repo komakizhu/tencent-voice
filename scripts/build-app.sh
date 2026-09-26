@@ -89,8 +89,67 @@ else
     APP_DIR="$PROJECT_DIR/dist/presets/Rime Voice-$BUNDLE_SHORT_VERSION-build$BUNDLE_BUILD-$PACING_PRESET.app"
 fi
 
-mkdir -p "$PROJECT_DIR/dist"
-DIST_ROOT="$(cd -P "$PROJECT_DIR/dist" && pwd)"
+EXTERNAL_VOLUME="/Volumes/T7_1T"
+EXTERNAL_CODEX_ROOT="$EXTERNAL_VOLUME/codex"
+EXTERNAL_VOLUME_UUID="E70D0032-CFF1-499D-81A2-DA2A661FCAD5"
+BUILD_ON_EXTERNAL=0
+case "$APP_DIR" in
+    "$EXTERNAL_CODEX_ROOT"/*) BUILD_ON_EXTERNAL=1 ;;
+esac
+
+if [[ "$BUILD_ON_EXTERNAL" == "1" ]]; then
+    VOLUME_INFO="$(/usr/sbin/diskutil info -plist "$EXTERNAL_VOLUME")"
+    ACTUAL_VOLUME_UUID="$(printf '%s' "$VOLUME_INFO" | /usr/bin/plutil -extract VolumeUUID raw -o - -)"
+    FILESYSTEM_TYPE="$(printf '%s' "$VOLUME_INFO" | /usr/bin/plutil -extract FilesystemType raw -o - -)"
+    WRITABLE_VOLUME="$(printf '%s' "$VOLUME_INFO" | /usr/bin/plutil -extract WritableVolume raw -o - -)"
+    MOUNT_POINT="$(printf '%s' "$VOLUME_INFO" | /usr/bin/plutil -extract MountPoint raw -o - -)"
+    if [[ "$ACTUAL_VOLUME_UUID" != "$EXTERNAL_VOLUME_UUID" || "$FILESYSTEM_TYPE" != "apfs" \
+        || "$WRITABLE_VOLUME" != "true" || "$MOUNT_POINT" != "$EXTERNAL_VOLUME" ]]; then
+        echo "refusing external build: $EXTERNAL_VOLUME is not the writable expected APFS volume" >&2
+        exit 1
+    fi
+    for storage_path in "${TVMVP_SWIFTPM_SCRATCH_PATH:-}" "${TVMVP_SWIFTPM_CACHE_PATH:-}" \
+        "${TVMVP_SWIFTPM_SECURITY_PATH:-}" "${TVMVP_BUILD_TMPDIR:-}"; do
+        case "$storage_path" in
+            "$EXTERNAL_CODEX_ROOT"/*) ;;
+            *) echo "external builds require all SwiftPM caches and temporary files under $EXTERNAL_CODEX_ROOT" >&2; exit 1 ;;
+        esac
+    done
+    SWIFTPM_SCRATCH_PATH="$TVMVP_SWIFTPM_SCRATCH_PATH"
+    SWIFTPM_CACHE_PATH="$TVMVP_SWIFTPM_CACHE_PATH"
+    SWIFTPM_SECURITY_PATH="$TVMVP_SWIFTPM_SECURITY_PATH"
+    BUILD_TMPDIR="$TVMVP_BUILD_TMPDIR"
+    for storage_path in "$SWIFTPM_SCRATCH_PATH" "$SWIFTPM_CACHE_PATH" "$SWIFTPM_SECURITY_PATH" "$BUILD_TMPDIR"; do
+        if [[ ! -d "$storage_path" ]]; then
+            echo "external build storage directory must already exist: $storage_path" >&2
+            exit 1
+        fi
+        RESOLVED_STORAGE_PATH="$(cd -P "$storage_path" && pwd)"
+        case "$RESOLVED_STORAGE_PATH" in
+            "$EXTERNAL_CODEX_ROOT"/*) ;;
+            *) echo "refusing storage path outside $EXTERNAL_CODEX_ROOT: $RESOLVED_STORAGE_PATH" >&2; exit 1 ;;
+        esac
+    done
+    export TMPDIR="$BUILD_TMPDIR"
+    SWIFTPM_STORAGE_ARGS=(
+        --scratch-path "$SWIFTPM_SCRATCH_PATH"
+        --cache-path "$SWIFTPM_CACHE_PATH"
+        --security-path "$SWIFTPM_SECURITY_PATH"
+        --manifest-cache local
+        --disable-automatic-resolution
+    )
+else
+    SWIFTPM_STORAGE_ARGS=()
+fi
+
+if [[ -d "$PROJECT_DIR/dist" ]]; then
+    DIST_ROOT="$(cd -P "$PROJECT_DIR/dist" && pwd)"
+elif [[ "$BUILD_ON_EXTERNAL" == "0" ]]; then
+    mkdir -p "$PROJECT_DIR/dist"
+    DIST_ROOT="$(cd -P "$PROJECT_DIR/dist" && pwd)"
+else
+    DIST_ROOT="$PROJECT_DIR/dist"
+fi
 APP_PARENT="$(dirname "$APP_DIR")"
 MISSING_PARENTS=()
 while [[ ! -d "$APP_PARENT" ]]; do
@@ -122,8 +181,21 @@ case "$APP_PARENT" in
         fi
         APP_DIR="$APP_DIR/$APP_NAME"
         ;;
+    "$EXTERNAL_CODEX_ROOT"|"$EXTERNAL_CODEX_ROOT"/*)
+        if [[ "$BUILD_ON_EXTERNAL" != "1" ]]; then
+            echo "external app output must be requested under $EXTERNAL_CODEX_ROOT" >&2
+            exit 1
+        fi
+        APP_DIR="$APP_PARENT"
+        if (( ${#MISSING_PARENTS[@]} > 0 )); then
+            for missing_parent in "${MISSING_PARENTS[@]}"; do
+                APP_DIR="$APP_DIR/$missing_parent"
+            done
+        fi
+        APP_DIR="$APP_DIR/$APP_NAME"
+        ;;
     *)
-        echo "output app must be inside $DIST_ROOT: $APP_DIR" >&2
+        echo "output app must be inside $DIST_ROOT or $EXTERNAL_CODEX_ROOT: $APP_DIR" >&2
         exit 1
         ;;
 esac
@@ -131,14 +203,21 @@ esac
 DISPLAY_NAME="${TVMVP_DISPLAY_NAME:-Rime Voice}"
 
 cd "$PROJECT_DIR"
-rm -rf -- "$APP_DIR"
+if [[ "$BUILD_ON_EXTERNAL" == "1" ]]; then
+    if [[ -e "$APP_DIR" ]]; then
+        echo "refusing to overwrite external app bundle: $APP_DIR" >&2
+        exit 1
+    fi
+else
+    rm -rf -- "$APP_DIR"
+fi
 
 if (( ${#SWIFT_DEFINITIONS[@]} > 0 )); then
-    swift build -c release "${SWIFT_DEFINITIONS[@]}"
+    swift build -c release "${SWIFTPM_STORAGE_ARGS[@]}" "${SWIFT_DEFINITIONS[@]}"
 else
-    swift build -c release
+    swift build -c release "${SWIFTPM_STORAGE_ARGS[@]}"
 fi
-BIN_DIR="$(swift build -c release --show-bin-path)"
+BIN_DIR="$(swift build -c release "${SWIFTPM_STORAGE_ARGS[@]}" --show-bin-path)"
 BIN_PATH="$BIN_DIR/$PRODUCT_NAME"
 if [[ ! -f "$BIN_PATH" ]]; then
     echo "release binary not found: $BIN_PATH" >&2

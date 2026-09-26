@@ -1187,8 +1187,13 @@ public enum RimeAuditCSV {
 public struct RimeAuditBatchStore {
     public let url: URL
     private let fileManager: FileManager
+    private let groupWritable: Bool
 
-    public init(url: URL, fileManager: FileManager = .default) { self.url = url; self.fileManager = fileManager }
+    public init(url: URL, fileManager: FileManager = .default, groupWritable: Bool = true) {
+        self.url = url
+        self.fileManager = fileManager
+        self.groupWritable = groupWritable
+    }
 
     public func load() throws -> RimeAuditBatch? {
         guard fileManager.fileExists(atPath: url.path) else { return nil }
@@ -1197,7 +1202,7 @@ public struct RimeAuditBatchStore {
 
     public func save(_ batch: RimeAuditBatch) throws {
         try AtomicFileStore.write(JSONEncoder.rimeEncoder.encode(batch), to: url, fileManager: fileManager)
-        try SharedDirectoryLayout.makeGroupWritable(url, fileManager: fileManager)
+        if groupWritable { try SharedDirectoryLayout.makeGroupWritable(url, fileManager: fileManager) }
     }
 }
 
@@ -1334,10 +1339,12 @@ public struct RimeUserDictionarySyncMetadata: Codable, Equatable, Sendable {
 public struct RimeUserDictionarySyncMetadataStore {
     public let url: URL
     private let fileManager: FileManager
+    private let groupWritable: Bool
 
-    public init(url: URL, fileManager: FileManager = .default) {
+    public init(url: URL, fileManager: FileManager = .default, groupWritable: Bool = true) {
         self.url = url
         self.fileManager = fileManager
+        self.groupWritable = groupWritable
     }
 
     public func load() throws -> RimeUserDictionarySyncMetadata {
@@ -1360,7 +1367,7 @@ public struct RimeUserDictionarySyncMetadataStore {
             to: url,
             fileManager: fileManager
         )
-        try SharedDirectoryLayout.makeGroupWritable(url, fileManager: fileManager)
+        if groupWritable { try SharedDirectoryLayout.makeGroupWritable(url, fileManager: fileManager) }
     }
 }
 
@@ -1402,6 +1409,34 @@ public extension RimeUserDictionaryMaintaining {
     }
 }
 
+public enum RimeReviewStorageMode: Equatable, Sendable {
+    /// Kept for the historical read/diagnostic engine and regression tests.
+    case shared
+    /// Current account only. No shared directory layout, ordinary sync, or
+    /// Squirrel --sync operation is allowed in this mode.
+    case local
+}
+
+public enum RimeLocalReviewStorage {
+    public static func defaultRoot(fileManager: FileManager = .default) -> URL {
+        let support = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
+        return support.appendingPathComponent("Rime Voice/Review", isDirectory: true)
+    }
+
+    public static func prepare(root: URL, fileManager: FileManager = .default) throws {
+        for directory in [
+            root,
+            root.appendingPathComponent("config", isDirectory: true),
+            root.appendingPathComponent("rime-userdata", isDirectory: true),
+            root.appendingPathComponent("backups", isDirectory: true)
+        ] {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        }
+    }
+}
+
 public final class RimeReviewSyncCoordinator: @unchecked Sendable {
     public let configuration: SyncConfiguration
     private let maintenance: any RimeUserDictionaryMaintaining
@@ -1416,6 +1451,7 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
     private let retentionStore: RimeBackupRetentionStore
     private let baseDictionaryCache: RimeBaseDictionaryIndexCache
     private let now: () -> Date
+    public let storageMode: RimeReviewStorageMode
 
     public init(
         configuration: SyncConfiguration,
@@ -1424,7 +1460,8 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
         ordinarySync: any RimeSyncEngine,
         fileManager: FileManager = .default,
         now: @escaping () -> Date = Date.init,
-        retentionStore: RimeBackupRetentionStore = RimeBackupRetentionStore()
+        retentionStore: RimeBackupRetentionStore = RimeBackupRetentionStore(),
+        storageMode: RimeReviewStorageMode = .local
     ) {
         self.configuration = configuration
         self.maintenance = maintenance
@@ -1432,19 +1469,24 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
         self.ordinarySync = ordinarySync
         self.fileManager = fileManager
         self.now = now
-        reviewStore = RimeReviewStore(url: configuration.sharedRoot.appendingPathComponent("config/rime-review-state.json"), fileManager: fileManager)
-        batchStore = RimeAuditBatchStore(url: configuration.sharedRoot.appendingPathComponent("config/rime-audit-batch.json"), fileManager: fileManager)
-        syncMetadataStore = RimeUserDictionarySyncMetadataStore(url: configuration.sharedRoot.appendingPathComponent("config/rime-userdata-sync.json"), fileManager: fileManager)
+        self.storageMode = storageMode
+        let groupWritable = storageMode == .shared
+        reviewStore = RimeReviewStore(url: configuration.sharedRoot.appendingPathComponent("config/rime-review-state.json"), fileManager: fileManager, groupWritable: groupWritable)
+        batchStore = RimeAuditBatchStore(url: configuration.sharedRoot.appendingPathComponent("config/rime-audit-batch.json"), fileManager: fileManager, groupWritable: groupWritable)
+        syncMetadataStore = RimeUserDictionarySyncMetadataStore(url: configuration.sharedRoot.appendingPathComponent("config/rime-userdata-sync.json"), fileManager: fileManager, groupWritable: groupWritable)
         backupManager = RimeBackupManager(fileManager: fileManager)
         self.retentionStore = retentionStore
         baseDictionaryCache = RimeBaseDictionaryIndexCache(fileManager: fileManager)
     }
 
     public func prepareAudit() throws -> RimeAuditBatch {
-        try SharedDirectoryLayout.prepare(sharedRoot: configuration.sharedRoot, nodeIDs: [configuration.nodeID], fileManager: fileManager)
-        // This synchronizes ordinary YAML/resources only.  Its inventory
-        // excludes userdb and the generated managed dictionary.
-        _ = try ordinarySync.sync(dryRun: false)
+        try prepareReviewStorage()
+        if storageMode == .shared {
+            // Legacy shared mode is retained for older diagnostic tests only.
+            _ = try ordinarySync.sync(dryRun: false)
+        } else {
+            try ensurePrivateSyncDirectory()
+        }
         try maintenance.backupUserDictionary(in: configuration.localRimeDirectory)
         try publishCurrentSnapshot()
         return try refreshAuditFromPublishedSnapshots()
@@ -1455,6 +1497,9 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
     /// all resources allowed by the ordinary sync policy.
     @discardableResult
     public func syncConfiguration(paths: Set<String>? = nil) throws -> SyncReport {
+        guard storageMode == .shared else {
+            throw RimeSyncError.unsupportedOperation("自动跨账户配置同步已停用；请使用“导出所有配置…”或“导入所有配置…”")
+        }
         if let paths {
             return try ordinarySync.sync(paths: paths, dryRun: false)
         }
@@ -1462,7 +1507,10 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
     }
 
     public func configurationConflictPreviews() throws -> [RimeConflictPreview] {
-        try ordinarySync.conflictPreviews()
+        guard storageMode == .shared else {
+            throw RimeSyncError.unsupportedOperation("配置冲突已由手动存档导入预览取代")
+        }
+        return try ordinarySync.conflictPreviews()
     }
 
     @discardableResult
@@ -1471,7 +1519,10 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
         resolution: RimeConflictResolution,
         expectedVersion: String? = nil
     ) throws -> SyncReport {
-        try ordinarySync.resolveConflict(
+        guard storageMode == .shared else {
+            throw RimeSyncError.unsupportedOperation("配置冲突解决已停用；请使用手动存档导入预览")
+        }
+        return try ordinarySync.resolveConflict(
             path: path,
             resolution: resolution,
             expectedVersion: expectedVersion
@@ -1482,7 +1533,7 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
     /// shared directory.  This intentionally does not stop Squirrel, invoke
     /// `--sync`, create a runtime backup, or run ordinary resource sync.
     public func refreshAuditFromPublishedSnapshots() throws -> RimeAuditBatch {
-        try SharedDirectoryLayout.prepare(sharedRoot: configuration.sharedRoot, nodeIDs: [configuration.nodeID], fileManager: fileManager)
+        try prepareReviewStorage()
         let snapshots = try loadSnapshots()
         guard !snapshots.isEmpty else { throw RimeSyncError.unsupportedOperation("没有找到 rime_ice.userdb 快照，请先生成当前用户库备份") }
         let lock = DirectoryLock(lockURL: configuration.lockURL, fileManager: fileManager)
@@ -1495,7 +1546,10 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
     /// native userdb is merged immediately; the audit manager remains an
     /// optional observer rather than a gate in this path.
     public func syncUserDictionary() throws -> RimeUserDictionarySyncReport {
-        try SharedDirectoryLayout.prepare(sharedRoot: configuration.sharedRoot, nodeIDs: [configuration.nodeID], fileManager: fileManager)
+        guard storageMode == .shared else {
+            throw RimeSyncError.unsupportedOperation("跨账户用户词库同步已停用；词库管理只读取本机快照")
+        }
+        try prepareReviewStorage()
         let synchronizedAt = now()
         let lock = DirectoryLock(lockURL: configuration.lockURL, fileManager: fileManager)
         return try lock.withLock {
@@ -1538,6 +1592,91 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
                 }
                 throw error
             }
+        }
+    }
+
+    /// Rebuilds only the current account's audit cache from the imported
+    /// controlled dictionary. This does not read shared history or touch
+    /// live userdb data.
+    public func reconcileManagedDictionaryAfterImport(
+        rebuildReviewState: Bool = true,
+        registerPreparedFile: (String, Data) throws -> Void
+    ) throws {
+        guard storageMode == .local else {
+            throw RimeSyncError.unsupportedOperation("受控词典存档恢复仅支持本机审核状态")
+        }
+        try prepareReviewStorage()
+        let lock = DirectoryLock(lockURL: configuration.lockURL, fileManager: fileManager)
+        try lock.withLock {
+            let mainDictionaryURL = configuration.localRimeDirectory.appendingPathComponent("rime_ice.dict.yaml")
+            if let preparedData = try managedDictionaryImportData(at: mainDictionaryURL) {
+                try registerPreparedFile("rime_ice.dict.yaml", preparedData)
+                try AtomicFileStore.write(preparedData, to: mainDictionaryURL, fileManager: fileManager)
+            }
+
+            guard rebuildReviewState else { return }
+
+            let managedURL = configuration.localRimeDirectory.appendingPathComponent(RimeManagedDictionary.fileName)
+            let managedEntries = fileManager.fileExists(atPath: managedURL.path)
+                ? RimeManagedDictionary.parse(data: try Data(contentsOf: managedURL))
+                : []
+            let importedEntries = Dictionary(uniqueKeysWithValues: managedEntries.map { entry in
+                (entry.identity, RimeManagedEntryState(text: entry.text, code: entry.code, sourceFrequencies: ["local-managed": 1]))
+            })
+            let state = RimeReviewState(
+                initialized: true,
+                entries: importedEntries,
+                migration: RimeReviewMigration(legacyManagedEntries: managedEntries.count)
+            )
+            try reviewStore.save(state)
+        }
+    }
+
+    public func backupLocalReviewStateForConfigurationImport(at backupDirectory: URL) throws {
+        guard storageMode == .local else {
+            throw RimeSyncError.unsupportedOperation("配置导入备份仅支持本机审核状态")
+        }
+        try prepareReviewStorage()
+        let dependentDirectory = backupDirectory.appendingPathComponent("dependent-state", isDirectory: true)
+        try fileManager.createDirectory(at: dependentDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let stateURL = configuration.sharedRoot.appendingPathComponent("config/rime-review-state.json")
+        let snapshotURL = dependentDirectory.appendingPathComponent("rime-review-state.json")
+        let absentURL = dependentDirectory.appendingPathComponent("rime-review-state.absent")
+        if fileManager.fileExists(atPath: stateURL.path) {
+            guard (try? fileManager.destinationOfSymbolicLink(atPath: stateURL.path)) == nil,
+                  (try fileManager.attributesOfItem(atPath: stateURL.path)[.type] as? FileAttributeType) == .typeRegular else {
+                throw RimeSyncError.unsupportedOperation("本机审核状态不是普通文件，无法安全备份")
+            }
+            try fileManager.copyItem(at: stateURL, to: snapshotURL)
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: snapshotURL.path)
+        } else {
+            try AtomicFileStore.write(Data("absent\n".utf8), to: absentURL, fileManager: fileManager)
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: absentURL.path)
+        }
+    }
+
+    public func restoreLocalReviewStateFromConfigurationImport(at backupDirectory: URL) throws {
+        guard storageMode == .local else {
+            throw RimeSyncError.unsupportedOperation("配置导入回滚仅支持本机审核状态")
+        }
+        let dependentDirectory = backupDirectory.appendingPathComponent("dependent-state", isDirectory: true)
+        let snapshotURL = dependentDirectory.appendingPathComponent("rime-review-state.json")
+        let absentURL = dependentDirectory.appendingPathComponent("rime-review-state.absent")
+        let stateURL = configuration.sharedRoot.appendingPathComponent("config/rime-review-state.json")
+        if fileManager.fileExists(atPath: snapshotURL.path) {
+            guard (try? fileManager.destinationOfSymbolicLink(atPath: snapshotURL.path)) == nil,
+                  (try fileManager.attributesOfItem(atPath: snapshotURL.path)[.type] as? FileAttributeType) == .typeRegular else {
+                throw RimeSyncError.unsupportedOperation("本机审核状态备份不是普通文件，无法安全恢复")
+            }
+            try fileManager.createDirectory(at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try AtomicFileStore.copyItem(from: snapshotURL, to: stateURL, fileManager: fileManager)
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
+        } else if fileManager.fileExists(atPath: absentURL.path) {
+            if fileManager.fileExists(atPath: stateURL.path) {
+                try fileManager.removeItem(at: stateURL)
+            }
+        } else {
+            throw RimeSyncError.backupNotFound("本机审核状态导入前快照")
         }
     }
 
@@ -1704,8 +1843,7 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
             }
         }
         do {
-            let syncReport = try ordinarySync.sync(dryRun: false)
-            try reloader.reload()
+            let syncReport = try completeManagedDictionaryMutation()
             return RimeReviewApplyReport(
                 importedCount: applied.promoted,
                 skippedCount: applied.skipped,
@@ -1955,8 +2093,7 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
         }
 
         do {
-            let syncReport = try ordinarySync.sync(dryRun: false)
-            try reloader.reload()
+            let syncReport = try completeManagedDictionaryMutation()
             return RimeReviewApplyReport(
                 importedCount: 0,
                 skippedCount: 0,
@@ -1988,6 +2125,7 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
         guard RimeUserDictionaryValidator.isValidWord(word) else { throw RimeSyncError.unsupportedOperation("手动词条不能为空，且不能包含换行或制表符") }
         guard RimeUserDictionaryValidator.isValidCode(pinyin) else { throw RimeSyncError.unsupportedOperation("全拼编码格式无效") }
         _ = try RimeUserDictionaryValidator.frequency(frequency)
+        try prepareReviewStorage()
         let lock = DirectoryLock(lockURL: configuration.lockURL, fileManager: fileManager)
         let backupID = try lock.withLock { () throws -> String in
             let backupID = try backupManager.createBackup(configuration: configuration, retention: retentionStore.current)
@@ -2002,8 +2140,7 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
             return backupID
         }
         do {
-            let syncReport = try ordinarySync.sync(dryRun: false)
-            try reloader.reload()
+            let syncReport = try completeManagedDictionaryMutation()
             return RimeReviewApplyReport(
                 importedCount: 1,
                 skippedCount: 0,
@@ -2023,6 +2160,7 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
 
     public func submitProposals(_ proposals: [RimeAuditProposal], for batch: RimeAuditBatch) throws -> RimeAuditPreview {
         try validateProposals(proposals, for: batch)
+        try prepareReviewStorage()
         let lock = DirectoryLock(lockURL: configuration.lockURL, fileManager: fileManager)
         try lock.withLock {
             let current = try loadSnapshots()
@@ -2085,9 +2223,9 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
     }
 
     public func restore(backupID: String) throws {
+        try prepareReviewStorage()
         let lock = DirectoryLock(lockURL: configuration.lockURL, fileManager: fileManager)
         try lock.withLock {
-            try SharedDirectoryLayout.prepare(sharedRoot: configuration.sharedRoot, nodeIDs: [configuration.nodeID], fileManager: fileManager)
             let rollbackBackupID = try backupManager.createBackup(
                 configuration: configuration,
                 retention: retentionStore.current,
@@ -2231,6 +2369,19 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
         let managedURL = configuration.localRimeDirectory.appendingPathComponent(RimeManagedDictionary.fileName)
         if fileManager.fileExists(atPath: managedURL.path) {
             let legacyEntries = RimeManagedDictionary.parse(data: try Data(contentsOf: managedURL))
+            if storageMode == .local {
+                state.entries = Dictionary(uniqueKeysWithValues: legacyEntries.map { entry in
+                    let previous = state.entries[entry.identity]
+                    return (entry.identity, RimeManagedEntryState(
+                        text: entry.text,
+                        code: entry.code,
+                        sourceFrequencies: previous?.sourceFrequencies ?? ["local-managed": 1]
+                    ))
+                })
+                state.initialized = true
+                state.migration.legacyManagedEntries = max(state.migration.legacyManagedEntries, legacyEntries.count)
+                return state
+            }
             var importedCount = 0
             for entry in legacyEntries where state.entries[entry.identity] == nil && !state.permanentIgnoredIDs.contains(entry.identity) {
                 state.entries[entry.identity] = RimeManagedEntryState(text: entry.text, code: entry.code, sourceFrequencies: ["legacy-managed": 1])
@@ -2581,12 +2732,20 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
 
     private func ensureManagedDictionaryImported() throws {
         let url = configuration.localRimeDirectory.appendingPathComponent("rime_ice.dict.yaml")
-        guard fileManager.fileExists(atPath: url.path) else { return }
-        let original = try String(contentsOf: url, encoding: .utf8)
+        guard let preparedData = try managedDictionaryImportData(at: url) else { return }
+        try AtomicFileStore.write(preparedData, to: url, fileManager: fileManager)
+    }
+
+    private func managedDictionaryImportData(at url: URL) throws -> Data? {
+        guard fileManager.fileExists(atPath: url.path) else { return nil }
+        let originalData = try Data(contentsOf: url)
+        guard let original = String(data: originalData, encoding: .utf8) else {
+            throw RimeSyncError.unsupportedOperation("主词典不是有效 UTF-8 文本，无法启用长期词条词典")
+        }
         var lines = original.components(separatedBy: .newlines)
-        guard let importIndex = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "import_tables:" }) else { return }
+        guard let importIndex = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "import_tables:" }) else { return nil }
         lines.removeAll { line in line.trimmingCharacters(in: .whitespaces).hasPrefix("- rime_managed") }
-        guard let newImportIndex = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "import_tables:" }) else { return }
+        guard let newImportIndex = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "import_tables:" }) else { return nil }
         var insertion = newImportIndex + 1
         while insertion < lines.count {
             let trimmed = lines[insertion].trimmingCharacters(in: .whitespaces)
@@ -2594,15 +2753,18 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
             break
         }
         lines.insert("  - rime_managed     # 审核后的长期记忆，始终位于静态词库之后", at: insertion)
-        if lines != original.components(separatedBy: .newlines) { try AtomicFileStore.write(Data(lines.joined(separator: "\n").utf8), to: url, fileManager: fileManager) }
+        guard lines != original.components(separatedBy: .newlines) else { return nil }
         _ = importIndex
+        return Data(lines.joined(separator: "\n").utf8)
     }
 
     private func publishCurrentSnapshot() throws {
         let local = configuration.localRimeDirectory.appendingPathComponent("sync", isDirectory: true).appendingPathComponent(configuration.installationID, isDirectory: true).appendingPathComponent("rime_ice.userdb.txt")
         let shared = configuration.sharedRoot.appendingPathComponent("rime-userdata", isDirectory: true).appendingPathComponent(configuration.installationID, isDirectory: true).appendingPathComponent("rime_ice.userdb.txt")
-        if fileManager.fileExists(atPath: local.path), local.standardizedFileURL != shared.standardizedFileURL { try AtomicFileStore.copyItem(from: local, to: shared, fileManager: fileManager) }
-        if fileManager.fileExists(atPath: shared.path) { try SharedDirectoryLayout.makeGroupWritable(shared, fileManager: fileManager) }
+        if storageMode == .shared {
+            if fileManager.fileExists(atPath: local.path), local.standardizedFileURL != shared.standardizedFileURL { try AtomicFileStore.copyItem(from: local, to: shared, fileManager: fileManager) }
+            if fileManager.fileExists(atPath: shared.path) { try SharedDirectoryLayout.makeGroupWritable(shared, fileManager: fileManager) }
+        }
     }
 
     private func loadSnapshots() throws -> [RimeUserDictionarySnapshot] {
@@ -2642,11 +2804,61 @@ public final class RimeReviewSyncCoordinator: @unchecked Sendable {
     }
 
     private func rollbackWithSharedLock(backupID: String, originalError: Error) throws {
+        try prepareReviewStorage()
         let lock = DirectoryLock(lockURL: configuration.lockURL, fileManager: fileManager)
         try lock.withLock {
             if let recoveryError = rollbackError(backupID: backupID, originalError: originalError) {
                 throw recoveryError
             }
         }
+    }
+
+    private func prepareReviewStorage() throws {
+        switch storageMode {
+        case .shared:
+            try SharedDirectoryLayout.prepare(sharedRoot: configuration.sharedRoot, nodeIDs: [configuration.nodeID], fileManager: fileManager)
+        case .local:
+            try RimeLocalReviewStorage.prepare(root: configuration.sharedRoot, fileManager: fileManager)
+        }
+    }
+
+    private func ensurePrivateSyncDirectory() throws {
+        guard storageMode == .local else { return }
+        let installationURL = configuration.localRimeDirectory.appendingPathComponent("installation.yaml")
+        let desiredSyncDirectory = configuration.sharedRoot.appendingPathComponent("rime-userdata", isDirectory: true)
+        let existing = try RimeInstallationFile.loading(from: installationURL, fileManager: fileManager)
+        guard existing?.syncDirectory != desiredSyncDirectory.path else { return }
+        let installationBackupRoot = configuration.sharedRoot.appendingPathComponent("installation-backups", isDirectory: true)
+        try fileManager.createDirectory(at: installationBackupRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: installationBackupRoot.path)
+        let installationBackup = installationBackupRoot.appendingPathComponent("installation-\(UUID().uuidString.lowercased())")
+        if fileManager.fileExists(atPath: installationURL.path) {
+            let attributes = try fileManager.attributesOfItem(atPath: installationURL.path)
+            guard (attributes[.type] as? FileAttributeType) == .typeRegular else {
+                throw RimeSyncError.unsupportedOperation("installation.yaml 不是普通文件，无法安全切换本机 sync_dir")
+            }
+            try fileManager.copyItem(at: installationURL, to: installationBackup)
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: installationBackup.path)
+        } else {
+            try AtomicFileStore.write(Data("installation.yaml was absent before local snapshot setup\n".utf8), to: installationBackup.appendingPathExtension("absent"), fileManager: fileManager)
+        }
+        try RimeInstallationFile.updating(
+            existingURL: installationURL,
+            installationID: existing?.installationID ?? configuration.installationID,
+            syncDirectory: desiredSyncDirectory,
+            fileManager: fileManager
+        )
+    }
+
+    private func completeManagedDictionaryMutation() throws -> SyncReport? {
+        let report: SyncReport?
+        switch storageMode {
+        case .shared:
+            report = try ordinarySync.sync(dryRun: false)
+        case .local:
+            report = nil
+        }
+        try reloader.reload()
+        return report
     }
 }

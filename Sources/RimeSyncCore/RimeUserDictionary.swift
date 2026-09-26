@@ -355,10 +355,12 @@ public struct RimeReviewState: Codable, Equatable, Sendable {
 public struct RimeReviewStore {
     public let url: URL
     private let fileManager: FileManager
+    private let groupWritable: Bool
 
-    public init(url: URL, fileManager: FileManager = .default) {
+    public init(url: URL, fileManager: FileManager = .default, groupWritable: Bool = true) {
         self.url = url
         self.fileManager = fileManager
+        self.groupWritable = groupWritable
     }
 
     public func load() throws -> RimeReviewState {
@@ -376,7 +378,7 @@ public struct RimeReviewStore {
 
     public func save(_ state: RimeReviewState) throws {
         try AtomicFileStore.write(JSONEncoder.rimeEncoder.encode(state), to: url, fileManager: fileManager)
-        try SharedDirectoryLayout.makeGroupWritable(url, fileManager: fileManager)
+        if groupWritable { try SharedDirectoryLayout.makeGroupWritable(url, fileManager: fileManager) }
     }
 }
 

@@ -17,17 +17,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let rimeThemeStore: RimeThemeStore
     private let rimeBackupRetentionStore: RimeBackupRetentionStore
     private let permissionChecker: SystemPrivacyPermissionChecker
-    private var rimeReviewCoordinator: RimeReviewSyncCoordinator?
-    private let rimeConfigurationCoordinator: RimeReviewSyncCoordinator
+    private let rimeReviewCoordinator: RimeReviewSyncCoordinator
+    private let rimeLocalSupportRoot: URL
     private let rimeLocalDirectory: URL
-    private let rimeInstallationID: String
     private var settingsWindowController: SettingsWindowController?
     private var rimeDictionaryWindowController: RimeDictionaryWindowController?
-    private var rimeConflictWindowController: RimeConflictWindowController?
     private var usageMonitorTask: Task<Void, Never>?
     private var nativeF5MonitorTask: Task<Void, Never>?
     private var rimeThemeSelectionTask: Task<Void, Never>?
-    private var rimeSyncTask: Task<Void, Never>?
+    private var configurationArchiveTask: Task<Void, Never>?
+    private var configurationImportRecoveryPending = false
     private var cachedCredentials: TencentCredentials?
     private var activeUsageSessionID: UUID?
 
@@ -50,7 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         let localRimeDirectory = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Rime", isDirectory: true)
-        let sharedRimeRoot = URL(fileURLWithPath: "/Users/Shared/RimeSync", isDirectory: true)
+        let localSupportRoot = RimeLocalReviewStorage.defaultRoot()
         let installationURL = localRimeDirectory.appendingPathComponent("installation.yaml")
         let configuredInstallationID: String?
         do {
@@ -62,7 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let rimeMaintenance = SquirrelMaintenance()
         let rimeConfiguration = SyncConfiguration(
             localRimeDirectory: localRimeDirectory,
-            sharedRoot: sharedRimeRoot,
+            sharedRoot: localSupportRoot,
             installationID: rimeInstallationID
         )
         let ordinaryRimeSync = DefaultRimeSyncEngine(
@@ -70,14 +69,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             maintenance: rimeMaintenance,
             retentionStore: rimeBackupRetentionStore
         )
-        let rimeConfigurationCoordinator = RimeReviewSyncCoordinator(
+        let rimeReviewCoordinator = RimeReviewSyncCoordinator(
             configuration: rimeConfiguration,
             maintenance: rimeMaintenance,
             reloader: rimeMaintenance,
             ordinarySync: ordinaryRimeSync,
-            retentionStore: rimeBackupRetentionStore
+            retentionStore: rimeBackupRetentionStore,
+            storageMode: .local
         )
-        let rimeReviewCoordinator = configuredInstallationID == nil ? nil : rimeConfigurationCoordinator
         self.settingsStore = settingsStore
         self.credentialStore = credentialStore
         self.hotkeyManager = hotkeyManager
@@ -90,9 +89,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.rimeBackupRetentionStore = rimeBackupRetentionStore
         self.permissionChecker = permissionChecker
         self.rimeReviewCoordinator = rimeReviewCoordinator
-        self.rimeConfigurationCoordinator = rimeConfigurationCoordinator
+        self.rimeLocalSupportRoot = localSupportRoot
         self.rimeLocalDirectory = localRimeDirectory
-        self.rimeInstallationID = rimeInstallationID
         self.sessionLogger = sessionLogger
         coordinator = SessionCoordinator(
             asr: TencentASRClient(),
@@ -154,25 +152,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onManageRimeDictionary: { [weak self] in
                 self?.showRimeDictionaryManager()
             },
-            onSyncRimeDictionary: { [weak self] in
-                self?.syncRimeDictionary()
+            onExportRimeConfiguration: { [weak self] in
+                self?.exportRimeConfiguration()
             },
-            onSyncRimeSkin: { [weak self] in
-                self?.syncRimeSkin()
-            },
-            onSyncAllConfiguration: { [weak self] in
-                self?.syncAllConfiguration()
-            },
-            onManageRimeConflicts: { [weak self] in
-                self?.showRimeConflicts()
-            },
-            onRefreshRimeConflicts: { [weak self] in
-                self?.refreshRimeConflictCount()
+            onImportRimeConfiguration: { [weak self] in
+                self?.importRimeConfiguration()
             }
         )
         menu.update(autoStartEnabled: loginItemManager.isEnabled)
         refreshRimeThemes()
-        refreshRimeConflictCount()
+        recoverPendingConfigurationImports()
         registerHotkey()
         startNativeF5Monitor()
         localUsageStore.migrateLegacyUnscopedUsage(to: TencentEnginePreset.standard.rawValue)
@@ -231,7 +220,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         nativeF5MonitorTask?.cancel()
         usageMonitorTask?.cancel()
         rimeThemeSelectionTask?.cancel()
-        rimeSyncTask?.cancel()
         rimeDictionaryWindowController?.close()
         hotkeyManager.unregister()
         if !nativeF5Remapper.restoreIfOwned() {
@@ -462,7 +450,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func selectRimeTheme(_ themeID: String) {
-        guard rimeThemeSelectionTask == nil else { return }
+        guard rimeThemeSelectionTask == nil,
+              configurationArchiveTask == nil,
+              !configurationImportRecoveryPending else { return }
         rimeThemeSelectionTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { rimeThemeSelectionTask = nil }
@@ -477,10 +467,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showRimeDictionaryManager() {
-        guard let rimeReviewCoordinator else {
-            menu.update(status: "Rime 词库管理不可用")
-            return
-        }
+        guard configurationArchiveTask == nil, !configurationImportRecoveryPending else { return }
         if let existing = rimeDictionaryWindowController, existing.window?.isVisible == true {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
@@ -499,167 +486,279 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.begin()
     }
 
-    private func showRimeConflicts() {
-        if let existing = rimeConflictWindowController, existing.window?.isVisible == true {
-            NSApp.setActivationPolicy(.regular)
-            NSApp.activate(ignoringOtherApps: true)
-            existing.window?.makeKeyAndOrderFront(nil)
-            existing.window?.orderFrontRegardless()
-            existing.begin()
-            return
-        }
-        let controller = RimeConflictWindowController(reviewCoordinator: rimeConfigurationCoordinator)
-        controller.onConflictsChanged = { [weak self] in
-            self?.refreshRimeConflictCount()
-        }
-        rimeConflictWindowController = controller
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
-        controller.showWindow(nil)
-        controller.window?.center()
-        controller.window?.makeKeyAndOrderFront(nil)
-        controller.window?.orderFrontRegardless()
-        controller.begin()
-    }
-
-    private func refreshRimeConflictCount() {
-        do {
-            menu.update(rimeConflictCount: try rimeConfigurationCoordinator.configurationConflictPreviews().count)
-        } catch {
-            menu.update(rimeConflictCount: nil)
-        }
-    }
-
-    private func syncRimeDictionary() {
-        guard rimeSyncTask == nil else { return }
-        menu.update(syncStatus: "Rime 词库同步 1/3：准备目录…")
-        do {
-            try prepareRimeDirectoryForConfigurationSync()
-        } catch {
-            menu.update(syncStatus: "Rime 词库同步失败：\(error.localizedDescription)")
-            return
-        }
-        guard let coordinator = rimeReviewCoordinator else {
-            menu.update(syncStatus: "Rime 词库同步不可用")
-            return
-        }
-
-        menu.update(rimeSyncInProgress: true)
-        menu.update(syncStatus: "Rime 词库同步 2/3：同步词库并生成快照…")
-        rimeSyncTask = Task { @MainActor [weak self] in
+    private func exportRimeConfiguration() {
+        guard configurationArchiveTask == nil, !configurationImportRecoveryPending else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "rimevoiceconfig") ?? .data]
+        panel.nameFieldStringValue = "Rime Voice Configuration-\(Self.archiveDateFormatter.string(from: Date())).rimevoiceconfig"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        menu.update(configurationArchiveInProgress: true)
+        configurationArchiveTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
-                rimeSyncTask = nil
-                menu.update(rimeSyncInProgress: false)
+                configurationArchiveTask = nil
+                refreshConfigurationImportRecoveryState()
             }
-            let result: Result<RimeUserDictionarySyncReport, Error> = await Task.detached(priority: .userInitiated) {
-                do {
-                    return .success(try coordinator.syncUserDictionary())
-                } catch {
-                    return .failure(error)
-                }
-            }.value
-            switch result {
-            case let .success(report):
-                menu.update(syncStatus: "Rime 词库同步 3/3：刷新词库管理器…")
-                rimeDictionaryWindowController?.reloadFromStoredSnapshot()
-                menu.update(syncStatus: "Rime 词库同步完成 · \(report.entryCount) 条审核记录")
-            case let .failure(error):
-                menu.update(syncStatus: "Rime 词库同步失败：\(error.localizedDescription)")
+            do {
+                let source = rimeLocalDirectory
+                let exportPreview = try await Task.detached(priority: .userInitiated) {
+                    try RimePortableArchiveService().previewExport(from: source)
+                }.value
+                let confirmation = NSAlert()
+                confirmation.messageText = "导出所有 Rime 配置？"
+                confirmation.informativeText = "将导出 \(exportPreview.files.count) 个文件，预计 \(ByteCountFormatter.string(fromByteCount: exportPreview.totalBytes, countStyle: .file))。请确认完整文件清单后继续。"
+                confirmation.accessoryView = Self.archivePreviewScrollView(lines: Self.exportPreviewLines(exportPreview))
+                confirmation.addButton(withTitle: "导出存档")
+                confirmation.addButton(withTitle: "取消")
+                guard confirmation.runModal() == .alertFirstButtonReturn else { return }
+                let inspection = try await Task.detached(priority: .userInitiated) {
+                    try RimePortableArchiveService().export(from: source, to: destination, expectedPreview: exportPreview)
+                }.value
+                showArchiveNotice(
+                    title: "配置存档已导出",
+                    message: "已导出 \(inspection.files.count) 个文件（\(ByteCountFormatter.string(fromByteCount: inspection.totalBytes, countStyle: .file))）。\n\n\(destination.path)"
+                )
+            } catch {
+                showArchiveNotice(title: "导出失败", message: error.localizedDescription, style: .critical)
             }
         }
     }
 
-    private func syncRimeSkin() {
-        syncRimeConfiguration(
-            paths: [RimeResourcePolicy.skinConfigurationPath],
-            operation: "Rime 皮肤同步",
-            success: "Rime 皮肤同步完成"
-        )
-    }
-
-    private func syncAllConfiguration() {
-        syncRimeConfiguration(
-            paths: nil,
-            operation: "一键同步所有配置",
-            success: "一键同步所有配置完成"
-        )
-    }
-
-    private func syncRimeConfiguration(
-        paths: Set<String>?,
-        operation: String,
-        success: String
-    ) {
-        guard rimeSyncTask == nil else { return }
-        menu.update(syncStatus: "\(operation) 1/3：准备目录…")
-        do {
-            try prepareRimeDirectoryForConfigurationSync()
-        } catch {
-            menu.update(syncStatus: "\(operation)失败：\(error.localizedDescription)")
+    private func importRimeConfiguration() {
+        guard configurationArchiveTask == nil, !configurationImportRecoveryPending else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "rimevoiceconfig") ?? .data]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        guard panel.runModal() == .OK, let archiveURL = panel.url else { return }
+        guard rimeThemeSelectionTask == nil else {
+            showArchiveNotice(title: "暂时无法导入", message: "皮肤切换正在进行，请稍后再导入配置。")
             return
         }
-
-        menu.update(rimeSyncInProgress: true)
-        menu.update(syncStatus: "\(operation) 2/3：合并并写入配置…")
-        let coordinator = rimeConfigurationCoordinator
-        rimeSyncTask = Task { @MainActor [weak self] in
+        guard rimeDictionaryWindowController?.hasPendingOperation != true else {
+            showArchiveNotice(title: "暂时无法导入", message: "词库管理操作正在进行，请稍后再导入配置。")
+            return
+        }
+        menu.update(configurationArchiveInProgress: true)
+        rimeDictionaryWindowController?.window?.close()
+        rimeDictionaryWindowController = nil
+        configurationArchiveTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
-                rimeSyncTask = nil
-                menu.update(rimeSyncInProgress: false)
+                configurationArchiveTask = nil
+                refreshConfigurationImportRecoveryState()
             }
-            let result: Result<SyncReport, Error> = await Task.detached(priority: .userInitiated) {
-                do {
-                    return .success(try coordinator.syncConfiguration(paths: paths))
-                } catch {
-                    return .failure(error)
+            do {
+                let target = rimeLocalDirectory
+                let preview = try await Task.detached(priority: .userInitiated) {
+                    try RimePortableArchiveService().previewImport(from: archiveURL, to: target)
+                }.value
+                guard preview.changedCount > 0 else {
+                    showArchiveNotice(title: "配置无需更新", message: "存档中的 \(preview.items.count) 个文件与当前配置完全相同；未创建备份，也未重新部署。")
+                    return
                 }
-            }.value
-            switch result {
-            case let .success(report):
-                let changedCount = report.changedFiles.count + report.deletedFiles.count
-                menu.update(syncStatus: "\(operation) 3/3：刷新 Rime…")
+                let containsCode = preview.items.contains { item in
+                    item.relativePath == "Rime配置助手.command" || item.relativePath.hasPrefix("lua/")
+                }
+                if containsCode {
+                    let trustConfirmation = NSAlert()
+                    trustConfirmation.alertStyle = .critical
+                    trustConfirmation.messageText = "存档包含可执行代码"
+                    trustConfirmation.informativeText = "该存档包含 Lua 或 Rime 配置助手脚本。重新部署可能加载 Lua 代码；配置助手命令文件也会保留其执行权限。只有在确认存档来源可信时继续。"
+                    trustConfirmation.addButton(withTitle: "信任来源并继续")
+                    trustConfirmation.addButton(withTitle: "取消")
+                    guard trustConfirmation.runModal() == .alertFirstButtonReturn else { return }
+                }
+                let confirmation = NSAlert()
+                confirmation.alertStyle = .warning
+                confirmation.messageText = "导入并替换同名配置？"
+                confirmation.informativeText = "新增 \(preview.additions.count) 个文件；替换 \(preview.replacements.count) 个文件；内容相同 \(preview.unchanged.count) 个文件。未列入存档的目标文件会保留。请确认完整文件清单后继续。"
+                confirmation.accessoryView = Self.archivePreviewScrollView(lines: Self.importPreviewLines(preview))
+                confirmation.addButton(withTitle: "导入并重新部署")
+                confirmation.addButton(withTitle: "取消")
+                guard confirmation.runModal() == .alertFirstButtonReturn else { return }
+
+                try RimeLocalReviewStorage.prepare(root: rimeLocalSupportRoot)
+                let archiveIncludesManagedDictionary = preview.items.contains {
+                    $0.relativePath == RimeManagedDictionary.fileName
+                }
+                let managedDictionaryWillChange = preview.items.contains {
+                    $0.relativePath == RimeManagedDictionary.fileName && $0.change != .unchanged
+                }
+                let backupRoot = rimeLocalSupportRoot.appendingPathComponent("backups", isDirectory: true)
+                let coordinator = rimeReviewCoordinator
+                let importReport = try await Task.detached(priority: .userInitiated) {
+                    try RimePortableArchiveService().importAndDeploy(
+                        from: archiveURL,
+                        to: target,
+                        backupRoot: backupRoot,
+                        expectedPreview: preview,
+                        protectedPaths: archiveIncludesManagedDictionary ? ["rime_ice.dict.yaml", RimeManagedDictionary.fileName] : [],
+                        backupDependentState: { backupDirectory in
+                            if managedDictionaryWillChange {
+                                try coordinator.backupLocalReviewStateForConfigurationImport(at: backupDirectory)
+                            }
+                        },
+                        prepareAfterImport: { registerPreparedFile in
+                            if archiveIncludesManagedDictionary {
+                                try coordinator.reconcileManagedDictionaryAfterImport(
+                                    rebuildReviewState: managedDictionaryWillChange,
+                                    registerPreparedFile: registerPreparedFile
+                                )
+                            }
+                        },
+                        deploy: { try SquirrelMaintenance().reload() },
+                        restoreAfterRollback: { backupDirectory in
+                            if managedDictionaryWillChange {
+                                try coordinator.restoreLocalReviewStateFromConfigurationImport(at: backupDirectory)
+                            }
+                            try SquirrelMaintenance().reload()
+                        }
+                    )
+                }.value
+                guard !importReport.backupID.isEmpty else {
+                    showArchiveNotice(title: "配置无需更新", message: "目标文件在确认时已与存档一致；未创建备份或重新部署。")
+                    return
+                }
+
                 refreshRimeThemes()
-                refreshRimeConflictCount()
-                if !report.conflicts.isEmpty {
-                    let reloadMessage = report.reloadSucceeded
-                        ? ""
-                        : "；配置已保存，生效失败：\(report.reloadError ?? "未知重载错误")"
-                    menu.update(syncStatus: "部分同步完成，\(report.conflicts.count) 个文件待处理 · \(changedCount) 项变更\(reloadMessage)")
-                } else if !report.reloadSucceeded {
-                    menu.update(syncStatus: "配置已保存，生效失败：\(report.reloadError ?? "未知重载错误")")
-                } else {
-                    menu.update(syncStatus: "\(success) · \(changedCount) 项变更")
-                }
-            case let .failure(error):
-                menu.update(syncStatus: "\(operation)失败：\(error.localizedDescription)")
+                showArchiveNotice(
+                    title: "配置已导入",
+                    message: "新增 \(importReport.addedFiles.count) 个文件，替换 \(importReport.replacedFiles.count) 个文件。当前账户独有文件已保留。\n\n导入前备份：\(rimeLocalSupportRoot.appendingPathComponent("backups/\(importReport.backupID)").path)"
+                )
+            } catch {
+                showArchiveNotice(title: "导入失败", message: error.localizedDescription, style: .critical)
             }
         }
     }
 
-    private func prepareRimeDirectoryForConfigurationSync() throws {
-        let fileManager = FileManager.default
-        try fileManager.createDirectory(at: rimeLocalDirectory, withIntermediateDirectories: true)
-        // Once the local directory is bootstrapped, dictionary operations can
-        // use the same coordinator as configuration synchronization.
-        rimeReviewCoordinator = rimeConfigurationCoordinator
-        let installationURL = rimeLocalDirectory.appendingPathComponent("installation.yaml")
-        let syncDirectory = URL(
-            fileURLWithPath: "/Users/Shared/RimeSync/rime-userdata",
-            isDirectory: true
-        )
-        let installation = try? RimeInstallationFile.loading(from: installationURL)
-        guard installation?.installationID != rimeInstallationID
-            || installation?.syncDirectory != syncDirectory.path else {
+    private func recoverPendingConfigurationImports() {
+        let backupRoot = rimeLocalSupportRoot.appendingPathComponent("backups", isDirectory: true)
+        let recoveries: [RimePortableImportRecovery]
+        do {
+            recoveries = try RimePortableArchiveService().pendingRecoveries(in: backupRoot)
+        } catch {
+            configurationImportRecoveryPending = true
+            menu.update(configurationArchiveInProgress: true)
+            Task { @MainActor [weak self] in
+                self?.showArchiveNotice(
+                    title: "无法检查未完成的配置导入",
+                    message: "为避免覆盖未恢复的配置，本次运行期间已停用 Rime 配置操作。检查失败：\(error.localizedDescription)\n\n请保留备份目录并检查后重启应用：\(backupRoot.path)",
+                    style: .critical
+                )
+            }
             return
         }
-        try RimeInstallationFile.updating(
-            existingURL: installationURL,
-            installationID: rimeInstallationID,
-            syncDirectory: syncDirectory
-        )
+        guard !recoveries.isEmpty else { return }
+        configurationImportRecoveryPending = true
+        menu.update(configurationArchiveInProgress: true)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            for recovery in recoveries {
+                let backupDirectory = backupRoot.appendingPathComponent(recovery.id, isDirectory: true)
+                if let problem = recovery.problem {
+                    showArchiveNotice(
+                        title: "配置导入恢复记录无法读取",
+                        message: "为避免误覆盖，本次运行期间已停用 Rime 配置操作。记录错误：\(problem)\n\n请保留并人工检查此备份目录，然后重启应用：\(backupDirectory.path)",
+                        style: .critical
+                    )
+                    continue
+                }
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "发现未完成的配置导入"
+                alert.informativeText = "检测到尚未确认完成的导入。为避免把部分写入误标为完整，只能恢复导入前内容；也可以稍后处理。恢复前会检查目标文件，若发现后续编辑，将停止回滚并保留备份。\n\n涉及 \(recovery.filePaths.count) 个文件。\n备份：\(backupDirectory.path)"
+                alert.addButton(withTitle: "恢复导入前配置")
+                alert.addButton(withTitle: "稍后处理")
+                do {
+                    guard alert.runModal() == .alertFirstButtonReturn else { continue }
+                    let target = rimeLocalDirectory
+                    let coordinator = rimeReviewCoordinator
+                    let needsManagedReconcile = recovery.filePaths.contains(RimeManagedDictionary.fileName)
+                    try await Task.detached(priority: .userInitiated) {
+                        try RimePortableArchiveService().restoreImportFiles(backupID: recovery.id, in: backupRoot, targetDirectory: target)
+                        if needsManagedReconcile {
+                            try coordinator.restoreLocalReviewStateFromConfigurationImport(at: backupDirectory)
+                        }
+                        try SquirrelMaintenance().reload()
+                        try RimePortableArchiveService().completeRollback(backupID: recovery.id, in: backupRoot)
+                    }.value
+                } catch {
+                    showArchiveNotice(title: "恢复未完成", message: "\(error.localizedDescription)\n\n请保留备份：\(backupRoot.appendingPathComponent(recovery.id).path)", style: .critical)
+                }
+            }
+            refreshConfigurationImportRecoveryState()
+        }
     }
+
+    private func refreshConfigurationImportRecoveryState() {
+        let backupRoot = rimeLocalSupportRoot.appendingPathComponent("backups", isDirectory: true)
+        do {
+            let recoveries = try RimePortableArchiveService().pendingRecoveries(in: backupRoot)
+            configurationImportRecoveryPending = !recoveries.isEmpty
+        } catch {
+            configurationImportRecoveryPending = true
+        }
+        menu.update(configurationArchiveInProgress: configurationImportRecoveryPending || configurationArchiveTask != nil)
+    }
+
+    private func showArchiveNotice(title: String, message: String, style: NSAlert.Style = .informational) {
+        let alert = NSAlert()
+        alert.alertStyle = style
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "好")
+        alert.runModal()
+    }
+
+    private static func importPreviewLines(_ preview: RimePortableImportPreview) -> [String] {
+        let symbols: [RimePortableImportChange: String] = [.add: "新增", .replace: "替换", .unchanged: "相同"]
+        return preview.items.map { "\(symbols[$0.change, default: ""])  \($0.relativePath)" }
+    }
+
+    private static func exportPreviewLines(_ preview: RimePortableArchiveExportPreview) -> [String] {
+        preview.files.map { file in
+            "\(file.relativePath)  ·  \(ByteCountFormatter.string(fromByteCount: file.byteCount, countStyle: .file))"
+        }
+    }
+
+    private static func archivePreviewScrollView(lines: [String]) -> NSScrollView {
+        let size = NSSize(width: 520, height: 260)
+        let scrollView = NSScrollView(frame: NSRect(origin: .zero, size: size))
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .bezelBorder
+
+        let textView = NSTextView(frame: NSRect(origin: .zero, size: size))
+        textView.string = lines.joined(separator: "\n")
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.minSize = size
+        textView.maxSize = NSSize(width: size.width, height: .greatestFiniteMagnitude)
+        textView.autoresizingMask = [.width]
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+        textView.textContainer?.containerSize = NSSize(width: size.width, height: .greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = true
+        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        if let container = textView.textContainer, let layoutManager = textView.layoutManager {
+            layoutManager.ensureLayout(for: container)
+            let contentHeight = ceil(layoutManager.usedRect(for: container).height + 24)
+            textView.setFrameSize(NSSize(width: size.width, height: max(size.height, contentHeight)))
+        }
+        scrollView.documentView = textView
+        return scrollView
+    }
+
+    private static let archiveDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        return formatter
+    }()
 
     private static func defaultRimeInstallationID() -> String {
         let user = NSUserName().unicodeScalars.map { scalar -> String in
