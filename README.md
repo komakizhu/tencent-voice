@@ -1,18 +1,20 @@
 # Rime Voice
 
-这是一个只面向当前这台 macOS 的独立试用版：点击一次全局快捷键开始录音，再点击一次停止，腾讯实时语音识别结果会尽量实时改写到当前文本输入框。停止后会继续等待最多 3 秒，让最后一个语音片段完成修正；这段时间不会重新上屏整段文字。腾讯 ASR 会话与 Rime 管理是两个独立模块，Rime 管理负责稳定配置同步、快照审核和受控词库同步，不改变 ASR 数据管路。
+这是一个只面向当前这台 macOS 的独立试用版：点击一次全局快捷键开始录音，再点击一次停止，腾讯实时语音识别结果会尽量实时改写到当前文本输入框。停止后会继续等待最多 3 秒，让最后一个语音片段完成修正；这段时间不会重新上屏整段文字。腾讯 ASR 会话与 Rime 管理是两个独立模块，Rime 管理提供手动配置存档迁移、本机快照审核和受控词库维护，不改变 ASR 数据管路。
 
 ## 使用
 
+麦克风显示“尚未决定”时，点击设置页“麦克风”右侧的“打开设置”，应用会单独发起麦克风授权请求。点击系统弹窗中的“允许”后，状态会自动刷新；若未允许，则打开麦克风系统设置供手动调整。此操作保留其他已有权限，不需要重置全部授权。
+
 1. 在腾讯云开通实时语音识别，准备 AppID、SecretId、SecretKey。
 2. 运行 `./scripts/install-app.sh`。它会构建并覆盖 `/Applications/Rime Voice.app`，并通过脚本打开 macOS 隐私设置页面。
-3. 在 macOS 系统设置中手动开启麦克风、辅助功能、发送键盘事件和输入监控。若更换 App 后权限状态失效，在菜单栏“设置…”点击“重置并重新授权”，应用会清除旧权限记录并打开逐步授权向导；向导会依次打开每个对应设置页，完成当前开关后点击“进入下一步”。如果 macOS 要求输入当前账户密码，输入即可，但权限开关仍需确认已打开。也可以单独运行 `./scripts/request-permissions.sh microphone` 等命令打开指定页面。
-4. 之后直接打开 `/Applications/Rime Voice.app` 即可；普通启动和点击“开始录音”都只检查权限，不会再次主动申请。
-5. 默认点击 Command+0 开始录音，再点击 Command+0 停止；设置中可以重新录制快捷键。
+3. Rime Voice 保留原“讯飞一键语音”的 Bundle ID `local.onekey.iflyvoice` 和固定签名，因此旧 App 已授予的辅助功能、发送键盘事件和输入监控权限会继续生效。首次使用 Rime Voice 仍需在 macOS 系统设置中单独开启麦克风，因为原 App 不使用麦克风。若仍缺少权限，在菜单栏“设置…”点击对应的“打开设置”即可；只有需要清除共享的旧授权记录时才使用“重置并重新授权”。
+4. 之后直接打开 `/Applications/Rime Voice.app` 即可；普通启动和点击“开始录音”都只检查权限，不会再次主动申请。如果点击 F5 或“开始录音”时麦克风仍未授权，应用会自动打开设置并显示具体原因；点击“麦克风”右侧的“打开设置”完成授权后再试。
+5. 默认点击 Command+0 开始录音，再点击 Command+0 停止；设置中可以选择 F5（屏蔽 macOS 听写）、Esc、Home、Page Up、Page Down 预设，也可以重新录制快捷键。
 
 当前 `main` 版本为 0.2.3，构建号以 `Resources/Info.plist` 为准。
 
-应用对外名称为 Rime Voice；为保持已有系统权限、凭证和日志数据兼容，内部可执行文件、Bundle ID 和历史数据目录仍沿用旧标识。
+应用对外名称为 Rime Voice；为保持已有系统权限、凭证和日志数据兼容，内部可执行文件、Bundle ID（`local.onekey.iflyvoice`）和历史数据目录仍沿用旧标识。
 
 设置页的“测试连接”按钮会使用当前填写的 AppID、SecretId、SecretKey 和识别引擎执行一次腾讯 ASR WebSocket 握手。握手成功才会提示连接可用；这个测试不会录音、不会写入文本，也不会计入用量。
 
@@ -31,25 +33,26 @@
 ```bash
 swift test
 ./scripts/build-app.sh
-codesign --verify --deep --strict "dist/Rime Voice.app"
+build_number=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist)
+codesign --verify --deep --strict "dist/Rime Voice Build${build_number}.app"
 ```
 
-本地构建默认在设置页显示版本号和 Build 号；公开发布由 GitHub Actions 使用 `TVMVP_PUBLIC_RELEASE=1` 构建，设置页只显示版本号。安装脚本明确使用本地构建模式。
+每次构建都会把递增后的 Build 号写入 `.app` 文件名（例如 `Rime Voice Build97.app`）；设置页始终只显示版本号。GitHub Actions 发布包也采用同一文件名规则。安装脚本为保留 macOS 应用身份，仍将构建产物安装到固定路径 `/Applications/Rime Voice.app`。
 
 这是个人本地 macOS 应用，没有 Windows 兼容目标，也没有自动上传或发布流程。
 
-## Rime 双账户迁移与同步
+## Rime 跨账户配置迁移
 
-本仓库同时包含仅面向 macOS 的 `RimeSync` Swift 命令行工具，以及 Rime Voice 菜单栏中的“Rime 词库管理”。命令行工具负责稳定配置的双向同步；菜单栏模块负责生成 `rime_ice` 快照、逐条审核、手动添加和维护独立的 `rime_managed.dict.yaml`，不会调用绕过审核的原生远端合并。使用方式、备份、冲突暂停和回滚说明见 [docs/rime/rime-sync.md](docs/rime/rime-sync.md)。
+Rime Voice 提供“导出所有配置…”与“导入所有配置…”两个手动迁移入口。导入前完整校验存档并预览逐文件新增、替换和相同项；确认后备份受影响文件、保留目标账户独有文件，并在失败时回滚。存档可以携带 `custom_phrase.txt`、皮肤、方案、词典、Lua、OpenCC、语法模型和受控长期词库，但不包含 `installation.yaml`、实时 `.userdb`、机器身份或审核历史。流程与回滚说明见 [docs/rime/rime-sync.md](docs/rime/rime-sync.md)。
 
-状态栏菜单还提供“同步 Rime 皮肤”和“一键同步所有配置”。前者只同步 `squirrel.custom.yaml`；后者同步 YAML、Lua、OpenCC 和皮肤等稳定 Rime 资源，不直接共享两个账户的实时 `.userdb`。实时用户词库仍通过单独的“同步 Rime 词库”处理；Rime Voice 的权限、快捷键和账户级应用设置也不会被一键覆盖。
-
-同一个稳定配置文件在两个账户同时修改时，工具会以两边上一次同步共同看到的版本为基线做三方增量合并；不同片段会合并，同一片段重叠、没有共同基线或时间完全相同则暂停为冲突，不会直接用较晚版本覆盖。实时词库由 Squirrel 的原生同步按词条处理。
+“Rime 词库管理”保留为本机工具：打开窗口只读取当前账户已有的审核数据；只有明确点击“刷新本机快照”才会先备份本地状态，再将本机 `sync_dir` 设为私有目录并生成快照。审核缓存和备份保存在当前账户的 Application Support；不会调用 Squirrel `--sync` 或读取另一账户快照。旧的自动同步、冲突解决和共享快照脚本已停用，旧共享数据保持不动。
 
 凭证现在保存在 `/Users/Shared/TencentVoiceMVP/tencent-credentials.yaml`，共享目录归 macOS 的 `staff` 组管理，文件权限为组内账户可读写（0660），因此把应用放在 `/Applications` 后，两个 macOS 用户只要填写的是同一组 AppID、SecretId、SecretKey，就会自动读到同一份凭证。首次读取凭证或打开“设置…”时，会把当前用户旧的 `~/Library/Application Support/TencentVoiceMVP/tencent-credentials.yaml` 或旧 Keychain 凭证迁移到共享文件；共享 YAML 是明文文件，属于同一 `staff` 组的本机账户都可能读取，请勿同步到云盘或提交到 Git。
 
 状态栏菜单会显示共享本机本月用量、当前引擎对应的免费额度参考值和已用百分比。用量账本保存在 `/Users/Shared/TencentVoiceMVP/usage.json`，按 AppID、SecretId、SecretKey 的 SHA-256 指纹和识别引擎分别统计，所以两个账户使用同一密钥时会看到同一累计时长，换密钥后则会分开统计；设置页中的“已充值时长”也按同一凭证共享，方便直接看剩余量。账本不保存 SecretKey 明文；应用只记录实际处于“录音中”的时间，每秒刷新一次，停止录音或正常退出时落盘；不会调用腾讯云用量接口，也不会上传用量数据。旧版本的当前用户用量会在首次识别到对应凭证时迁移一次，异常退出时会回收遗留会话。
 
-构建脚本默认使用本机的 `OneKeyIFlyVoice Local Code Signing v4` 签名证书，避免每次重建后 macOS 把应用识别成新的程序。也可以通过 `CODESIGN_IDENTITY` 环境变量指定其他已安装的签名证书。
+构建脚本默认使用本机的 `OneKeyIFlyVoice Local Code Signing v4` 签名证书，避免每次重建后 macOS 把应用识别成新的程序。Rime Voice 还固定使用旧 App 的 Bundle ID `local.onekey.iflyvoice`，以便继承“讯飞一键语音”的 TCC 授权。也可以通过 `CODESIGN_IDENTITY` 环境变量指定其他已安装的签名证书。为避免授权失效，本地构建会拒绝 `CODESIGN_IDENTITY=-` 的 ad-hoc 签名；只有 GitHub Actions 等不需要继承本机 TCC 授权的构建，才可以显式设置 `TVMVP_ALLOW_ADHOC_SIGNING=1`。
+
+请使用同一份固定签名的 App：开发安装运行 `./scripts/install-app.sh` 后，从 `/Applications/Rime Voice.app` 启动；不要直接运行旧的 `dist` 副本。macOS 的麦克风、辅助功能、发送键盘事件和输入监控授权属于 Bundle ID 与代码签名身份，重新构建后只有这两者保持一致时才会继承。
 
 权限准备由 `scripts/request-permissions.sh` 负责，应用日常运行和点击“开始录音”都只检查权限，不会触发新的系统权限弹窗。设置页的“重置并重新授权”会调用 macOS `tccutil reset All` 清除 Rime Voice 的旧 TCC 记录，再打开逐步授权向导；向导会按麦克风、辅助功能、发送键盘事件、输入监控逐项引导，回到向导后会校验当前步骤再进入下一步。macOS 不允许普通脚本或密码静默授予 TCC 权限，因此每一项开关仍需用户在系统设置中确认。

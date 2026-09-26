@@ -137,6 +137,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let secretKeyField = NSSecureTextField()
     private let enginePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let prepaidHoursPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let shortcutPresetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let logCheckbox = NSButton(checkboxWithTitle: "自动保存诊断日志", target: nil, action: nil)
     private let safeCopyCheckbox = NSButton(
         checkboxWithTitle: "Safe Copy（始终复制到剪贴板）",
@@ -190,7 +191,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         onClose: @escaping () -> Void = {}
     ) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 830),
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 870),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -233,6 +234,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         prepaidHoursPopup.target = self
         prepaidHoursPopup.action = #selector(prepaidHoursChanged)
         rebuildPrepaidHoursPopup()
+        shortcutPresetPopup.addItem(withTitle: "选择预设…")
+        for preset in ShortcutPreset.allCases {
+            shortcutPresetPopup.addItem(withTitle: preset.displayName)
+            shortcutPresetPopup.lastItem?.representedObject = preset
+        }
+        shortcutPresetPopup.target = self
+        shortcutPresetPopup.action = #selector(shortcutPresetChanged)
+        updateShortcutPresetSelection()
         logCheckbox.state = settings.saveTextLogs ? .on : .off
         safeCopyCheckbox.state = settings.safeCopyEnabled ? .on : .off
         hideMenuBarIconCheckbox.state = settings.hideMenuBarIcon ? .on : .off
@@ -262,6 +271,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         } else {
             statusLabel.stringValue = "仍缺少：\(report.missing.map(\.title).joined(separator: "、"))；请继续开启后回到这里。"
         }
+    }
+
+    func showRecordingStartFailure(_ error: Error) {
+        refreshPermissionReport()
+        statusLabel.stringValue = RecordingStartFeedback.message(for: error)
+        statusLabel.textColor = .systemRed
     }
 
     private func buildView() {
@@ -304,14 +319,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         fields.spacing = 10
         fields.translatesAutoresizingMaskIntoConstraints = false
 
+        let shortcutPresetRow = labeled(
+            "快捷键预设",
+            view: shortcutPresetPopup,
+            toolTip: "选择常用快捷键预设。F5 会在 Rime Voice 运行期间屏蔽 macOS 原生听写。"
+        )
         let shortcutButton = NSButton(title: "重新录制", target: self, action: #selector(captureShortcut))
-        shortcutLabel.toolTip = "当前用于开始或停止录音的全局快捷键。"
+        shortcutLabel.toolTip = "当前用于开始或停止录音的全局快捷键。选择预设或重新录制后，点击“保存设置”生效。"
         shortcutButton.toolTip = "录制新的全局快捷键；选择后点击“保存设置”生效。"
         let shortcutRow = NSStackView(views: [
             NSTextField(labelWithString: "快捷键"), shortcutLabel, shortcutButton
         ])
         shortcutRow.alignment = .centerY
         shortcutRow.spacing = 10
+        let shortcutSection = NSStackView(views: [shortcutPresetRow, shortcutRow])
+        shortcutSection.orientation = .vertical
+        shortcutSection.alignment = .leading
+        shortcutSection.spacing = 8
 
         let saveButton = NSButton(title: "保存设置", target: self, action: #selector(saveButtonPressed))
         saveButton.keyEquivalent = "\r"
@@ -327,11 +351,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         logCheckbox.toolTip = "开启后自动保存会话状态、错误代码和操作上下文；点击右侧“导出诊断报告”导出已保存内容。"
         hideMenuBarIconCheckbox.toolTip = "隐藏状态栏图标；隐藏后可从 Dock 中 Rime Voice 的应用菜单重新打开设置。"
         saveButton.toolTip = "保存腾讯云凭证和设置；日志开关、Safe Copy 与快捷键也在此生效。"
+        shortcutPresetPopup.toolTip = "选择常用快捷键预设；F5 会在 Rime Voice 运行期间屏蔽 macOS 原生听写。"
+        shortcutPresetPopup.setAccessibilityLabel("快捷键预设")
         permissionResetButton.target = self
         permissionResetButton.action = #selector(resetPermissionsPressed)
         permissionResetButton.toolTip = "清除 Rime Voice 的全部 macOS 权限记录，打开隐私设置，从头重新授权。"
         statusLabel.toolTip = "显示当前设置页操作、权限、连接测试、快捷键和导出结果。"
-        versionLabel.toolTip = "显示当前应用版本和构建号。"
+        versionLabel.toolTip = "显示当前应用版本。"
         let buttons = NSStackView(views: [statusLabel, NSView(), saveButton])
         buttons.distribution = .fill
         buttons.alignment = .centerY
@@ -340,7 +366,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         saveButton.setContentHuggingPriority(.required, for: .horizontal)
 
         let permissionView = buildPermissionView()
-        let content = NSStackView(views: [versionLabel, fields, shortcutRow, permissionView, buttons])
+        let content = NSStackView(views: [versionLabel, fields, shortcutSection, permissionView, buttons])
         content.orientation = .vertical
         content.alignment = .leading
         content.spacing = 16
@@ -558,6 +584,29 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         onRecordDiagnosticAction?("permission_settings_open_requested", [
             "permission": String(permission.rawValue)
         ])
+        if permission == .microphone,
+           permissionChecker.report().status(for: .microphone)?.isGranted != true {
+            sender.isEnabled = false
+            statusLabel.textColor = .secondaryLabelColor
+            statusLabel.stringValue = "请在系统麦克风授权弹窗中点击“允许”。"
+            permissionChecker.requestPermission(for: .microphone) { [weak self, weak sender] _ in
+                Task { @MainActor [weak self, weak sender] in
+                    sender?.isEnabled = true
+                    guard let self else { return }
+                    let report = self.refreshPermissionReport()
+                    if report.status(for: .microphone)?.isGranted == true {
+                        self.statusLabel.stringValue = "麦克风已允许；回到目标输入框后按录音快捷键重试。"
+                    } else {
+                        self.openPermissionSettings(.microphone)
+                    }
+                }
+            }
+            return
+        }
+        openPermissionSettings(permission)
+    }
+
+    private func openPermissionSettings(_ permission: PrivacyPermission) {
         if permissionChecker.openSettings(for: permission) {
             permissionRefreshPending = true
             statusLabel.stringValue = "已打开“\(permission.title)”设置；开启后回到这里会自动刷新状态。"
@@ -576,6 +625,31 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 : .systemRed
         }
         return report
+    }
+
+    @objc private func shortcutPresetChanged() {
+        guard let preset = shortcutPresetPopup.selectedItem?.representedObject as? ShortcutPreset else {
+            updateShortcutPresetSelection()
+            return
+        }
+
+        currentShortcut = preset.shortcut
+        shortcutLabel.stringValue = ShortcutFormatter.string(for: currentShortcut)
+        onRecordDiagnosticAction?("shortcut_preset_selected", [
+            "preset": preset.rawValue,
+            "shortcut": ShortcutFormatter.string(for: currentShortcut)
+        ])
+        statusLabel.stringValue = "已选择 \(preset.displayName)，保存后生效"
+    }
+
+    private func updateShortcutPresetSelection() {
+        guard let index = ShortcutPreset.allCases.firstIndex(where: {
+            $0.shortcut == currentShortcut
+        }) else {
+            shortcutPresetPopup.selectItem(at: 0)
+            return
+        }
+        shortcutPresetPopup.selectItem(at: index + 1)
     }
 
     private func labeled(_ title: String, view: NSView, toolTip: String) -> NSView {
@@ -607,6 +681,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             }
             self.currentShortcut = shortcut
             self.shortcutLabel.stringValue = ShortcutFormatter.string(for: shortcut)
+            self.updateShortcutPresetSelection()
             self.onRecordDiagnosticAction?("shortcut_selected", [
                 "shortcut": ShortcutFormatter.string(for: shortcut)
             ])

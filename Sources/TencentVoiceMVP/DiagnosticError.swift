@@ -76,6 +76,8 @@ enum DiagnosticErrorFormatter {
             return "腾讯 ASR 连接已经结束"
         case "hotkey_invalid_shortcut":
             return "快捷键配置无效"
+        case "hotkey_native_f5_remap_unavailable":
+            return "无法屏蔽 macOS 原生听写，F5 预设未生效"
         default:
             if code.hasPrefix("hotkey_unavailable_") {
                 return "快捷键不可用，系统状态码已记录"
@@ -87,6 +89,28 @@ enum DiagnosticErrorFormatter {
                 return "腾讯 ASR 服务端返回错误，详情已隐藏"
             }
             return "腾讯 ASR 返回错误（\(status)），服务端详情已隐藏"
+        }
+    }
+}
+
+enum RecordingStartFeedback {
+    static func message(for error: Error) -> String {
+        switch DiagnosticErrorFormatter.code(for: error) {
+        case "microphone_denied":
+            return "无法开始录音：麦克风权限未开启。请点击“麦克风”右侧的“打开设置”，允许 Rime Voice 后重试。"
+        case "credentials_missing":
+            return "无法开始录音：尚未配置腾讯云凭证。请先填写并保存 AppID、SecretId 和 SecretKey。"
+        default:
+            return "无法开始录音：(DiagnosticErrorFormatter.message(for: error))"
+        }
+    }
+
+    static func shouldShowSettings(for error: Error) -> Bool {
+        switch DiagnosticErrorFormatter.code(for: error) {
+        case "microphone_denied", "credentials_missing":
+            return true
+        default:
+            return false
         }
     }
 }

@@ -60,7 +60,8 @@ final class RimeAuditTests: XCTestCase {
             configuration: SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac", nodeID: "mac"),
             maintenance: maintenance,
             reloader: maintenance,
-            ordinarySync: AuditNoopSync()
+            ordinarySync: AuditNoopSync(),
+            storageMode: .shared
         )
 
         let batch = try coordinator.refreshAuditFromPublishedSnapshots()
@@ -68,6 +69,68 @@ final class RimeAuditTests: XCTestCase {
         XCTAssertEqual(batch.entries.count, 1)
         XCTAssertTrue(maintenance.calls.isEmpty)
         XCTAssertNil(try coordinator.syncMetadata().latestRecord)
+    }
+
+    func testLocalReviewModeUsesPrivateSnapshotStorageAndNeverRunsSharedSync() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let support = root.appendingPathComponent("Application Support/Rime Voice", isDirectory: true)
+        let local = root.appendingPathComponent("local/Rime", isDirectory: true)
+        let legacyShared = root.appendingPathComponent("legacy-shared", isDirectory: true)
+        let originalSyncDirectory = legacyShared.appendingPathComponent("rime-userdata", isDirectory: true)
+        try write("preserve", to: legacyShared.appendingPathComponent("sentinel.txt"))
+        try write("installation_id: 'stable-account-id'\nsync_dir: '\(originalSyncDirectory.path)'\n", to: local.appendingPathComponent("installation.yaml"))
+        try write("import_tables:\n  - luna_pinyin\n", to: local.appendingPathComponent("rime_ice.dict.yaml"))
+        try write("---\nname: rime_managed\n...\n编译语\tbyy\t1\n", to: local.appendingPathComponent(RimeManagedDictionary.fileName))
+
+        let maintenance = AuditFakeMaintenance()
+        maintenance.snapshotToWrite = "#@/db_name\trime_ice.userdb\nni\t你\tc=2 d=0 t=1\n"
+        let sync = AuditNoopSync()
+        let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: support, installationID: "stable-account-id", nodeID: "account")
+        let coordinator = RimeReviewSyncCoordinator(
+            configuration: configuration,
+            maintenance: maintenance,
+            reloader: maintenance,
+            ordinarySync: sync
+        )
+
+        XCTAssertEqual(coordinator.storageMode, .local)
+        let batch = try coordinator.prepareAudit()
+
+        XCTAssertEqual(batch.entries.count, 2)
+        XCTAssertEqual(sync.syncCalls, 0)
+        XCTAssertEqual(maintenance.calls, ["capture"])
+        let installation = try XCTUnwrap(RimeInstallationFile.loading(from: local.appendingPathComponent("installation.yaml")))
+        XCTAssertEqual(installation.installationID, "stable-account-id")
+        XCTAssertEqual(installation.syncDirectory, support.appendingPathComponent("rime-userdata", isDirectory: true).path)
+        XCTAssertEqual(try String(contentsOf: legacyShared.appendingPathComponent("sentinel.txt")), "preserve")
+        XCTAssertTrue(try coordinator.reviewState().entries.values.contains { $0.text == "编译语" && $0.code == "byy" })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: support.appendingPathComponent("config/rime-review-state.json").path))
+    }
+
+    func testLocalManualDictionaryEditReloadsLocallyWithoutOrdinarySync() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let local = root.appendingPathComponent("local/Rime", isDirectory: true)
+        let support = root.appendingPathComponent("Application Support/Rime Voice", isDirectory: true)
+        let sync = AuditNoopSync()
+        let maintenance = AuditFakeMaintenance()
+        try write("---\nname: rime_managed\n...\nexisting\tyi cun\t1\n", to: local.appendingPathComponent(RimeManagedDictionary.fileName))
+        try write("import_tables:\n  - luna_pinyin\n", to: local.appendingPathComponent("rime_ice.dict.yaml"))
+        let coordinator = RimeReviewSyncCoordinator(
+            configuration: SyncConfiguration(localRimeDirectory: local, sharedRoot: support, installationID: "account", nodeID: "account"),
+            maintenance: maintenance,
+            reloader: maintenance,
+            ordinarySync: sync,
+            storageMode: .local
+        )
+
+        _ = try coordinator.addManualEntry(text: "新词", code: "xin ci")
+
+        XCTAssertEqual(sync.syncCalls, 0)
+        XCTAssertEqual(maintenance.calls, ["reload"])
+        XCTAssertTrue(try String(contentsOf: local.appendingPathComponent(RimeManagedDictionary.fileName)).contains("新词\txin ci\t1"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: support.appendingPathComponent("config/rime-review-state.json").path))
     }
 
     func testSyncUserDictionaryRunsNativeSyncAndRecordsLastSync() throws {
@@ -84,7 +147,8 @@ final class RimeAuditTests: XCTestCase {
             maintenance: maintenance,
             reloader: maintenance,
             ordinarySync: AuditNoopSync(),
-            now: { synchronizedAt }
+            now: { synchronizedAt },
+            storageMode: .shared
         )
 
         let report = try coordinator.syncUserDictionary()
@@ -108,7 +172,7 @@ final class RimeAuditTests: XCTestCase {
         try write("schema", to: local.appendingPathComponent("rime_ice.schema.yaml"))
         let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac2", nodeID: "mac2")
         let maintenance = AuditFakeMaintenance()
-        let coordinator = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync())
+        let coordinator = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync(), storageMode: .shared)
 
         let batch = try coordinator.prepareAudit()
 
@@ -128,7 +192,7 @@ final class RimeAuditTests: XCTestCase {
         try write("schema", to: local.appendingPathComponent("rime_ice.schema.yaml"))
         let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac", nodeID: "mac")
         let maintenance = AuditFakeMaintenance()
-        let coordinator = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync())
+        let coordinator = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync(), storageMode: .shared)
 
         let first = try coordinator.prepareAudit()
         XCTAssertTrue(first.isInitialBaseline)
@@ -163,7 +227,8 @@ final class RimeAuditTests: XCTestCase {
             configuration: SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac", nodeID: "mac"),
             maintenance: maintenance,
             reloader: maintenance,
-            ordinarySync: AuditNoopSync()
+            ordinarySync: AuditNoopSync(),
+            storageMode: .shared
         )
 
         _ = try coordinator.prepareAudit()
@@ -184,7 +249,7 @@ final class RimeAuditTests: XCTestCase {
         try write("schema", to: local.appendingPathComponent("rime_ice.schema.yaml"))
         let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac", nodeID: "mac")
         let maintenance = AuditFakeMaintenance()
-        let coordinator = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync())
+        let coordinator = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync(), storageMode: .shared)
 
         let batch = try coordinator.prepareAudit()
         let deletedEntry = try XCTUnwrap(batch.entries.first(where: { $0.text == "坏词" }))
@@ -295,7 +360,8 @@ final class RimeAuditTests: XCTestCase {
             configuration: configuration,
             maintenance: maintenance,
             reloader: maintenance,
-            ordinarySync: AuditNoopSync()
+            ordinarySync: AuditNoopSync(),
+            storageMode: .shared
         )
         let batch = try coordinator.prepareAudit()
         let chinese = try XCTUnwrap(batch.entries.first(where: { $0.text == "静默粘连" }))
@@ -327,7 +393,7 @@ final class RimeAuditTests: XCTestCase {
         XCTAssertEqual(preview.countsByAction["replace_entry"], 2)
         XCTAssertTrue(preview.replacements.allSatisfy { $0.generatedByReplaceEntry && $0.willBecomePermanent })
         XCTAssertEqual(try coordinator.reviewState().proposals[batch.batchID], proposals)
-        let restarted = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync())
+        let restarted = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync(), storageMode: .shared)
         XCTAssertEqual(try restarted.reviewState().proposals[batch.batchID], proposals)
 
         let report = try coordinator.apply(proposals: proposals, for: batch)
@@ -365,7 +431,7 @@ final class RimeAuditTests: XCTestCase {
         XCTAssertTrue(payloadEntries.contains { $0.identity == english.id && $0.isTombstone })
 
         let restoreCount = maintenance.restoredSnapshots.count
-        let restartedAfterApply = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync())
+        let restartedAfterApply = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync(), storageMode: .shared)
         let refreshedBatch = try restartedAfterApply.refreshAuditFromPublishedSnapshots()
         XCTAssertTrue(refreshedBatch.entries.first(where: { $0.id == chineseTargetID })?.generatedByReplaceEntry == true)
         let second = try restartedAfterApply.apply(proposals: proposals, for: batch)
@@ -386,7 +452,8 @@ final class RimeAuditTests: XCTestCase {
             configuration: remoteConfiguration,
             maintenance: remoteMaintenance,
             reloader: remoteMaintenance,
-            ordinarySync: AuditNoopSync()
+            ordinarySync: AuditNoopSync(),
+            storageMode: .shared
         )
         let remoteBatch = try remoteCoordinator.refreshAuditFromPublishedSnapshots()
         XCTAssertTrue(remoteBatch.entries.first(where: { $0.id == chineseTargetID })?.generatedByReplaceEntry == true)
@@ -411,7 +478,7 @@ final class RimeAuditTests: XCTestCase {
         try write("schema", to: local.appendingPathComponent("rime_ice.schema.yaml"))
         let maintenance = AuditFakeMaintenance()
         let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac", nodeID: "mac")
-        let coordinator = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync())
+        let coordinator = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync(), storageMode: .shared)
         let batch = try coordinator.prepareAudit()
         let old = try XCTUnwrap(batch.entries.first(where: { $0.text == "旧词" }))
         let existingTarget = try RimeAuditProposal(
@@ -454,7 +521,7 @@ final class RimeAuditTests: XCTestCase {
         try write("schema", to: local.appendingPathComponent("rime_ice.schema.yaml"))
         let maintenance = AuditFakeMaintenance()
         let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac", nodeID: "mac")
-        let reader = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync())
+        let reader = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync(), storageMode: .shared)
         let batch = try reader.prepareAudit()
         let old = try XCTUnwrap(batch.entries.first)
         let proposal = try RimeAuditProposal(
@@ -467,7 +534,7 @@ final class RimeAuditTests: XCTestCase {
             replacementText: "新词",
             replacementCode: "xin ci"
         )
-        let failing = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditFailingSync())
+        let failing = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditFailingSync(), storageMode: .shared)
 
         XCTAssertThrowsError(try failing.apply(proposals: [proposal], for: batch)) { error in
             XCTAssertTrue(error.localizedDescription.contains("配置同步失败"))
@@ -495,7 +562,8 @@ final class RimeAuditTests: XCTestCase {
             maintenance: maintenance,
             reloader: maintenance,
             ordinarySync: AuditNoopSync(),
-            now: { clock }
+            now: { clock },
+            storageMode: .shared
         )
 
         let first = try coordinator.prepareAudit()
@@ -564,7 +632,8 @@ final class RimeAuditTests: XCTestCase {
             configuration: SyncConfiguration(localRimeDirectory: macLocal, sharedRoot: shared, installationID: "mac", nodeID: "mac"),
             maintenance: macMaintenance,
             reloader: macMaintenance,
-            ordinarySync: AuditNoopSync()
+            ordinarySync: AuditNoopSync(),
+            storageMode: .shared
         )
         let batch = try macCoordinator.prepareAudit()
         let entry = try XCTUnwrap(batch.entries.first)
@@ -576,7 +645,8 @@ final class RimeAuditTests: XCTestCase {
             configuration: SyncConfiguration(localRimeDirectory: mac2Local, sharedRoot: shared, installationID: "mac2-main", nodeID: "mac2"),
             maintenance: mac2Maintenance,
             reloader: mac2Maintenance,
-            ordinarySync: AuditNoopSync()
+            ordinarySync: AuditNoopSync(),
+            storageMode: .shared
         )
         let updated = try mac2Coordinator.prepareAudit()
 
@@ -597,7 +667,8 @@ final class RimeAuditTests: XCTestCase {
             configuration: SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac", nodeID: "mac"),
             maintenance: maintenance,
             reloader: maintenance,
-            ordinarySync: AuditNoopSync()
+            ordinarySync: AuditNoopSync(),
+            storageMode: .shared
         )
         let batch = try coordinator.prepareAudit()
         let entry = try XCTUnwrap(batch.entries.first)
@@ -625,11 +696,11 @@ final class RimeAuditTests: XCTestCase {
         try write("schema", to: local.appendingPathComponent("rime_ice.schema.yaml"))
         let configuration = SyncConfiguration(localRimeDirectory: local, sharedRoot: shared, installationID: "mac", nodeID: "mac")
         let maintenance = AuditFakeMaintenance()
-        let reader = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync())
+        let reader = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditNoopSync(), storageMode: .shared)
         let batch = try reader.prepareAudit()
         let entry = try XCTUnwrap(batch.entries.first)
 
-        let failing = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditFailingSync())
+        let failing = RimeReviewSyncCoordinator(configuration: configuration, maintenance: maintenance, reloader: maintenance, ordinarySync: AuditFailingSync(), storageMode: .shared)
         XCTAssertThrowsError(try failing.apply(batch: batch, actions: [entry.id: .promotePermanent]))
         XCTAssertNil(try failing.reviewState().entries[entry.id])
         let managed = try String(contentsOf: local.appendingPathComponent(RimeManagedDictionary.fileName))
@@ -649,8 +720,9 @@ final class RimeAuditTests: XCTestCase {
 }
 
 private final class AuditNoopSync: RimeSyncEngine {
+    private(set) var syncCalls = 0
     func status() throws -> SyncReport { SyncReport() }
-    func sync(dryRun: Bool) throws -> SyncReport { SyncReport() }
+    func sync(dryRun: Bool) throws -> SyncReport { syncCalls += 1; return SyncReport() }
     func restore(backupID: String) throws {}
 }
 
@@ -663,9 +735,17 @@ private final class AuditFailingSync: RimeSyncEngine {
 private final class AuditFakeMaintenance: NativeRimeMaintaining, RimeUserDictionaryMaintaining {
     var restoredSnapshots: [Data] = []
     var calls: [String] = []
+    var snapshotToWrite: String?
     func syncUserData() throws { calls.append("sync") }
     func reload() throws { calls.append("reload") }
-    func captureUserDictionarySnapshot(in rimeDirectory: URL) throws { calls.append("capture") }
+    func captureUserDictionarySnapshot(in rimeDirectory: URL) throws {
+        calls.append("capture")
+        guard let snapshotToWrite else { return }
+        let installation = try XCTUnwrap(RimeInstallationFile.loading(from: rimeDirectory.appendingPathComponent("installation.yaml")))
+        let snapshotURL = URL(fileURLWithPath: installation.syncDirectory!).appendingPathComponent(installation.installationID, isDirectory: true).appendingPathComponent("rime_ice.userdb.txt")
+        try FileManager.default.createDirectory(at: snapshotURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(snapshotToWrite.utf8).write(to: snapshotURL)
+    }
     func restoreUserDictionarySnapshot(from snapshot: URL, in rimeDirectory: URL) throws {
         restoredSnapshots.append(try Data(contentsOf: snapshot))
     }

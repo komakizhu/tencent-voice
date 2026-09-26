@@ -9,20 +9,18 @@
 	<key>CFBundleIconFile</key>
 	<string>AppIcon.icns</string>
 	<key>CFBundleIdentifier</key>
-	<string>local.tencent-voice-mvp</string>
+	<string>local.onekey.iflyvoice</string>
 	<key>CFBundleName</key>
 	<string>Rime Voice</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.2.4</string>
+	<string>0.3.0</string>
 	<key>CFBundleVersion</key>
-	<string>79</string>
+	<string>98</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>用于将你的语音实时转换为文字。</string>
-	<key>RimeVoiceShowBuild</key>
-	<true/>
 </dict>
 </plist>

@@ -5,7 +5,13 @@ set -euo pipefail
 script_dir="${0:A:h}"
 project_root="${script_dir:h}"
 application_path="/Applications/Rime Voice.app"
-built_app="${project_root}/dist/Rime Voice.app"
+current_build="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "${project_root}/Resources/Info.plist")"
+if [[ "${current_build}" != <-> ]]; then
+  print -u2 "CFBundleVersion must be a non-negative integer: ${current_build}"
+  exit 64
+fi
+next_build=$(( current_build + 1 ))
+built_app="${project_root}/dist/Rime Voice Build${next_build}.app"
 
 case "${application_path}" in
   /Applications/Rime\ Voice.app) ;;
@@ -15,10 +21,10 @@ case "${application_path}" in
     ;;
 esac
 
-TVMVP_OUTPUT_APP="${built_app}" TVMVP_PACING_PRESET=balanced TVMVP_PUBLIC_RELEASE=0 "${script_dir}/build-app.sh"
+TVMVP_OUTPUT_APP="${built_app}" TVMVP_PACING_PRESET=balanced "${script_dir}/build-app.sh"
 
 case "${built_app}" in
-  "${project_root}/dist/Rime Voice.app") ;;
+  "${project_root}/dist/Rime Voice Build${next_build}.app") ;;
   *)
     print -u2 "refusing to install unexpected build path: ${built_app}"
     exit 66

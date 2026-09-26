@@ -96,4 +96,36 @@ final class HotkeyEventProcessorTests: XCTestCase {
             .press
         )
     }
+
+    func testSystemDefinedF5DownRepeatAndUpTriggerOnlyOnce() {
+        var processor = HotkeyEventProcessor(shortcut: .defaultF5)
+
+        XCTAssertEqual(
+            processor.process(
+                isDown: true,
+                isRepeat: false,
+                keyCode: Shortcut.defaultF5.keyCode,
+                flags: []
+            ),
+            .press
+        )
+        XCTAssertEqual(
+            processor.process(
+                isDown: true,
+                isRepeat: true,
+                keyCode: Shortcut.defaultF5.keyCode,
+                flags: []
+            ),
+            .consume
+        )
+        XCTAssertEqual(
+            processor.process(
+                isDown: false,
+                isRepeat: false,
+                keyCode: Shortcut.defaultF5.keyCode,
+                flags: []
+            ),
+            .release
+        )
+    }
 }

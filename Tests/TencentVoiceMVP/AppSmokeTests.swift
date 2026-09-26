@@ -1,53 +1,113 @@
+import Foundation
 import XCTest
 import RimeSyncCore
 @testable import TencentVoiceMVP
 
 @MainActor
 final class AppSmokeTests: XCTestCase {
+    func testMicrophoneButtonRequestsOnlyMicrophoneAndRefreshesResult() async throws {
+        for grant in [true, false] {
+            var authorized = false
+            var requested: [PrivacyPermission] = []
+            var opened: [PrivacyPermission] = []
+            var resets = 0
+            let checker = SystemPrivacyPermissionChecker(
+                microphoneStatus: { authorized ? .authorized : .notDetermined },
+                accessibilityStatus: { true },
+                postEventStatus: { true },
+                inputMonitoringStatus: { true },
+                openSettings: { opened.append($0); return true },
+                requestPermission: { permission, completion in
+                    requested.append(permission)
+                    authorized = grant
+                    completion(grant)
+                },
+                resetPermissions: { resets += 1; return true }
+            )
+            let controller = SettingsWindowController(
+                settings: AppSettings(), credentials: nil,
+                onSave: { _, _ in }, permissionChecker: checker
+            )
+            let button = try XCTUnwrap(flatten(controller.window?.contentView)
+                .compactMap { $0 as? NSButton }
+                .first { $0.title == "打开设置" && $0.tag == PrivacyPermission.microphone.rawValue })
+            button.performClick(nil)
+            for _ in 0..<10 { await Task.yield() }
+            XCTAssertEqual(requested, [.microphone])
+            XCTAssertEqual(opened, grant ? [] : [.microphone])
+            XCTAssertEqual(resets, 0)
+            XCTAssertTrue(button.isEnabled)
+            if grant {
+                XCTAssertTrue(flatten(controller.window?.contentView)
+                    .compactMap { $0 as? NSTextField }
+                    .contains { $0.stringValue.contains("麦克风已允许；") })
+            }
+        }
+    }
+
+    func testSettingsWindowExplainsRecordingStartPermissionFailure() throws {
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .notDetermined },
+            accessibilityStatus: { true },
+            postEventStatus: { true },
+            inputMonitoringStatus: { true }
+        )
+        let controller = SettingsWindowController(
+            settings: AppSettings(),
+            credentials: TencentCredentials(appID: "app", secretID: "id", secretKey: "key"),
+            onSave: { _, _ in },
+            permissionChecker: checker
+        )
+
+        controller.showRecordingStartFailure(SessionError.microphoneDenied)
+
+        XCTAssertTrue(
+            flatten(controller.window?.contentView)
+                .compactMap { $0 as? NSTextField }
+                .contains { $0.stringValue == RecordingStartFeedback.message(for: SessionError.microphoneDenied) }
+        )
+    }
+
     func testStatusMenuControllerCanBeCreated() {
         let controller = StatusMenuController()
         XCTAssertEqual(controller.statusText, "就绪")
     }
 
-    func testStatusMenuDisplaysSyncProgress() {
+    func testStatusMenuReturnsToStartAfterRecordingStartFailure() {
         let controller = StatusMenuController()
         let menu = controller.makeMenu()
 
-        let statusItem = menu.items.first { $0.title == "同步状态：就绪" }
-        let usageView = menu.items.compactMap { $0.view as? UsageMenuItemView }.first
-        let syncStatusView = menu.items.compactMap { $0.view as? SyncStatusMenuItemView }.first
-        XCTAssertNotNil(statusItem)
-        XCTAssertFalse(statusItem?.isEnabled ?? true)
-        XCTAssertNotNil(usageView)
-        XCTAssertNotNil(syncStatusView)
-        XCTAssertEqual(syncStatusView?.frame.width, usageView?.frame.width)
+        controller.update(status: RecordingStartFeedback.message(for: SessionError.microphoneDenied))
 
-        controller.update(syncStatus: "Rime 配置同步 2/3：合并并写入配置，这是一条需要自动换行的状态…")
-        XCTAssertEqual(statusItem?.title, "同步状态：Rime 配置同步 2/3：合并并写入配置，这是一条需要自动换行的状态…")
-        XCTAssertEqual(syncStatusView?.text, "同步状态：Rime 配置同步 2/3：合并并写入配置，这是一条需要自动换行的状态…")
-        XCTAssertEqual(syncStatusView?.frame.width, usageView?.frame.width)
-        XCTAssertGreaterThan(syncStatusView?.frame.height ?? 0, SyncStatusMenuItemView.lineHeight)
+        XCTAssertEqual(menu.items.first { $0.title == "开始录音" }?.title, "开始录音")
+        XCTAssertNil(menu.items.first { $0.title == "停止录音" })
+    }
+
+    func testStatusMenuHasNoSharedSyncStatusRow() {
+        let controller = StatusMenuController()
+        let menu = controller.makeMenu()
+
+        let usageView = menu.items.compactMap { $0.view as? UsageMenuItemView }.first
+        XCTAssertNotNil(usageView)
+        XCTAssertFalse(menu.items.contains { $0.title.hasPrefix("同步状态：") })
+        XCTAssertTrue(menu.items.compactMap { $0.view as? SyncStatusMenuItemView }.isEmpty)
 
         controller.update(usage: "模型：16k_zh_en_2.0\n用量：1h 36min / 60h（3%）")
-        XCTAssertEqual(syncStatusView?.frame.width, usageView?.frame.width)
         XCTAssertEqual(controller.statusText, "就绪")
         XCTAssertEqual(menu.items.first { $0.title == "开始录音" }?.title, "开始录音")
     }
 
-    func testStatusMenuContainsRimeSyncActions() {
+    func testStatusMenuContainsManualArchiveActionsAndRemovesAutomaticSyncActions() {
         let controller = StatusMenuController()
         let menu = controller.makeMenu()
 
         let titles = menu.items.map(\.title)
-        let syncTitles = titles.filter {
-            ["同步 Rime 词库", "同步 Rime 皮肤", "一键同步所有配置"].contains($0)
-        }
-
-        XCTAssertEqual(
-            syncTitles,
-            ["同步 Rime 词库", "同步 Rime 皮肤", "一键同步所有配置"]
-        )
-        XCTAssertFalse(titles.contains("同步 Rime 所有配置"))
+        XCTAssertTrue(titles.contains("导出所有配置…"))
+        XCTAssertTrue(titles.contains("导入所有配置…"))
+        XCTAssertFalse(titles.contains("同步 Rime 词库"))
+        XCTAssertFalse(titles.contains("同步 Rime 皮肤"))
+        XCTAssertFalse(titles.contains("一键同步所有配置"))
+        XCTAssertFalse(titles.contains("处理配置冲突…"))
     }
 
     func testStatusMenuContainsAutoStartToggle() throws {
@@ -64,24 +124,65 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertEqual(autoStart.state, .off)
     }
 
-    func testStatusMenuDisablesAllRimeSyncActionsWhileBusy() {
+    func testStatusMenuDisablesArchiveActionsWhileBusy() {
         let controller = StatusMenuController()
         let menu = controller.makeMenu()
-        let titles = ["同步 Rime 词库", "同步 Rime 皮肤", "一键同步所有配置"]
+        let titles = ["导出所有配置…", "导入所有配置…"]
 
-        controller.update(rimeSyncInProgress: true)
+        controller.update(configurationArchiveInProgress: true)
         XCTAssertTrue(
             titles.allSatisfy { title in
                 menu.items.first { $0.title == title }?.isEnabled == false
             }
         )
+        XCTAssertEqual(menu.items.first { $0.title == "Rime 词库管理…" }?.isEnabled, false)
+        XCTAssertEqual(menu.items.first { $0.title == "Rime 皮肤" }?.isEnabled, false)
 
-        controller.update(rimeSyncInProgress: false)
+        controller.update(configurationArchiveInProgress: false)
         XCTAssertTrue(
             titles.allSatisfy { title in
                 menu.items.first { $0.title == title }?.isEnabled == true
             }
         )
+        XCTAssertEqual(menu.items.first { $0.title == "Rime 词库管理…" }?.isEnabled, true)
+        XCTAssertEqual(menu.items.first { $0.title == "Rime 皮肤" }?.isEnabled, true)
+    }
+
+    func testLegacySyncEntrypointsAreDisabledWithoutCreatingSharedData() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let buildDirectory = Bundle(for: AppSmokeTests.self).bundleURL.deletingLastPathComponent()
+        let cli = try XCTUnwrap(existingExecutable("RimeSync", in: buildDirectory))
+        let mcp = try XCTUnwrap(existingExecutable("RimeAuditMCP", in: buildDirectory))
+        let probeRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RimeDisabledEntrypoints-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: probeRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: probeRoot) }
+
+        let cliSharedRoot = probeRoot.appendingPathComponent("legacy-cli", isDirectory: true)
+        let cliResult = try run(cli, arguments: [
+            "sync",
+            "--dry-run",
+            "--rime-dir", probeRoot.appendingPathComponent("rime-cli", isDirectory: true).path,
+            "--shared-root", cliSharedRoot.path
+        ])
+        XCTAssertEqual(cliResult.status, 1)
+        XCTAssertTrue(cliResult.output.contains("自动跨账户同步命令已停用"), cliResult.output)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cliSharedRoot.path))
+
+        let mcpSharedRoot = probeRoot.appendingPathComponent("legacy-mcp", isDirectory: true)
+        let mcpResult = try run(mcp, arguments: ["--shared-root", mcpSharedRoot.path])
+        XCTAssertEqual(mcpResult.status, 1)
+        XCTAssertTrue(mcpResult.output.contains("--shared-root 已停用"), mcpResult.output)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: mcpSharedRoot.path))
+
+        let snapshotScript = root.appendingPathComponent("scripts/rime-refresh-snapshot")
+        let scriptResult = try run(URL(fileURLWithPath: "/bin/sh"), arguments: [snapshotScript.path])
+        XCTAssertEqual(scriptResult.status, 2)
+        XCTAssertTrue(scriptResult.output.contains("已停用"), scriptResult.output)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: probeRoot.appendingPathComponent("rime-cli").path))
     }
 
     func testRimeDictionaryMenuItemsUseLocalCommandShortcuts() {
@@ -163,8 +264,21 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertTrue(credentialFields.allSatisfy { !($0.toolTip ?? "").isEmpty })
 
         let popups = flatten(contentView).compactMap { $0 as? NSPopUpButton }
-        XCTAssertEqual(popups.count, 2)
+        XCTAssertEqual(popups.count, 3)
         XCTAssertTrue(popups.allSatisfy { !($0.toolTip ?? "").isEmpty })
+        guard let shortcutPresetPopup = popups.first(where: { popup in
+            popup.itemArray.contains { $0.title == "F5（屏蔽 macOS 听写）" }
+        }) else {
+            XCTFail("找不到快捷键预设下拉框")
+            return
+        }
+        let shortcutPresetTitles = shortcutPresetPopup.itemArray.map(\.title)
+        XCTAssertTrue(shortcutPresetTitles.contains("F5（屏蔽 macOS 听写）"))
+        XCTAssertTrue(shortcutPresetTitles.contains("Esc"))
+        XCTAssertTrue(shortcutPresetTitles.contains("Home"))
+        XCTAssertTrue(shortcutPresetTitles.contains("Page Up"))
+        XCTAssertTrue(shortcutPresetTitles.contains("Page Down"))
+        XCTAssertFalse(shortcutPresetTitles.contains { $0.localizedCaseInsensitiveContains("delete") })
 
         let controls = flatten(contentView).compactMap { $0 as? NSButton }
         XCTAssertTrue(controls.contains { $0.title == "自动保存诊断日志" })
@@ -436,6 +550,48 @@ final class AppSmokeTests: XCTestCase {
         )
     }
 
+    func testSettingsWindowSavesSelectedShortcutPreset() throws {
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .authorized },
+            accessibilityStatus: { true },
+            postEventStatus: { true },
+            inputMonitoringStatus: { true }
+        )
+        var savedSettings: AppSettings?
+        let controller = SettingsWindowController(
+            settings: AppSettings(),
+            credentials: TencentCredentials(appID: "app", secretID: "id", secretKey: "key"),
+            onSave: { settings, _ in savedSettings = settings },
+            permissionChecker: checker
+        )
+        let contentView = try XCTUnwrap(controller.window?.contentView)
+        let popup = try XCTUnwrap(
+            flatten(contentView)
+                .compactMap { $0 as? NSPopUpButton }
+                .first { $0.itemTitles.contains("Page Down") }
+        )
+        popup.selectItem(withTitle: "Page Down")
+        guard let action = popup.action else {
+            XCTFail("快捷键预设下拉框没有绑定操作")
+            return
+        }
+        XCTAssertTrue(NSApp.sendAction(action, to: popup.target, from: popup))
+
+        let saveButton = try XCTUnwrap(
+            flatten(contentView)
+                .compactMap { $0 as? NSButton }
+                .first { $0.title == "保存设置" }
+        )
+        saveButton.performClick(nil)
+
+        XCTAssertEqual(savedSettings?.shortcut, ShortcutPreset.pageDown.shortcut)
+        XCTAssertTrue(
+            flatten(contentView)
+                .compactMap { $0 as? NSTextField }
+                .contains { $0.stringValue == "Page Down" }
+        )
+    }
+
     func testSettingsWindowSavesHiddenMenuBarIcon() throws {
         let checker = SystemPrivacyPermissionChecker(
             microphoneStatus: { .authorized },
@@ -580,7 +736,7 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertEqual(RimeBackupSettings.loadPolicy(from: defaults).limit, 10)
     }
 
-    func testRimeDictionaryWindowUsesUpdatedActionLayout() throws {
+    func testRimeDictionaryWindowUsesUpdatedActionLayoutAndDoesNotRefreshOnOpen() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("RimeDictionaryWindowTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -600,27 +756,51 @@ final class AppSmokeTests: XCTestCase {
         let controller = RimeDictionaryWindowController(reviewCoordinator: coordinator)
         let views = flatten(controller.window?.contentView)
         let buttons = views.compactMap { $0 as? NSButton }
+        controller.begin()
 
-        XCTAssertTrue(buttons.contains { $0.title == "重新读取" })
+        XCTAssertTrue(buttons.contains { $0.title == "刷新本机快照" })
         XCTAssertTrue(buttons.contains { $0.title == "导出" })
         XCTAssertTrue(buttons.contains { $0.title == "导入 AI 提案…" })
         XCTAssertTrue(buttons.contains { $0.title == "应用 AI 提案" })
         XCTAssertFalse(buttons.contains { $0.title == "关闭" })
         let export = try XCTUnwrap(views.compactMap { $0 as? NSPopUpButton }.first { $0.title == "导出" })
         XCTAssertEqual(export.menu?.items.map(\.title), ["导出", "CSV", "TXT", "Markdown", "JSON"])
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(maintenance.calls.isEmpty, "打开词库管理不应自动备份或刷新本机快照")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("shared").path))
     }
 
     private func flatten(_ view: NSView?) -> [NSView] {
         guard let view else { return [] }
         return [view] + view.subviews.flatMap(flatten)
     }
+
+    private func existingExecutable(_ name: String, in directory: URL) -> URL? {
+        let candidate = directory.appendingPathComponent(name)
+        return FileManager.default.isExecutableFile(atPath: candidate.path) ? candidate : nil
+    }
+
+    private func run(_ executable: URL, arguments: [String]) throws -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
 }
 
 private final class AppSmokeRimeMaintenance: NativeRimeMaintaining, RimeUserDictionaryMaintaining {
-    func syncUserData() throws {}
-    func reload() throws {}
-    func captureUserDictionarySnapshot(in rimeDirectory: URL) throws {}
-    func restoreUserDictionarySnapshot(from snapshot: URL, in rimeDirectory: URL) throws {}
+    private(set) var calls: [String] = []
+    func syncUserData() throws { calls.append("sync") }
+    func reload() throws { calls.append("reload") }
+    func captureUserDictionarySnapshot(in rimeDirectory: URL) throws { calls.append("capture") }
+    func restoreUserDictionarySnapshot(from snapshot: URL, in rimeDirectory: URL) throws { calls.append("restore") }
 }
 
 private final class AppSmokeRimeSync: RimeSyncEngine {

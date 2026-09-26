@@ -61,6 +61,180 @@ public struct FileRecord: Codable, Equatable, Hashable, Sendable {
     public var contentIdentity: String {
         "\(state.rawValue):\(byteCount):\(sha256 ?? "")"
     }
+
+    public func changingOwner(to owner: String) -> FileRecord {
+        FileRecord(
+            relativePath: relativePath,
+            state: state,
+            modifiedNanoseconds: modifiedNanoseconds,
+            byteCount: byteCount,
+            sha256: sha256,
+            owner: owner
+        )
+    }
+}
+
+public enum RimeConflictReason: String, Codable, Equatable, Sendable {
+    case overlappingEdits
+    case missingBaseline
+    case baselineMismatch
+    case deletionConflict
+    case historical
+    case firstSync
+    case missingData
+
+    public var displayName: String {
+        switch self {
+        case .overlappingEdits: return "双方修改重叠，需要选择"
+        case .missingBaseline: return "缺少共同历史，需要首次对齐"
+        case .baselineMismatch: return "共同基线与记录不一致，需要确认"
+        case .deletionConflict: return "删除与修改冲突，需要选择"
+        case .historical: return "历史冲突，需要确认"
+        case .firstSync: return "首次同步，需要选择"
+        case .missingData: return "冲突来源缺失，需要确认"
+        }
+    }
+}
+
+/// Durable conflict information. It is optional in the manifest so older
+/// shared directories remain readable and can be upgraded conservatively.
+public struct RimeConflictRecord: Codable, Equatable, Sendable {
+    public let relativePath: String
+    public var nodeRecords: [String: FileRecord]
+    public var sharedRecord: FileRecord?
+    public var baselineRecord: FileRecord?
+    public var reason: RimeConflictReason
+    public var artifactID: String?
+    public var createdAt: Date?
+
+    public init(
+        relativePath: String,
+        nodeRecords: [String: FileRecord] = [:],
+        sharedRecord: FileRecord? = nil,
+        baselineRecord: FileRecord? = nil,
+        reason: RimeConflictReason,
+        artifactID: String? = nil,
+        createdAt: Date? = Date()
+    ) {
+        self.relativePath = relativePath
+        self.nodeRecords = nodeRecords
+        self.sharedRecord = sharedRecord
+        self.baselineRecord = baselineRecord
+        self.reason = reason
+        self.artifactID = artifactID
+        self.createdAt = createdAt
+    }
+}
+
+public struct RimeConflictSummary: Equatable, Sendable {
+    public let relativePath: String
+    public let nodeIDs: [String]
+    public let reason: RimeConflictReason
+    public let hasBaseline: Bool
+
+    public init(
+        relativePath: String,
+        nodeIDs: [String],
+        reason: RimeConflictReason,
+        hasBaseline: Bool
+    ) {
+        self.relativePath = relativePath
+        self.nodeIDs = nodeIDs.sorted()
+        self.reason = reason
+        self.hasBaseline = hasBaseline
+    }
+}
+
+public struct RimeConflictVariant: Equatable, Sendable {
+    public let nodeID: String
+    public let record: FileRecord
+    public let text: String?
+
+    public init(nodeID: String, record: FileRecord, text: String?) {
+        self.nodeID = nodeID
+        self.record = record
+        self.text = text
+    }
+}
+
+public struct RimeConflictPreview: Equatable, Sendable {
+    public let relativePath: String
+    public let reason: RimeConflictReason
+    public let variants: [RimeConflictVariant]
+    public let localRecord: FileRecord?
+    public let sharedRecord: FileRecord?
+    public let baselineRecord: FileRecord?
+    public let localText: String?
+    public let sharedText: String?
+    public let suggestedMerge: String?
+    public let versionToken: String
+
+    public init(
+        relativePath: String,
+        reason: RimeConflictReason,
+        variants: [RimeConflictVariant],
+        localRecord: FileRecord?,
+        sharedRecord: FileRecord?,
+        baselineRecord: FileRecord?,
+        localText: String?,
+        sharedText: String?,
+        suggestedMerge: String?,
+        versionToken: String
+    ) {
+        self.relativePath = relativePath
+        self.reason = reason
+        self.variants = variants.sorted { $0.nodeID < $1.nodeID }
+        self.localRecord = localRecord
+        self.sharedRecord = sharedRecord
+        self.baselineRecord = baselineRecord
+        self.localText = localText
+        self.sharedText = sharedText
+        self.suggestedMerge = suggestedMerge
+        self.versionToken = versionToken
+    }
+
+    public var summary: RimeConflictSummary {
+        RimeConflictSummary(
+            relativePath: relativePath,
+            nodeIDs: variants.map(\.nodeID),
+            reason: reason,
+            hasBaseline: baselineRecord != nil
+        )
+    }
+}
+
+public enum RimeConflictResolution: Equatable, Sendable {
+    case keepLocal
+    case keepShared
+    case merge(String)
+}
+
+public enum SyncOperationKind: String, Equatable, Hashable, Sendable {
+    case upload
+    case download
+    case merge
+    case deleteLocal
+    case deleteShared
+
+    public var displayName: String {
+        switch self {
+        case .upload: return "上传"
+        case .download: return "下载"
+        case .merge: return "合并"
+        case .deleteLocal: return "删除本地"
+        case .deleteShared: return "删除共享"
+        }
+    }
+}
+
+public struct SyncFileOperation: Equatable, Sendable {
+    public let relativePath: String
+    public let kind: SyncOperationKind
+
+    public init(relativePath: String, kind: SyncOperationKind) {
+        self.relativePath = relativePath
+        self.kind = kind
+    }
 }
 
 public enum RimeResourcePolicy {
@@ -68,6 +242,13 @@ public enum RimeResourcePolicy {
 
     private static let excludedTopLevelNames: Set<String> = [
         "build", "trash", "sync", "weasel.yaml", "installation.yaml", "user.yaml"
+    ]
+    private static let credentialNameTokens: Set<String> = [
+        "credential", "credentials", "secret", "secrets", "token", "tokens",
+        "password", "passwords", "passwd", "auth", "authentication", "authorization", "oauth"
+    ]
+    private static let credentialNameCompounds: Set<String> = [
+        "apikey", "accesskey", "privatekey", "sshkey", "clientsecret"
     ]
 
     public static func isAllowed(relativePath: String) -> Bool {
@@ -77,29 +258,46 @@ public enum RimeResourcePolicy {
         }
 
         let components = path.split(separator: "/").map(String.init)
-        guard let topLevel = components.first else { return false }
-        guard !excludedTopLevelNames.contains(topLevel) else { return false }
-        guard !components.contains(where: { $0 == ".DS_Store" || $0.hasSuffix(".userdb") }) else {
+        let canonicalComponents = components.map(canonicalResourceName)
+        guard let topLevel = canonicalComponents.first else { return false }
+        guard !canonicalComponents.contains(where: isCredentialPathComponent) else { return false }
+        guard !excludedTopLevelNames.contains(where: { canonicalResourceName($0) == topLevel }) else { return false }
+        guard !canonicalComponents.contains(where: { $0 == ".ds_store" || $0.hasSuffix(".userdb") }) else {
             return false
         }
-        guard !path.hasSuffix(".userdb.txt") else { return false }
-        guard !path.hasSuffix(".log") else { return false }
+        let canonicalPath = canonicalComponents.joined(separator: "/")
+        guard !canonicalPath.hasSuffix(".userdb.txt") else { return false }
+        guard !canonicalPath.hasSuffix(".log") else { return false }
         // This file is generated from the shared audit state.  Letting the
         // ordinary configuration sync manage it would race with the audit
         // coordinator and could silently resurrect a rejected entry.
-        guard path != "rime_managed.dict.yaml" else { return false }
+        guard canonicalPath != canonicalResourceName("rime_managed.dict.yaml") else { return false }
 
         if ["cn_dicts", "en_dicts", "wanxiang_dicts", "lua", "opencc", "rime-mate-config"].contains(topLevel) {
             return true
         }
-        if topLevel == "Rime配置助手.command" {
+        if topLevel == canonicalResourceName("Rime配置助手.command") {
             return components.count == 1
         }
-        if topLevel == "wanxiang-lts-zh-hans.gram" {
+        if topLevel == canonicalResourceName("wanxiang-lts-zh-hans.gram") {
             return components.count == 1
         }
         guard components.count == 1 else { return false }
         return topLevel.hasSuffix(".yaml") || topLevel.hasSuffix(".dict.yaml") || topLevel.hasSuffix(".txt")
+    }
+
+    private static func canonicalResourceName(_ name: String) -> String {
+        name.precomposedStringWithCanonicalMapping
+            .folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .precomposedStringWithCanonicalMapping
+    }
+
+    private static func isCredentialPathComponent(_ component: String) -> Bool {
+        let tokens = component.split { !$0.isLetter && !$0.isNumber }.map(String.init)
+        guard !tokens.isEmpty else { return false }
+        if tokens.contains(where: { credentialNameTokens.contains($0) }) { return true }
+        let compact = tokens.joined()
+        return credentialNameCompounds.contains(where: { compact.contains($0) })
     }
 }
 
@@ -109,6 +307,8 @@ public enum RimeSyncError: LocalizedError, Equatable {
     case commandFailed(String)
     case backupNotFound(String)
     case lockUnavailable(URL)
+    case conflictNotFound(String)
+    case conflictChanged(String)
     case unsupportedOperation(String)
 
     public var errorDescription: String? {
@@ -118,6 +318,8 @@ public enum RimeSyncError: LocalizedError, Equatable {
         case let .commandFailed(message): return "命令执行失败：\(message)"
         case let .backupNotFound(id): return "备份不存在：\(id)"
         case let .lockUnavailable(url): return "同步锁不可用：\(url.path)"
+        case let .conflictNotFound(path): return "没有找到待处理冲突：\(path)"
+        case let .conflictChanged(path): return "冲突内容已变化，请刷新预览后再应用：\(path)"
         case let .unsupportedOperation(message): return message
         }
     }
@@ -179,17 +381,33 @@ public struct RimeManifest: Codable, Equatable, Sendable {
     public var records: [String: FileRecord]
     public var nodes: [String: [String: FileRecord]]
     public var pausedPaths: Set<String>
+    public var conflicts: [String: RimeConflictRecord]
 
     public init(
-        schemaVersion: Int = 1,
+        schemaVersion: Int = 2,
         records: [String: FileRecord] = [:],
         nodes: [String: [String: FileRecord]] = [:],
-        pausedPaths: Set<String> = []
+        pausedPaths: Set<String> = [],
+        conflicts: [String: RimeConflictRecord] = [:]
     ) {
-        self.schemaVersion = schemaVersion
+        self.schemaVersion = max(1, schemaVersion)
         self.records = records
         self.nodes = nodes
         self.pausedPaths = pausedPaths
+        self.conflicts = conflicts
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, records, nodes, pausedPaths, conflicts
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.schemaVersion = max(1, try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1)
+        self.records = try container.decodeIfPresent([String: FileRecord].self, forKey: .records) ?? [:]
+        self.nodes = try container.decodeIfPresent([String: [String: FileRecord]].self, forKey: .nodes) ?? [:]
+        self.pausedPaths = try container.decodeIfPresent(Set<String>.self, forKey: .pausedPaths) ?? []
+        self.conflicts = try container.decodeIfPresent([String: RimeConflictRecord].self, forKey: .conflicts) ?? [:]
     }
 
     public func saving(to url: URL, fileManager: FileManager = .default) throws {

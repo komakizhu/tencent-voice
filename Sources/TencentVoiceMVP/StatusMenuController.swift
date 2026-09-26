@@ -8,19 +8,16 @@ final class StatusMenuController: NSObject {
     private var recordMenuItem: NSMenuItem?
     private var autoStartMenuItem: NSMenuItem?
     private var rimeThemeMenuItem: NSMenuItem?
+    private var rimeDictionaryMenuItem: NSMenuItem?
     private var onSettings: (() -> Void)?
     private var onToggleRecording: (() -> Void)?
     private var onToggleAutoStart: (() -> Void)?
     private var onSelectRimeTheme: ((String) -> Void)?
     private var onManageRimeDictionary: (() -> Void)?
-    private var onSyncRimeDictionary: (() -> Void)?
-    private var onSyncRimeSkin: (() -> Void)?
-    private var onSyncAllConfiguration: (() -> Void)?
-    private var rimeSyncMenuItems: [NSMenuItem] = []
-    private var syncStatusMenuItem: NSMenuItem?
-    private var syncStatusMenuItemView: SyncStatusMenuItemView?
+    private var onExportRimeConfiguration: (() -> Void)?
+    private var onImportRimeConfiguration: (() -> Void)?
+    private var archiveMenuItems: [NSMenuItem] = []
     private(set) var statusText = "就绪"
-    private(set) var syncStatusText = "就绪"
     private(set) var installedMenu: NSMenu?
 
     func install() {
@@ -52,12 +49,6 @@ final class StatusMenuController: NSObject {
         usage.view = usageView
         usage.isEnabled = false
         menu.addItem(usage)
-        let syncStatusTitle = "同步状态：\(syncStatusText)"
-        let syncStatusView = SyncStatusMenuItemView(text: syncStatusTitle, width: usageView.frame.width)
-        let syncStatus = NSMenuItem(title: syncStatusTitle, action: nil, keyEquivalent: "")
-        syncStatus.view = syncStatusView
-        syncStatus.isEnabled = false
-        menu.addItem(syncStatus)
         menu.addItem(.separator())
         let rimeTheme = NSMenuItem(title: "Rime 皮肤", action: nil, keyEquivalent: "")
         rimeTheme.submenu = NSMenu(title: "Rime 皮肤")
@@ -66,19 +57,15 @@ final class StatusMenuController: NSObject {
         dictionary.target = self
         Self.applyLocalShortcut(to: dictionary, keyEquivalent: "m")
         menu.addItem(dictionary)
-        let syncDictionary = NSMenuItem(title: "同步 Rime 词库", action: #selector(syncRimeDictionaryPressed), keyEquivalent: "")
-        syncDictionary.target = self
-        Self.applyLocalShortcut(to: syncDictionary, keyEquivalent: "s")
-        menu.addItem(syncDictionary)
-        let syncSkin = NSMenuItem(title: "同步 Rime 皮肤", action: #selector(syncRimeSkinPressed), keyEquivalent: "")
-        syncSkin.target = self
-        syncSkin.toolTip = "只同步 squirrel.custom.yaml 皮肤配置"
-        menu.addItem(syncSkin)
         menu.addItem(.separator())
-        let syncAllConfiguration = NSMenuItem(title: "一键同步所有配置", action: #selector(syncAllConfigurationPressed), keyEquivalent: "")
-        syncAllConfiguration.target = self
-        syncAllConfiguration.toolTip = "同步全部 Rime 稳定配置；实时用户词库仍使用“同步 Rime 词库”"
-        menu.addItem(syncAllConfiguration)
+        let export = NSMenuItem(title: "导出所有配置…", action: #selector(exportRimeConfigurationPressed), keyEquivalent: "")
+        export.target = self
+        export.toolTip = "将当前账户可迁移的 Rime 配置打包为便携存档"
+        let `import` = NSMenuItem(title: "导入所有配置…", action: #selector(importRimeConfigurationPressed), keyEquivalent: "")
+        `import`.target = self
+        `import`.toolTip = "校验存档、预览将新增或替换的文件，并在确认后导入"
+        menu.addItem(export)
+        menu.addItem(`import`)
         let settings = NSMenuItem(title: "设置…", action: #selector(settingsPressed), keyEquivalent: ",")
         settings.target = self
         let record = NSMenuItem(title: "开始录音", action: #selector(toggleRecordingPressed), keyEquivalent: "")
@@ -96,9 +83,8 @@ final class StatusMenuController: NSObject {
         recordMenuItem = record
         autoStartMenuItem = autoStart
         rimeThemeMenuItem = rimeTheme
-        rimeSyncMenuItems = [syncDictionary, syncSkin, syncAllConfiguration]
-        syncStatusMenuItem = syncStatus
-        syncStatusMenuItemView = syncStatusView
+        rimeDictionaryMenuItem = dictionary
+        archiveMenuItems = [export, `import`]
         return menu
     }
 
@@ -110,19 +96,12 @@ final class StatusMenuController: NSObject {
     func update(status: String) {
         statusText = status
         let isIdle = status.contains("就绪")
+        let isError = status.hasPrefix("错误：") || status.hasPrefix("无法开始录音：")
         let isStopping = status.contains("收尾中")
         recordMenuItem?.title = isStopping
             ? "收尾中…"
-            : (isIdle ? "开始录音" : "停止录音")
+            : (isIdle || isError ? "开始录音" : "停止录音")
         recordMenuItem?.isEnabled = !isStopping
-    }
-
-    func update(syncStatus: String) {
-        syncStatusText = syncStatus
-        let title = "同步状态：\(syncStatus)"
-        syncStatusMenuItem?.title = title
-        syncStatusMenuItemView?.text = title
-        statusItem?.button?.toolTip = "Rime Voice · 同步状态：\(syncStatus)"
     }
 
     func update(shortcut: Shortcut) {
@@ -136,13 +115,12 @@ final class StatusMenuController: NSObject {
 
     func update(usage: String) {
         usageMenuItemView?.text = usage
-        if let width = usageMenuItemView?.frame.width {
-            syncStatusMenuItemView?.update(width: width)
-        }
     }
 
-    func update(rimeSyncInProgress: Bool) {
-        rimeSyncMenuItems.forEach { $0.isEnabled = !rimeSyncInProgress }
+    func update(configurationArchiveInProgress: Bool) {
+        archiveMenuItems.forEach { $0.isEnabled = !configurationArchiveInProgress }
+        rimeThemeMenuItem?.isEnabled = !configurationArchiveInProgress
+        rimeDictionaryMenuItem?.isEnabled = !configurationArchiveInProgress
     }
 
     func configure(
@@ -151,18 +129,16 @@ final class StatusMenuController: NSObject {
         onToggleAutoStart: @escaping () -> Void,
         onSelectRimeTheme: @escaping (String) -> Void,
         onManageRimeDictionary: @escaping () -> Void,
-        onSyncRimeDictionary: @escaping () -> Void,
-        onSyncRimeSkin: @escaping () -> Void,
-        onSyncAllConfiguration: @escaping () -> Void
+        onExportRimeConfiguration: @escaping () -> Void,
+        onImportRimeConfiguration: @escaping () -> Void
     ) {
         self.onSettings = onSettings
         self.onToggleRecording = onToggleRecording
         self.onToggleAutoStart = onToggleAutoStart
         self.onSelectRimeTheme = onSelectRimeTheme
         self.onManageRimeDictionary = onManageRimeDictionary
-        self.onSyncRimeDictionary = onSyncRimeDictionary
-        self.onSyncRimeSkin = onSyncRimeSkin
-        self.onSyncAllConfiguration = onSyncAllConfiguration
+        self.onExportRimeConfiguration = onExportRimeConfiguration
+        self.onImportRimeConfiguration = onImportRimeConfiguration
     }
 
     func update(rimeThemes snapshot: RimeThemeSnapshot) {
@@ -211,16 +187,12 @@ final class StatusMenuController: NSObject {
         onManageRimeDictionary?()
     }
 
-    @objc private func syncRimeDictionaryPressed() {
-        onSyncRimeDictionary?()
+    @objc private func exportRimeConfigurationPressed() {
+        onExportRimeConfiguration?()
     }
 
-    @objc private func syncRimeSkinPressed() {
-        onSyncRimeSkin?()
-    }
-
-    @objc private func syncAllConfigurationPressed() {
-        onSyncAllConfiguration?()
+    @objc private func importRimeConfigurationPressed() {
+        onImportRimeConfiguration?()
     }
 
     func uninstall() {
@@ -230,9 +202,8 @@ final class StatusMenuController: NSObject {
         onToggleAutoStart = nil
         onSelectRimeTheme = nil
         onManageRimeDictionary = nil
-        onSyncRimeDictionary = nil
-        onSyncRimeSkin = nil
-        onSyncAllConfiguration = nil
+        onExportRimeConfiguration = nil
+        onImportRimeConfiguration = nil
     }
 
     private func removeStatusItem() {
@@ -246,9 +217,8 @@ final class StatusMenuController: NSObject {
         recordMenuItem = nil
         autoStartMenuItem = nil
         rimeThemeMenuItem = nil
-        syncStatusMenuItem = nil
-        syncStatusMenuItemView = nil
-        rimeSyncMenuItems = []
+        rimeDictionaryMenuItem = nil
+        archiveMenuItems = []
     }
 
     private func statusImage() -> NSImage {
