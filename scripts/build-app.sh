@@ -12,7 +12,19 @@ if [[ ! "$CURRENT_BUILD" =~ ^[0-9]+$ ]]; then
     echo "CFBundleVersion must be a non-negative integer: $CURRENT_BUILD" >&2
     exit 1
 fi
-NEXT_BUILD=$((CURRENT_BUILD + 1))
+BUILD_MODE="${TVMVP_BUILD_MODE:-increment}"
+case "$BUILD_MODE" in
+increment)
+    OUTPUT_BUILD=$((CURRENT_BUILD + 1))
+    ;;
+keep)
+    OUTPUT_BUILD="$CURRENT_BUILD"
+    ;;
+*)
+    echo "TVMVP_BUILD_MODE must be increment or keep" >&2
+    exit 1
+    ;;
+esac
 
 case "$ALLOW_ADHOC_SIGNING" in
 0|1)
@@ -77,10 +89,14 @@ esac
 
 if [[ -n "${TVMVP_OUTPUT_APP:-}" ]]; then
     APP_DIR="$TVMVP_OUTPUT_APP"
+elif [[ "$BUILD_MODE" == "keep" && "$PACING_PRESET" == "balanced" ]]; then
+    APP_DIR="$PROJECT_DIR/dist/Rime Voice.app"
+elif [[ "$BUILD_MODE" == "keep" ]]; then
+    APP_DIR="$PROJECT_DIR/dist/presets/Rime Voice-$PACING_PRESET.app"
 elif [[ "$PACING_PRESET" == "balanced" ]]; then
-    APP_DIR="$PROJECT_DIR/dist/Rime Voice Build${NEXT_BUILD}.app"
+    APP_DIR="$PROJECT_DIR/dist/Rime Voice Build${OUTPUT_BUILD}.app"
 else
-    APP_DIR="$PROJECT_DIR/dist/presets/Rime Voice Build${NEXT_BUILD}-$PACING_PRESET.app"
+    APP_DIR="$PROJECT_DIR/dist/presets/Rime Voice Build${OUTPUT_BUILD}-$PACING_PRESET.app"
 fi
 
 EXTERNAL_VOLUME="/Volumes/T7_1T"
@@ -165,8 +181,8 @@ if [[ "$APP_NAME" == "." || "$APP_NAME" == ".." || "$APP_NAME" != *.app ]]; then
     echo "output app must be an .app bundle: $APP_DIR" >&2
     exit 1
 fi
-if [[ "$APP_NAME" != *"Build${NEXT_BUILD}"*.app ]]; then
-    echo "output app name must include Build${NEXT_BUILD}: $APP_NAME" >&2
+if [[ "$BUILD_MODE" == "increment" && "$APP_NAME" != *"Build${OUTPUT_BUILD}"*.app ]]; then
+    echo "output app name must include Build${OUTPUT_BUILD}: $APP_NAME" >&2
     exit 1
 fi
 case "$APP_PARENT" in
@@ -225,8 +241,10 @@ fi
 # binary. Restore it before the bundle is assembled so Finder can launch it.
 chmod +x "$BIN_PATH"
 
-/usr/bin/plutil -replace CFBundleVersion -string "$NEXT_BUILD" "$PROJECT_DIR/Resources/Info.plist"
-echo "Bundle build: $CURRENT_BUILD -> $NEXT_BUILD"
+if [[ "$BUILD_MODE" == "increment" ]]; then
+    /usr/bin/plutil -replace CFBundleVersion -string "$OUTPUT_BUILD" "$PROJECT_DIR/Resources/Info.plist"
+    echo "Bundle build: $CURRENT_BUILD -> $OUTPUT_BUILD"
+fi
 
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/$PRODUCT_NAME"

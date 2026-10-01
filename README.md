@@ -12,7 +12,7 @@
 4. 之后直接打开 `/Applications/Rime Voice.app` 即可；普通启动和点击“开始录音”都只检查权限，不会再次主动申请。如果点击 F5 或“开始录音”时麦克风仍未授权，应用会自动打开设置并显示具体原因；点击“麦克风”右侧的“打开设置”完成授权后再试。
 5. 默认点击 Command+0 开始录音，再点击 Command+0 停止；设置中可以选择 F5（屏蔽 macOS 听写）、Esc、Home、Page Up、Page Down 预设，也可以重新录制快捷键。
 
-当前 `main` 版本为 0.2.3，构建号以 `Resources/Info.plist` 为准。
+当前 `main` 版本为 0.3.1，构建号以 `Resources/Info.plist` 为准，应用界面不显示构建号。
 
 应用对外名称为 Rime Voice；为保持已有系统权限、凭证和日志数据兼容，内部可执行文件、Bundle ID（`local.onekey.iflyvoice`）和历史数据目录仍沿用旧标识。
 
@@ -37,7 +37,7 @@ build_number=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Inf
 codesign --verify --deep --strict "dist/Rime Voice Build${build_number}.app"
 ```
 
-每次构建都会把递增后的 Build 号写入 `.app` 文件名（例如 `Rime Voice Build97.app`）；设置页始终只显示版本号。GitHub Actions 发布包也采用同一文件名规则。安装脚本为保留 macOS 应用身份，仍将构建产物安装到固定路径 `/Applications/Rime Voice.app`。
+修改代码后的测试构建会递增 Build 号，测试产物名称包含 Build 号。提交后的定稿、发布、释放和覆盖不再递增；`TVMVP_BUILD_MODE=keep ./scripts/build-app.sh` 会按已提交的构建号完整编译，并生成 `dist/Rime Voice.app`。安装脚本和 GitHub Actions Release 均采用此模式；设置页、正式发布包内的 App 名称和 `/Applications/Rime Voice.app` 均不显示 Build 号。
 
 这是个人本地 macOS 应用，没有 Windows 兼容目标，也没有自动上传或发布流程。
 
