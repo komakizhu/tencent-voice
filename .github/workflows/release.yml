@@ -28,13 +28,13 @@ jobs:
         env:
           CODESIGN_IDENTITY: "-"
           TVMVP_ALLOW_ADHOC_SIGNING: "1"
+          TVMVP_BUILD_MODE: keep
           TVMVP_DISPLAY_NAME: Rime Voice
         run: ./scripts/build-app.sh
 
       - name: Verify app bundle
         run: |
-          BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist)"
-          APP_PATH="dist/Rime Voice Build${BUILD_NUMBER}.app"
+          APP_PATH="dist/Rime Voice.app"
           codesign --verify --deep --strict "$APP_PATH"
           test -x "$APP_PATH/Contents/MacOS/TencentVoiceMVP"
 
@@ -42,8 +42,7 @@ jobs:
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist)"
-          APP_PATH="dist/Rime Voice Build${BUILD_NUMBER}.app"
+          APP_PATH="dist/Rime Voice.app"
           archive="dist/Rime-Voice-${TAG_NAME}.zip"
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$archive"
           shasum -a 256 "$archive" > "${archive}.sha256"
