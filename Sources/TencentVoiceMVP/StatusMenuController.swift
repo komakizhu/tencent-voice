@@ -4,12 +4,14 @@ import AppKit
 final class StatusMenuController: NSObject {
     private var statusItem: NSStatusItem?
     private var usageMenuItemView: UsageMenuItemView?
+    private var calibrateUsageMenuItem: NSMenuItem?
     private var settingsMenuItem: NSMenuItem?
     private var recordMenuItem: NSMenuItem?
     private var autoStartMenuItem: NSMenuItem?
     private var rimeThemeMenuItem: NSMenuItem?
     private var rimeDictionaryMenuItem: NSMenuItem?
     private var onSettings: (() -> Void)?
+    private var onCalibrateUsage: (() -> Void)?
     private var onToggleRecording: (() -> Void)?
     private var onToggleAutoStart: (() -> Void)?
     private var onSelectRimeTheme: ((String) -> Void)?
@@ -49,6 +51,9 @@ final class StatusMenuController: NSObject {
         usage.view = usageView
         usage.isEnabled = false
         menu.addItem(usage)
+        let calibrateUsage = NSMenuItem(title: "校准用量…", action: #selector(calibrateUsagePressed), keyEquivalent: "")
+        calibrateUsage.target = self
+        menu.addItem(calibrateUsage)
         menu.addItem(.separator())
         let rimeTheme = NSMenuItem(title: "Rime 皮肤", action: nil, keyEquivalent: "")
         rimeTheme.submenu = NSMenu(title: "Rime 皮肤")
@@ -79,6 +84,7 @@ final class StatusMenuController: NSObject {
         menu.addItem(NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         installedMenu = menu
         usageMenuItemView = usageView
+        calibrateUsageMenuItem = calibrateUsage
         settingsMenuItem = settings
         recordMenuItem = record
         autoStartMenuItem = autoStart
@@ -117,6 +123,11 @@ final class StatusMenuController: NSObject {
         usageMenuItemView?.text = usage
     }
 
+    func update(calibrationInProgress: Bool) {
+        calibrateUsageMenuItem?.title = calibrationInProgress ? "正在核对腾讯云…" : "校准用量…"
+        calibrateUsageMenuItem?.isEnabled = !calibrationInProgress
+    }
+
     func update(configurationArchiveInProgress: Bool) {
         archiveMenuItems.forEach { $0.isEnabled = !configurationArchiveInProgress }
         rimeThemeMenuItem?.isEnabled = !configurationArchiveInProgress
@@ -125,6 +136,7 @@ final class StatusMenuController: NSObject {
 
     func configure(
         onSettings: @escaping () -> Void,
+        onCalibrateUsage: @escaping () -> Void = {},
         onToggleRecording: @escaping () -> Void,
         onToggleAutoStart: @escaping () -> Void,
         onSelectRimeTheme: @escaping (String) -> Void,
@@ -133,6 +145,7 @@ final class StatusMenuController: NSObject {
         onImportRimeConfiguration: @escaping () -> Void
     ) {
         self.onSettings = onSettings
+        self.onCalibrateUsage = onCalibrateUsage
         self.onToggleRecording = onToggleRecording
         self.onToggleAutoStart = onToggleAutoStart
         self.onSelectRimeTheme = onSelectRimeTheme
@@ -168,6 +181,10 @@ final class StatusMenuController: NSObject {
 
     @objc private func settingsPressed() {
         onSettings?()
+    }
+
+    @objc private func calibrateUsagePressed() {
+        onCalibrateUsage?()
     }
 
     @objc private func toggleRecordingPressed() {
