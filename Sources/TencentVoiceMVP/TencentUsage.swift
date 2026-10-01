@@ -7,19 +7,22 @@ struct TencentUsageSummary: Equatable, Sendable {
     let engineModelType: String
     let isPrepaid: Bool
     let sharedAcrossUsers: Bool
+    let sourceLabel: String?
 
     init(
         localUsedSeconds: Int,
         quotaSeconds: Int?,
         engineModelType: String = TencentEnginePreset.defaultPreset.rawValue,
         isPrepaid: Bool = false,
-        sharedAcrossUsers: Bool = false
+        sharedAcrossUsers: Bool = false,
+        sourceLabel: String? = nil
     ) {
         self.localUsedSeconds = localUsedSeconds
         self.quotaSeconds = quotaSeconds
         self.engineModelType = engineModelType
         self.isPrepaid = isPrepaid
         self.sharedAcrossUsers = sharedAcrossUsers
+        self.sourceLabel = sourceLabel
     }
 
     var usedSeconds: Int {
@@ -32,13 +35,13 @@ struct TencentUsageSummary: Equatable, Sendable {
     }
 
     var displayText: String {
-        let scope = sharedAcrossUsers ? "用量" : "本地本月用量"
+        let scope = sourceLabel ?? (sharedAcrossUsers ? "用量" : "本地本月用量")
         let model = "模型：\(engineModelType)"
         guard let quotaSeconds, quotaSeconds > 0 else {
             return "\(model)\n\(scope)：\(Self.formatCompact(seconds: usedSeconds))（当前引擎无免费额度）"
         }
         if isPrepaid {
-            let packageScope = sharedAcrossUsers ? "用量" : "本地套餐用量"
+            let packageScope = sourceLabel ?? (sharedAcrossUsers ? "用量" : "本地套餐用量")
             return "\(model)\n\(packageScope)：\(Self.formatCompact(seconds: usedSeconds)) / \(Self.formatCompactQuota(seconds: quotaSeconds))（\(percentage ?? 0)%）"
         }
         return "\(model)\n\(scope)：\(Self.formatCompact(seconds: usedSeconds)) / \(Self.formatCompact(seconds: quotaSeconds))（\(percentage ?? 0)%）"
@@ -94,6 +97,21 @@ enum TencentUsageQuota {
             return prepaidHours * 3_600
         }
         return freeQuotaSeconds(for: engineModelType)
+    }
+}
+
+enum UsageCorrectionInput {
+    static func seconds(hours: String, minutes: String) -> Int? {
+        let hours = hours.trimmingCharacters(in: .whitespacesAndNewlines)
+        let minutes = minutes.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !hours.isEmpty, !minutes.isEmpty,
+              hours.allSatisfy({ $0.isASCII && $0.isNumber }),
+              minutes.allSatisfy({ $0.isASCII && $0.isNumber }),
+              let hourValue = Int(hours), let minuteValue = Int(minutes),
+              (0...100_000).contains(hourValue), (0...59).contains(minuteValue) else {
+            return nil
+        }
+        return hourValue * 3_600 + minuteValue * 60
     }
 }
 
@@ -272,17 +290,20 @@ private struct SharedUsageSessionRecord: Codable {
 
 private struct SharedUsageLedger: Codable {
     var committedSeconds: [String: Int]
+    var usageAdjustments: [String: Int]
     var activeSessions: [SharedUsageSessionRecord]
     var migratedUsageSources: Set<String>
     var prepaidQuotaHours: [String: Int]
 
     init(
         committedSeconds: [String: Int] = [:],
+        usageAdjustments: [String: Int] = [:],
         activeSessions: [SharedUsageSessionRecord] = [],
         migratedUsageSources: Set<String> = [],
         prepaidQuotaHours: [String: Int] = [:]
     ) {
         self.committedSeconds = committedSeconds
+        self.usageAdjustments = usageAdjustments
         self.activeSessions = activeSessions
         self.migratedUsageSources = migratedUsageSources
         self.prepaidQuotaHours = prepaidQuotaHours
@@ -290,6 +311,7 @@ private struct SharedUsageLedger: Codable {
 
     private enum CodingKeys: String, CodingKey {
         case committedSeconds
+        case usageAdjustments
         case activeSessions
         case migratedUsageSources
         case prepaidQuotaHours
@@ -298,6 +320,7 @@ private struct SharedUsageLedger: Codable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         committedSeconds = try container.decodeIfPresent([String: Int].self, forKey: .committedSeconds) ?? [:]
+        usageAdjustments = try container.decodeIfPresent([String: Int].self, forKey: .usageAdjustments) ?? [:]
         activeSessions = try container.decodeIfPresent([SharedUsageSessionRecord].self, forKey: .activeSessions) ?? []
         migratedUsageSources = try container.decodeIfPresent(Set<String>.self, forKey: .migratedUsageSources) ?? []
         prepaidQuotaHours = try container.decodeIfPresent([String: Int].self, forKey: .prepaidQuotaHours) ?? [:]
@@ -413,12 +436,17 @@ final class SharedUsageStore {
                 engineModelType: engineModelType,
                 month: month(for: date)
             )] ?? 0
-            return committed + activeSeconds(
+            let active = activeSeconds(
                 in: ledger,
                 fingerprint: identity.fingerprint,
                 engineModelType: engineModelType,
                 at: date
             )
+            return max(0, committed + active + (ledger.usageAdjustments[adjustmentKey(
+                fingerprint: identity.fingerprint,
+                engineModelType: engineModelType,
+                period: month(for: date)
+            )] ?? 0))
         }
     }
 
@@ -433,12 +461,64 @@ final class SharedUsageStore {
             let committed = ledger.committedSeconds
                 .filter { $0.key.hasPrefix(prefix) }
                 .reduce(0) { $0 + $1.value }
-            return committed + activeSeconds(
+            let active = activeSeconds(
                 in: ledger,
                 fingerprint: identity.fingerprint,
                 engineModelType: engineModelType,
                 at: date
             )
+            return max(0, committed + active + (ledger.usageAdjustments[adjustmentKey(
+                fingerprint: identity.fingerprint,
+                engineModelType: engineModelType,
+                period: "total"
+            )] ?? 0))
+        }
+    }
+
+    func setDisplayedSeconds(
+        _ seconds: Int,
+        for credentials: TencentCredentials,
+        engineModelType: String,
+        isPrepaid: Bool,
+        prepaidQuotaHours: Int? = nil,
+        at date: Date = Date()
+    ) throws {
+        guard seconds >= 0, prepaidQuotaHours.map({ $0 >= 0 }) ?? true else {
+            throw SharedUsageStoreError.invalidLedger
+        }
+        let fingerprint = TencentCredentialIdentity(credentials: credentials).fingerprint
+        let period = isPrepaid ? "total" : month(for: date)
+        try updateLedger { ledger in
+            let committed: Int
+            if isPrepaid {
+                let prefix = "sharedUsage.\(fingerprint).\(engineModelType)."
+                committed = ledger.committedSeconds
+                    .filter { $0.key.hasPrefix(prefix) }
+                    .reduce(0) { $0 + $1.value }
+            } else {
+                committed = ledger.committedSeconds[key(
+                    fingerprint: fingerprint,
+                    engineModelType: engineModelType,
+                    month: period
+                )] ?? 0
+            }
+            let active = activeSeconds(
+                in: ledger,
+                fingerprint: fingerprint,
+                engineModelType: engineModelType,
+                at: date
+            )
+            ledger.usageAdjustments[adjustmentKey(
+                fingerprint: fingerprint,
+                engineModelType: engineModelType,
+                period: period
+            )] = seconds - committed - active
+            if let prepaidQuotaHours {
+                ledger.prepaidQuotaHours[quotaKey(
+                    fingerprint: fingerprint,
+                    engineModelType: engineModelType
+                )] = prepaidQuotaHours
+            }
         }
     }
 
@@ -466,7 +546,7 @@ final class SharedUsageStore {
                 fingerprint: identity.fingerprint,
                 engineModelType: engineModelType
             )
-            if let hours, hours > 0 {
+            if let hours, hours >= 0 {
                 ledger.prepaidQuotaHours[key] = hours
             } else {
                 ledger.prepaidQuotaHours.removeValue(forKey: key)
@@ -551,6 +631,10 @@ final class SharedUsageStore {
 
     private func quotaKey(fingerprint: String, engineModelType: String) -> String {
         "sharedQuota.\(fingerprint).\(engineModelType)"
+    }
+
+    private func adjustmentKey(fingerprint: String, engineModelType: String, period: String) -> String {
+        "sharedAdjustment.\(fingerprint).\(engineModelType).\(period)"
     }
 
     private func month(for date: Date) -> String {

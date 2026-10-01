@@ -3,6 +3,95 @@ import XCTest
 @testable import TencentVoiceMVP
 
 final class TencentUsageTests: XCTestCase {
+    func testUsageCorrectionInputValidatesWholeHoursAndMinutes() {
+        XCTAssertEqual(UsageCorrectionInput.seconds(hours: "19", minutes: "00"), 68_400)
+        XCTAssertEqual(UsageCorrectionInput.seconds(hours: " 7 ", minutes: "27"), 26_820)
+        XCTAssertNil(UsageCorrectionInput.seconds(hours: "1.5", minutes: "0"))
+        XCTAssertNil(UsageCorrectionInput.seconds(hours: "1", minutes: "60"))
+        XCTAssertNil(UsageCorrectionInput.seconds(hours: "-1", minutes: "0"))
+    }
+
+    func testManualCorrectionPreservesRecordedSessionsAndAddsNewTime() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVPSharedUsage-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = SharedUsageStore(fileURL: directory.appendingPathComponent("usage.json"))
+        let credentials = TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+        let otherCredentials = TencentCredentials(appID: "app", secretID: "id", secretKey: "other")
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let firstSession = try store.beginSession(for: credentials, engineModelType: "16k_zh_en_2.0", at: date)
+        try store.endSession(firstSession, at: date.addingTimeInterval(100))
+        try store.setDisplayedSeconds(68_400, for: credentials, engineModelType: "16k_zh_en_2.0",
+                                      isPrepaid: true, at: date.addingTimeInterval(100))
+        XCTAssertEqual(try store.currentTotalSeconds(for: credentials, engineModelType: "16k_zh_en_2.0",
+                                                     at: date.addingTimeInterval(100)), 68_400)
+        let nextSession = try store.beginSession(for: credentials, engineModelType: "16k_zh_en_2.0",
+                                                 at: date.addingTimeInterval(200))
+        try store.endSession(nextSession, at: date.addingTimeInterval(260))
+        XCTAssertEqual(try store.currentTotalSeconds(for: credentials, engineModelType: "16k_zh_en_2.0",
+                                                     at: date.addingTimeInterval(260)), 68_460)
+        XCTAssertEqual(try store.currentTotalSeconds(for: otherCredentials, engineModelType: "16k_zh_en_2.0",
+                                                     at: date.addingTimeInterval(260)), 0)
+    }
+
+    func testCloudPackageCalibrationSurvivesRestartAndKeepsAccumulating() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVPCloudCalibration-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("usage.json")
+        let credentials = TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+        let model = "16k_zh_en_2.0"
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let firstRun = SharedUsageStore(fileURL: fileURL)
+        try firstRun.setDisplayedSeconds(42_952, for: credentials, engineModelType: model,
+                                         isPrepaid: true, prepaidQuotaHours: 60, at: date)
+
+        let reopened = SharedUsageStore(fileURL: fileURL)
+        XCTAssertEqual(try reopened.currentTotalSeconds(for: credentials, engineModelType: model, at: date), 42_952)
+        XCTAssertEqual(try reopened.prepaidQuotaHours(for: credentials, engineModelType: model), 60)
+        let session = try reopened.beginSession(for: credentials, engineModelType: model,
+                                                at: date.addingTimeInterval(60))
+        try reopened.endSession(session, at: date.addingTimeInterval(120))
+        XCTAssertEqual(try reopened.currentTotalSeconds(for: credentials, engineModelType: model,
+                                                        at: date.addingTimeInterval(120)), 43_012)
+    }
+
+    func testFreePackageCalibrationUsesCurrentMonthAcrossRestart() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVPFreeCalibration-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("usage.json")
+        let credentials = TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+        let october = ISO8601DateFormatter().date(from: "2026-10-01T12:00:00Z")!
+        let november = ISO8601DateFormatter().date(from: "2026-11-01T12:00:00Z")!
+        let store = SharedUsageStore(fileURL: fileURL)
+        try store.setPrepaidQuotaHours(60, for: credentials, engineModelType: "16k_zh")
+        try store.setDisplayedSeconds(16, for: credentials, engineModelType: "16k_zh",
+                                      isPrepaid: false, prepaidQuotaHours: 0, at: october)
+
+        let reopened = SharedUsageStore(fileURL: fileURL)
+        let sharedHours = try reopened.prepaidQuotaHours(for: credentials, engineModelType: "16k_zh")
+        XCTAssertEqual(sharedHours, 0)
+        XCTAssertEqual(sharedHours ?? 60, 0)
+        XCTAssertEqual(try reopened.currentSeconds(for: credentials, engineModelType: "16k_zh", at: october), 16)
+        XCTAssertEqual(try reopened.currentSeconds(for: credentials, engineModelType: "16k_zh", at: november), 0)
+        XCTAssertEqual(TencentUsageQuota.seconds(for: "16k_zh", prepaidHours: sharedHours), 18_000)
+    }
+
+    func testMonthlyCorrectionDoesNotCarryIntoNextMonth() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVPSharedUsage-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = SharedUsageStore(fileURL: directory.appendingPathComponent("usage.json"))
+        let credentials = TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+        let september = ISO8601DateFormatter().date(from: "2026-09-30T12:00:00Z")!
+        let october = ISO8601DateFormatter().date(from: "2026-10-01T12:00:00Z")!
+        try store.setDisplayedSeconds(3_600, for: credentials, engineModelType: "16k_zh",
+                                      isPrepaid: false, at: september)
+        XCTAssertEqual(try store.currentSeconds(for: credentials, engineModelType: "16k_zh", at: september), 3_600)
+        XCTAssertEqual(try store.currentSeconds(for: credentials, engineModelType: "16k_zh", at: october), 0)
+    }
+
     func testGeneralRealtimeEngineHasFiveHourFreeQuota() {
         XCTAssertEqual(TencentUsageQuota.freeQuotaSeconds(for: "16k_zh"), 18_000)
     }

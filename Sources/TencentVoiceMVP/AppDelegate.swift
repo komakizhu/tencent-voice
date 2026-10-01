@@ -138,6 +138,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.configure(
             onSettings: { [weak self] in self?.showSettings() },
+            onCalibrateUsage: { [weak self] in
+                Task { @MainActor [weak self] in await self?.refreshCloudUsage() }
+            },
             onToggleRecording: { [weak self] in
                 Task { @MainActor [weak self] in
                     await self?.toggleRecording()
@@ -871,6 +874,152 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func refreshCloudUsage() async {
+        guard let credentials = loadCredentials() else {
+            updateLocalUsageDisplay()
+            let alert = NSAlert()
+            alert.messageText = "请先配置腾讯云凭证"
+            alert.informativeText = "校准用量使用设置中已有的 SecretId 和 SecretKey，无需登录腾讯云网页。"
+            alert.addButton(withTitle: "打开设置")
+            alert.addButton(withTitle: "取消")
+            if alert.runModal() == .alertFirstButtonReturn { showSettings() }
+            return
+        }
+        let model = settingsStore.load().engineModelType
+        menu.update(calibrationInProgress: true)
+        defer { menu.update(calibrationInProgress: false) }
+        do {
+            let usage = try await TencentCloudUsageClient().activePackageUsage(
+                credentials: credentials, engineModelType: model
+            )
+            guard !Task.isCancelled, loadCredentials() == credentials,
+                  settingsStore.load().engineModelType == model else { return }
+            guard let usage else {
+                updateLocalUsageDisplay()
+                showCloudCalibrationFallback("腾讯云没有返回当前模型的有效实时识别资源包；若目前按量后付费，请手动输入用量。")
+                return
+            }
+            let alert = NSAlert()
+            alert.messageText = "腾讯云核对结果"
+            let packageType = usage.isPrepaid ? "付费套餐累计" : "本月免费额度"
+            alert.informativeText = "模型：\(model)\n\(packageType)已用 \(TencentUsageSummary.format(seconds: usage.usedSeconds)) / \(TencentUsageSummary.format(seconds: usage.totalSeconds))。确认与控制台一致后使用此数值。"
+            alert.addButton(withTitle: "使用此用量")
+            alert.addButton(withTitle: "手动输入")
+            alert.addButton(withTitle: "打开腾讯云页面")
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                do {
+                    try sharedUsageStore.setDisplayedSeconds(
+                        usage.usedSeconds,
+                        for: credentials,
+                        engineModelType: model,
+                        isPrepaid: usage.isPrepaid,
+                        prepaidQuotaHours: usage.isPrepaid
+                            ? (usage.totalSeconds.isMultiple(of: 3_600) ? usage.totalSeconds / 3_600 : nil)
+                            : 0
+                    )
+                    updateLocalUsageDisplay()
+                } catch {
+                    showUsageCorrectionError(error.localizedDescription)
+                }
+            case .alertSecondButtonReturn:
+                correctUsage()
+            case .alertThirdButtonReturn:
+                NSWorkspace.shared.open(TencentCloudUsageClient.resourceBundleURL)
+            default:
+                break
+            }
+        } catch {
+            guard !Task.isCancelled, loadCredentials() == credentials,
+                  settingsStore.load().engineModelType == model else { return }
+            updateLocalUsageDisplay()
+            showCloudCalibrationFallback("腾讯云查询失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func showCloudCalibrationFallback(_ detail: String) {
+        let alert = NSAlert()
+        alert.messageText = "暂时无法自动校准"
+        alert.informativeText = detail
+        alert.addButton(withTitle: "手动输入")
+        alert.addButton(withTitle: "打开腾讯云页面")
+        alert.addButton(withTitle: "取消")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: correctUsage()
+        case .alertSecondButtonReturn: NSWorkspace.shared.open(TencentCloudUsageClient.resourceBundleURL)
+        default: break
+        }
+    }
+
+    private func correctUsage() {
+        guard let credentials = loadCredentials() else {
+            showSettings()
+            return
+        }
+        let settings = settingsStore.load()
+        let model = settings.engineModelType
+        let prepaidHours = (try? sharedUsageStore.prepaidQuotaHours(
+            for: credentials,
+            engineModelType: model
+        )) ?? settings.prepaidQuotaHoursByModel[model]
+        let isPrepaid = (prepaidHours ?? 0) > 0
+        let current: Int
+        do {
+            current = isPrepaid
+                ? try sharedUsageStore.currentTotalSeconds(for: credentials, engineModelType: model)
+                : try sharedUsageStore.currentSeconds(for: credentials, engineModelType: model)
+        } catch {
+            showUsageCorrectionError(error.localizedDescription)
+            return
+        }
+
+        let hoursField = NSTextField(string: String(current / 3_600))
+        let minutesField = NSTextField(string: String((current % 3_600) / 60))
+        hoursField.alignment = .right
+        minutesField.alignment = .right
+        let row = NSStackView(views: [hoursField, NSTextField(labelWithString: "小时"),
+                                     minutesField, NSTextField(labelWithString: "分钟")])
+        row.spacing = 8
+        row.alignment = .centerY
+        row.frame = NSRect(x: 0, y: 0, width: 280, height: 30)
+        hoursField.widthAnchor.constraint(equalToConstant: 85).isActive = true
+        minutesField.widthAnchor.constraint(equalToConstant: 70).isActive = true
+
+        let alert = NSAlert()
+        alert.messageText = "校正当前模型用量"
+        alert.informativeText = "模型：\(model)；范围：\(isPrepaid ? "套餐累计" : "本月")。保存后，后续录音会继续累计。"
+        alert.accessoryView = row
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let seconds = UsageCorrectionInput.seconds(
+            hours: hoursField.stringValue,
+            minutes: minutesField.stringValue
+        ) else {
+            showUsageCorrectionError("请输入 0 至 100000 小时、0 至 59 分钟的整数")
+            return
+        }
+        do {
+            try sharedUsageStore.setDisplayedSeconds(
+                seconds,
+                for: credentials,
+                engineModelType: model,
+                isPrepaid: isPrepaid
+            )
+            updateLocalUsageDisplay()
+        } catch {
+            showUsageCorrectionError(error.localizedDescription)
+        }
+    }
+
+    private func showUsageCorrectionError(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "无法校正用量"
+        alert.informativeText = message
+        alert.runModal()
+    }
+
     private func updateLocalUsageDisplay(at date: Date = Date()) {
         let settings = settingsStore.load()
         guard let credentials = loadCredentials() else {
@@ -906,7 +1055,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 ),
                 engineModelType: settings.engineModelType,
                 isPrepaid: hasPrepaidQuota,
-                sharedAcrossUsers: true
+                sharedAcrossUsers: true,
+                sourceLabel: "本机估算用量"
             )
             menu.update(usage: summary.displayText)
         } catch {

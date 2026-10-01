@@ -211,11 +211,11 @@ else
 fi
 
 if (( ${#SWIFT_DEFINITIONS[@]} > 0 )); then
-    swift build -c release "${SWIFTPM_STORAGE_ARGS[@]}" "${SWIFT_DEFINITIONS[@]}"
+    swift build -c release "${SWIFTPM_STORAGE_ARGS[@]+"${SWIFTPM_STORAGE_ARGS[@]}"}" "${SWIFT_DEFINITIONS[@]}"
 else
-    swift build -c release "${SWIFTPM_STORAGE_ARGS[@]}"
+    swift build -c release "${SWIFTPM_STORAGE_ARGS[@]+"${SWIFTPM_STORAGE_ARGS[@]}"}"
 fi
-BIN_DIR="$(swift build -c release "${SWIFTPM_STORAGE_ARGS[@]}" --show-bin-path)"
+BIN_DIR="$(swift build -c release "${SWIFTPM_STORAGE_ARGS[@]+"${SWIFTPM_STORAGE_ARGS[@]}"}" --show-bin-path)"
 BIN_PATH="$BIN_DIR/$PRODUCT_NAME"
 if [[ ! -f "$BIN_PATH" ]]; then
     echo "release binary not found: $BIN_PATH" >&2
