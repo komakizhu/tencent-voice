@@ -185,19 +185,6 @@ final class TextInjector {
             previousText: previousText,
             previousSegmentID: previousSegmentID
         )
-        // The clipboard backup must follow recognition, independently of the
-        // editor write queue and graceful ASR shutdown. Otherwise an immediate
-        // paste or cancellation can expose a previous session's first sentence.
-        if safeCopyEnabled {
-            do {
-                try copyIfNeeded(projection.text)
-            } catch {
-                recordDiagnostic("safe_copy_update_failed", [
-                    "failureCode": DiagnosticErrorFormatter.code(for: error),
-                    "recognizedLengthCharacters": String(projection.text.count)
-                ])
-            }
-        }
         defer {
             lastProjectionText = projection.text
             previousProjectionSegmentID = projection.activeSegmentID
@@ -302,6 +289,16 @@ final class TextInjector {
     }
 
     func cancel() {
+        // Preserve the latest recognition on cancellation without publishing
+        // partial results throughout the session or replacing a finished backup.
+        do {
+            try copyOnFinishIfNeeded(lastProjectionText)
+        } catch {
+            recordDiagnostic("safe_copy_update_failed", [
+                "failureCode": DiagnosticErrorFormatter.code(for: error),
+                "recognizedLengthCharacters": String(lastProjectionText.count)
+            ])
+        }
         reset()
     }
 
@@ -313,10 +310,10 @@ final class TextInjector {
     }
 
     private func copyOnFinishIfNeeded(_ text: String) throws {
-        guard safeCopyEnabled, mode != .inactive, mode != .disabledAfterError else { return }
-        // Reassert the final backup even if another app changed the clipboard
-        // after the last recognition update.
-        lastCopiedText = nil
+        guard safeCopyEnabled, mode != .inactive, mode != .disabledAfterError,
+              lastCopiedText == nil else { return }
+        // Publish one completed backup per session, keeping interim ASR revisions
+        // out of clipboard managers such as Maccy.
         try copyIfNeeded(text)
     }
 

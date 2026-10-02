@@ -832,8 +832,10 @@ final class SessionCoordinatorTests: XCTestCase {
         try await coordinator.begin()
         asr.emit(ASRUpdate(text: "安全复制结果", isFinal: true, sequence: 0))
         await settleCoordinator()
+        XCTAssertTrue(target.copiedTexts.isEmpty)
         try await coordinator.end()
 
+        XCTAssertEqual(target.copiedTexts, ["安全复制结果"])
         XCTAssertEqual(target.text, "原文安全复制结果")
         XCTAssertEqual(target.copiedText, "安全复制结果")
     }
