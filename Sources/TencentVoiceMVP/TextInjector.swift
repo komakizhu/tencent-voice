@@ -61,6 +61,7 @@ final class TextInjector {
     private var ownedRange = TextRange(location: 0, length: 0)
     private var lastDocumentText = ""
     private var lastProjectionText = ""
+    private var lastCopiedText: String?
     private var lastSubmittedText = ""
     // After an external edit, the complete projection before that edit is a
     // frozen prefix. Only the suffix after it belongs to the new voice range.
@@ -138,6 +139,7 @@ final class TextInjector {
             ownedRange = captured.selection
             lastDocumentText = captured.text
             lastProjectionText = ""
+            lastCopiedText = nil
             lastSubmittedText = ""
             mixedInputFrozenPrefix = nil
             writeCount = 0
@@ -183,6 +185,19 @@ final class TextInjector {
             previousText: previousText,
             previousSegmentID: previousSegmentID
         )
+        // The clipboard backup must follow recognition, independently of the
+        // editor write queue and graceful ASR shutdown. Otherwise an immediate
+        // paste or cancellation can expose a previous session's first sentence.
+        if safeCopyEnabled {
+            do {
+                try copyIfNeeded(projection.text)
+            } catch {
+                recordDiagnostic("safe_copy_update_failed", [
+                    "failureCode": DiagnosticErrorFormatter.code(for: error),
+                    "recognizedLengthCharacters": String(projection.text.count)
+                ])
+            }
+        }
         defer {
             lastProjectionText = projection.text
             previousProjectionSegmentID = projection.activeSegmentID
@@ -291,12 +306,17 @@ final class TextInjector {
     }
 
     private func copyIfNeeded(_ text: String) throws {
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty, text != lastCopiedText else { return }
         try target.copyToClipboard(text)
+        lastCopiedText = text
+        recordDiagnostic("safe_copy_updated", ["copiedLengthCharacters": String(text.count)])
     }
 
     private func copyOnFinishIfNeeded(_ text: String) throws {
         guard safeCopyEnabled, mode != .inactive, mode != .disabledAfterError else { return }
+        // Reassert the final backup even if another app changed the clipboard
+        // after the last recognition update.
+        lastCopiedText = nil
         try copyIfNeeded(text)
     }
 
@@ -779,6 +799,7 @@ final class TextInjector {
         ownedRange = TextRange(location: 0, length: 0)
         lastDocumentText = ""
         lastProjectionText = ""
+        lastCopiedText = nil
         lastSubmittedText = ""
         writeCount = 0
         backspaceCount = 0
@@ -808,6 +829,7 @@ final class TextInjector {
         ownedRange = TextRange(location: 0, length: 0)
         lastDocumentText = ""
         lastProjectionText = ""
+        lastCopiedText = nil
         lastSubmittedText = ""
         writeCount = 0
         backspaceCount = 0

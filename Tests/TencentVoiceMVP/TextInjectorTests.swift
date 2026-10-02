@@ -3,6 +3,34 @@ import XCTest
 
 @MainActor
 final class TextInjectorTests: XCTestCase {
+    func testSafeCopyKeepsLatestThousandCharactersBeforeStopAndAfterCancel() throws {
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let injector = TextInjector(target: target, safeCopyEnabled: true)
+        try injector.begin()
+        injector.apply(projection: projection(committed: "", active: "第一句。", id: 1, revision: 1))
+        XCTAssertEqual(target.copiedText, "第一句。")
+        let longText = "第一句。" + String(repeating: "后面的灵感不能丢失。", count: 120)
+        injector.apply(projection: projection(committed: "第一句。", active: String(longText.dropFirst(4)), id: 2, revision: 2))
+        XCTAssertGreaterThan(longText.count, 1000)
+        XCTAssertEqual(target.copiedText, longText)
+        injector.cancel()
+        XCTAssertEqual(target.copiedText, longText)
+    }
+
+    func testSafeCopyContinuesUpdatingAfterTargetStopsAcceptingInput() throws {
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let injector = TextInjector(target: target, safeCopyEnabled: true)
+        try injector.begin()
+        injector.apply(projection: projection(committed: "", active: "第一句", id: 1, revision: 1))
+        target.text = "用户编辑后的文档"
+        injector.apply(projection: projection(committed: "", active: "修订后的第一句", id: 1, revision: 2))
+        let full = "修订后的第一句" + String(repeating: "后续内容", count: 300)
+        injector.apply(projection: projection(committed: "修订后的第一句", active: String(repeating: "后续内容", count: 300), id: 2, revision: 3))
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
+        XCTAssertEqual(target.text, "用户编辑后的文档")
+        XCTAssertEqual(target.copiedText, full)
+    }
+
     func testKeyboardPacingShowsFirstCharacterImmediatelyAndCompletesWithinDeadline() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let clock = ManualKeyboardPacingClock()

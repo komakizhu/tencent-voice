@@ -16,6 +16,7 @@ enum SessionError: Error, LocalizedError {
     case noTextTarget
     case busy
     case cancelled
+    case recognitionEnded
 
     var errorDescription: String? {
         switch self {
@@ -24,6 +25,7 @@ enum SessionError: Error, LocalizedError {
         case .noTextTarget: return "没有找到可输入的文本目标"
         case .busy: return "上一段语音还没有结束"
         case .cancelled: return "语音会话已取消"
+        case .recognitionEnded: return "识别连接意外结束，录音已停止；已收到的文字已保留，请重新开始录音"
         }
     }
 }
@@ -64,6 +66,8 @@ final class SessionCoordinator: SessionCoordinating {
     private var prebuffer: AudioPrebuffer?
     private var audioForwarder: AudioChunkForwarder?
     private var eventTask: Task<Void, Never>?
+    private var progressTask: Task<Void, Never>?
+    private var audioProgress: AudioPipelineProgress?
     private var latestProjection: ASRProjection?
     private var asrStreamEnded = false
     private var finishSent = false
@@ -148,12 +152,15 @@ final class SessionCoordinator: SessionCoordinating {
             )
             let buffer = AudioPrebuffer()
             let forwarder = AudioChunkForwarder()
+            let progress = AudioPipelineProgress()
+            audioProgress = progress
             prebuffer = buffer
             audioForwarder = forwarder
             try await audio.start(
                 sessionID: id,
                 onChunk: { [weak self, weak buffer] chunk in
                 guard let buffer else { return }
+                progress.captured(byteCount: chunk.count)
                 forwarder.submit { [weak self, weak buffer] in
                     guard let buffer else { return }
                     do {
@@ -182,6 +189,7 @@ final class SessionCoordinator: SessionCoordinating {
             try await buffer.attach { [weak self, asr] chunk in
                 do {
                     try await asr.sendAudio(chunk)
+                    progress.uploaded(byteCount: chunk.count)
                 } catch {
                     await self?.handleAudioError(error, sessionID: id)
                     throw error
@@ -195,12 +203,14 @@ final class SessionCoordinator: SessionCoordinating {
                 setState(.listening)
                 log(event: "started")
             }
+            startProgressObservation(sessionID: id)
             eventTask = Task { [weak self] in
                 do {
                     for try await update in stream {
                         if Task.isCancelled { return }
                         self?.process(update, sessionID: id)
                     }
+                    self?.handleASRError(SessionError.recognitionEnded, sessionID: id)
                 } catch {
                     self?.handleASRError(error, sessionID: id)
                 }
@@ -303,6 +313,7 @@ final class SessionCoordinator: SessionCoordinating {
         } else {
             injector?.cancel()
         }
+        logAudioProgress()
         asr.cancel()
         await prebuffer?.clear()
         eventTask?.cancel()
@@ -313,6 +324,7 @@ final class SessionCoordinator: SessionCoordinating {
     func cancel() {
         asrFinalizationPhase = .hardStopped
         log(event: "cancel_requested")
+        logAudioProgress()
         audioForwarder?.cancel()
         audio.stop()
         asr.cancel()
@@ -327,6 +339,7 @@ final class SessionCoordinator: SessionCoordinating {
     private func process(_ update: ASRUpdate, sessionID: UUID) {
         guard self.sessionID == sessionID else { return }
         guard state == .listening || state == .stopping || state == .recovering else { return }
+        audioProgress?.receivedRecognitionUpdate()
         if update.isStreamEnded {
             asrStreamEnded = true
             if let projection = projectionAccumulator.apply(update) {
@@ -371,6 +384,7 @@ final class SessionCoordinator: SessionCoordinating {
         if let sessionID, self.sessionID != sessionID { return }
         guard state == .connecting || state == .listening || state == .recovering else { return }
         asrFinalizationPhase = .hardStopped
+        audioForwarder?.cancel()
         audio.stop()
         asr.cancel()
         errorCount += 1
@@ -383,6 +397,7 @@ final class SessionCoordinator: SessionCoordinating {
             log(event: "finish_error", projection: finalProjection, error: error)
         }
         logDegradationIfNeeded(projection: finalProjection)
+        logAudioProgress()
         let currentPrebuffer = prebuffer
         eventTask?.cancel()
         resetSession()
@@ -466,6 +481,9 @@ final class SessionCoordinator: SessionCoordinating {
     }
 
     private func resetSession() {
+        progressTask?.cancel()
+        progressTask = nil
+        audioProgress = nil
         injector = nil
         prebuffer = nil
         audioForwarder = nil
@@ -481,6 +499,24 @@ final class SessionCoordinator: SessionCoordinating {
         degradationWasLogged = false
         asrFinalizationPhase = .listening
         projectionAccumulator = ASRProjectionAccumulator()
+    }
+
+    private func startProgressObservation(sessionID id: UUID) {
+        progressTask?.cancel()
+        progressTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                } catch { return }
+                guard let self, self.sessionID == id else { return }
+                self.logAudioProgress()
+            }
+        }
+    }
+
+    private func logAudioProgress() {
+        guard let audioProgress else { return }
+        log(event: "audio_pipeline_progress", metadata: audioProgress.metadata())
     }
 
     private func setState(_ newState: SessionState) {
@@ -540,20 +576,21 @@ final class SessionCoordinator: SessionCoordinating {
         }
         let resolvedFailureCode = failureCode ?? error.map(DiagnosticErrorFormatter.code(for:))
         let resolvedFailureMessage = failureMessage ?? error.map(DiagnosticErrorFormatter.message(for:))
-        var metadata = [
+        var entryMetadata = [
             "sourceBuild": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
             "sourceAppPath": Bundle.main.bundlePath,
             "writeCountMeaning": "submission_call_not_target_confirmation",
             "asrFinalizationPhase": asrFinalizationPhase.rawValue
         ]
+        entryMetadata.merge(metadata) { existing, _ in existing }
         if event == "safe_copy" || event == "input_error",
            let degradationOccurredAt = injector?.degradationOccurredAt,
            let degradationOccurredMonotonicMilliseconds = injector?.degradationOccurredMonotonicMilliseconds {
-            metadata["failureOccurredAt"] = Self.iso8601(degradationOccurredAt)
-            metadata["failureOccurredMonotonicMilliseconds"] = String(degradationOccurredMonotonicMilliseconds)
-            metadata["degradationRecordedAt"] = Self.iso8601(Date())
-            metadata["degradationRecordedOnASREvent"] = String(update != nil)
-            metadata["degradationRecordTiming"] = update == nil
+            entryMetadata["failureOccurredAt"] = Self.iso8601(degradationOccurredAt)
+            entryMetadata["failureOccurredMonotonicMilliseconds"] = String(degradationOccurredMonotonicMilliseconds)
+            entryMetadata["degradationRecordedAt"] = Self.iso8601(Date())
+            entryMetadata["degradationRecordedOnASREvent"] = String(update != nil)
+            entryMetadata["degradationRecordTiming"] = update == nil
                 ? "lifecycle_event"
                 : "asr_event_or_following_update"
         }
@@ -584,7 +621,7 @@ final class SessionCoordinator: SessionCoordinating {
             errorCode: errorCode,
             failureCode: resolvedFailureCode,
             failureMessage: resolvedFailureMessage,
-            metadata: metadata
+            metadata: entryMetadata
         )
         try? logger.append(entry)
         for diagnostic in injector?.drainDiagnostics() ?? [] {

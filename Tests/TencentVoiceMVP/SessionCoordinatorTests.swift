@@ -4,6 +4,49 @@ import XCTest
 
 @MainActor
 final class SessionCoordinatorTests: XCTestCase {
+    func testPipelineDiagnosticsIncludeCapturedUploadedAndReturnedProgress() async throws {
+        let asr = FakeRealtimeASRClient()
+        let audio = FakeAudioCapture()
+        let logger = SessionLogger(enabled: { false })
+        let coordinator = SessionCoordinator(
+            asr: asr, audio: audio, textTarget: FakeTextTarget(text: ""),
+            settingsStore: UserDefaultsSettingsStore(suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"),
+            credentialStore: InMemoryCredentialStore(TencentCredentials(appID: "app", secretID: "id", secretKey: "key")),
+            logger: logger, keyboardSmoothing: .immediate, onStateChange: { _ in }
+        )
+        try await coordinator.begin()
+        audio.emit(Data(repeating: 0, count: 6400))
+        audio.emit(Data(repeating: 0, count: 3200))
+        asr.emit(ASRUpdate(text: "正文不能进入诊断日志", isFinal: true, sequence: 0))
+        await settleCoordinator()
+        try await coordinator.end()
+        let progress = try XCTUnwrap(logger.recentEntries().last { $0.event == "audio_pipeline_progress" })
+        XCTAssertEqual(progress.metadata["capturedChunkCount"], "2")
+        XCTAssertEqual(progress.metadata["uploadedChunkCount"], "2")
+        XCTAssertEqual(progress.metadata["capturedDurationMilliseconds"], "300")
+        XCTAssertEqual(progress.metadata["uploadedDurationMilliseconds"], "300")
+        XCTAssertEqual(progress.metadata["recognitionUpdateCount"], "2")
+        XCTAssertFalse(progress.metadata.values.contains { $0.contains("正文") })
+    }
+
+    func testUnexpectedRecognitionEndDoesNotLeaveMicrophoneListening() async throws {
+        let asr = FakeRealtimeASRClient()
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let settings = UserDefaultsSettingsStore(suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)")
+        settings.save(AppSettings(safeCopyEnabled: true))
+        let coordinator = makeCoordinator(asr: asr, target: target, settingsStore: settings)
+        try await coordinator.begin()
+        let text = String(repeating: "长语音内容。", count: 200)
+        asr.emit(ASRUpdate(text: text, isFinal: true, sequence: 0))
+        await settleCoordinator()
+        asr.finishStream()
+        await settleCoordinator()
+        guard case .error = coordinator.state else {
+            return XCTFail("Unexpected ASR end must stop recording instead of showing listening")
+        }
+        XCTAssertEqual(target.copiedText, text)
+    }
+
     func testStopFlushesPendingKeyboardSmoothingCharacters() async throws {
         let asr = FakeRealtimeASRClient()
         asr.finishCompletesStream = false

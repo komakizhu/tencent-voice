@@ -347,7 +347,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         exportDiagnosticLogButton.action = #selector(exportDiagnosticLogPressed)
         exportDiagnosticLogButton.isEnabled = onExportDiagnosticLog != nil
         exportDiagnosticLogButton.toolTip = "将自动保存的会话与诊断事件导出为诊断报告 JSON；不会导出密钥、录音或识别正文。"
-        safeCopyCheckbox.toolTip = "开启后始终把识别结果复制到剪贴板；关闭后只按正常方式输入。"
+        safeCopyCheckbox.toolTip = "开启后实时把完整识别结果备份到剪贴板；输入中断后仍继续更新，结束时补齐最终结果。"
         logCheckbox.toolTip = "开启后自动保存会话状态、错误代码和操作上下文；点击右侧“导出诊断报告”导出已保存内容。"
         hideMenuBarIconCheckbox.toolTip = "隐藏状态栏图标；隐藏后可从 Dock 中 Rime Voice 的应用菜单重新打开设置。"
         saveButton.toolTip = "保存腾讯云凭证和设置；日志开关、Safe Copy 与快捷键也在此生效。"

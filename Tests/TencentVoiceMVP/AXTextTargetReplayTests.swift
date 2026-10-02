@@ -6,6 +6,60 @@ private typealias ReplayTextRange = TencentVoiceMVP.TextRange
 
 @MainActor
 final class AXTextTargetReplayTests: XCTestCase {
+    func testCodexMainAndCommentReplayAcceptMoreThanThousandCharacters() async throws {
+        for placeholder in ["询问任何问题", "\n添加可选评论…"] {
+            let access = ReplayAXTextTargetAccess(
+                text: placeholder,
+                selection: .init(location: 0, length: 0),
+                placeholderEvidence: .init(markedTexts: [placeholder.trimmingCharacters(in: .newlines)]),
+                application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+            )
+            let sender = ReplayKeyboardEventSender(access: access)
+            let clock = ManualKeyboardPacingClock()
+            let target = AXTextTarget(access: access, keyboardEventSender: sender,
+                writeTiming: .init(now: { clock.nowNanoseconds }, sleep: { try await clock.sleep(nanoseconds: $0) }))
+            let injector = TextInjector(target: target, keyboardSmoothing: .live, pacingClock: clock)
+            try injector.begin()
+            var accumulator = ASRProjectionAccumulator()
+            var expected = ""
+            for segment in 0..<24 {
+                let sentence = "第\(segment)句。" + String(repeating: "长语音输入应当保留灵感", count: 5) + "😀。"
+                expected += sentence
+                let update = ASRUpdate(text: sentence, isFinal: true, sequence: segment)
+                injector.apply(projection: try XCTUnwrap(accumulator.apply(update)))
+                for _ in 0..<180 {
+                    await Task.yield()
+                    clock.advance(by: 10_000_000)
+                }
+                XCTAssertEqual(injector.errorCount, 0, placeholder)
+            }
+            injector.apply(projection: try XCTUnwrap(accumulator.apply(.streamEnded)))
+            await finish(injector, finalText: expected, advancing: clock)
+            XCTAssertGreaterThan(expected.count, 1000)
+            XCTAssertEqual(access.rawText, expected, placeholder)
+            XCTAssertEqual(injector.modeDescription, "keyboard_live_tail", placeholder)
+            XCTAssertEqual(injector.errorCount, 0, placeholder)
+            injector.cancel()
+        }
+    }
+
+    func testCodexReconciliationRetriesTransientCoordinateMismatch() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "草稿", application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+        _ = try target.capture()
+        access.coordinateOverride = "旧稿"
+        XCTAssertEqual(try target.reconcileKeyboardStateForUserEdit(), .matched)
+        XCTAssertEqual(sender.totalPosts, 0, "An inconsistent read must not send input")
+        access.coordinateOverride = nil
+        XCTAssertEqual(try target.reconcileKeyboardStateForUserEdit(), .matched)
+        try target.paste("继续")
+        try await target.acknowledgeKeyboardWrite()
+        XCTAssertEqual(access.rawText, "草稿继续")
+    }
+
     func testRealAXReplayRetriesTransientPreflightReadWithoutDegrading() async throws {
         let access = ReplayAXTextTargetAccess(
             text: "Draft: ",
