@@ -6,6 +6,7 @@ final class FakeTextTarget: TextTarget {
     var text: String
     let supportsAXReplacement: Bool
     private(set) var copiedText: String?
+    private(set) var copiedTexts: [String] = []
     private(set) var replaceCallCount = 0
     private(set) var pastedTexts: [String] = []
     private(set) var trailingReplacementLengths: [Int] = []
@@ -46,6 +47,7 @@ final class FakeTextTarget: TextTarget {
 
     func copyToClipboard(_ text: String) throws {
         copiedText = text
+        copiedTexts.append(text)
     }
 }
 
