@@ -1127,7 +1127,9 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         }
         let currentState: KeyboardDocumentState
         do {
-            currentState = try keyboardDocumentState(in: currentElement)
+            currentState = try KeyboardWriteAcknowledgement.readObservation {
+                try keyboardDocumentState(in: currentElement)
+            }
         } catch KeyboardDocumentStateReadError.retryable,
                 KeyboardWriteReadError.retryable {
             // The atomic writer performs the same preflight with its bounded

@@ -140,6 +140,7 @@ extension SessionError {
         case .noTextTarget: return "text_target_missing"
         case .busy: return "session_busy"
         case .cancelled: return "session_cancelled"
+        case .recognitionEnded: return "asr_stream_ended_unexpectedly"
         }
     }
 }

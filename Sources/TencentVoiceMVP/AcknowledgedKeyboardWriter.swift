@@ -115,8 +115,8 @@ enum KeyboardDocumentComparison: String, Equatable {
 // In particular, a matching caret with stale, same-length text is not a receipt.
 @MainActor
 enum KeyboardWriteAcknowledgement {
-    // Only used while confirming an already posted operation. An inconsistent
-    // AX snapshot is not a receipt and must never cause another keyboard post.
+    // An inconsistent AX snapshot is neither a receipt nor proof of an
+    // external edit. Preflight/acknowledgement must still confirm before posting.
     static func readObservation(_ read: () throws -> KeyboardDocumentState) throws -> KeyboardDocumentState {
         do {
             return try read()
