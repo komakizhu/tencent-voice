@@ -6,6 +6,47 @@ private typealias ReplayTextRange = TencentVoiceMVP.TextRange
 
 @MainActor
 final class AXTextTargetReplayTests: XCTestCase {
+    func testSafariProseMirrorUsesAcknowledgedKeyboardInputDespiteWritableAX() async throws {
+        for draft in ["\n", "已有草稿\n"] {
+            let access = ReplayAXTextTargetAccess(
+                text: draft,
+                selection: .init(location: draft.utf16.count - 1, length: 0),
+                application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+            )
+            access.proseMirror = true
+            access.textAttributesAreSettable = true
+            access.coordinateIncludesStructuralSeparators = true
+            let sender = ReplayKeyboardEventSender(access: access)
+            let target = AXTextTarget(access: access, keyboardEventSender: sender)
+            let injector = TextInjector(target: target)
+            try injector.begin()
+            XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+            injector.apply(projection: projection("你好", revision: 1))
+            try await injector.finish(finalText: "你好")
+            injector.apply(projection: projection("您好😀", revision: 2))
+            try await injector.finish(finalText: "您好😀")
+            XCTAssertEqual(access.rawText, String(draft.dropLast()) + "您好😀\n")
+            XCTAssertEqual(access.axTextWrites, 0)
+            XCTAssertEqual(injector.errorCount, 0)
+            let posts = sender.totalPosts
+            access.focusChanged = true
+            injector.apply(projection: projection("您好😀继续", revision: 3))
+            try await injector.finish(finalText: "您好😀继续")
+            XCTAssertEqual(sender.totalPosts, posts)
+            XCTAssertEqual(injector.degradationCode, "text_target_changed")
+        }
+    }
+
+    func testSafariNativeFieldKeepsAXReplacement() throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "搜索", application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        let injector = TextInjector(target: AXTextTarget(access: access))
+        try injector.begin()
+        XCTAssertEqual(injector.modeDescription, "ax")
+    }
+
     func testCodexMainAndCommentReplayAcceptMoreThanThousandCharacters() async throws {
         for placeholder in ["询问任何问题", "\n添加可选评论…"] {
             let access = ReplayAXTextTargetAccess(
@@ -866,6 +907,9 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var failNextCoordinateReads = 0
     var permissionError: TextTargetError?
     var selectionRangeIsSettable = false
+    var proseMirror = false
+    var textAttributesAreSettable = false
+    private(set) var axTextWrites = 0
     var focusChanged = false
     var coordinateIncludesStructuralSeparators = false
     var collapseStructuralSeparatorsAfterNextWrite = false
@@ -944,8 +988,11 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     }
 
     func isAttributeSettable(_ attribute: String, on element: AXUIElement) -> Bool {
-        selectionRangeIsSettable && attribute == (kAXSelectedTextRangeAttribute as String)
+        (selectionRangeIsSettable && attribute == (kAXSelectedTextRangeAttribute as String))
+            || (textAttributesAreSettable && [kAXSelectedTextAttribute as String, kAXValueAttribute as String].contains(attribute))
     }
+
+    func isProseMirrorEditor(_ element: AXUIElement) -> Bool { proseMirror }
 
     func setSelection(_ range: ReplayTextRange, on element: AXUIElement) throws -> Int32 {
         selection = range
@@ -953,11 +1000,13 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     }
 
     func setSelectedText(_ text: String, on element: AXUIElement) throws -> Int32 {
+        axTextWrites += 1
         applyReplacement(text, range: selection)
         return AXError.success.rawValue
     }
 
     func setValue(_ text: String, on element: AXUIElement) throws -> Int32 {
+        axTextWrites += 1
         rawText = text
         selection = .init(location: coordinateText.utf16.count, length: 0)
         placeholderEvidenceValue = .init()

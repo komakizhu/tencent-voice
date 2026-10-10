@@ -36,9 +36,14 @@ protocol AXTextTargetAccess {
     func coordinateText(for range: TextRange, in element: AXUIElement) throws -> String?
     func placeholderEvidence(in element: AXUIElement) -> AXPlaceholderEvidence
     func isAttributeSettable(_ attribute: String, on element: AXUIElement) -> Bool
+    func isProseMirrorEditor(_ element: AXUIElement) -> Bool
     func setSelection(_ range: TextRange, on element: AXUIElement) throws -> Int32
     func setSelectedText(_ text: String, on element: AXUIElement) throws -> Int32
     func setValue(_ text: String, on element: AXUIElement) throws -> Int32
+}
+
+extension AXTextTargetAccess {
+    func isProseMirrorEditor(_ element: AXUIElement) -> Bool { false }
 }
 
 @MainActor
@@ -188,6 +193,11 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         // still a valid keyboard target as long as a frontmost application is
         // known; the keyboard append path only owns the text it sends.
         let element = try? focusedElement()
+        // Safari's ProseMirror editor advertises writable AX attributes but
+        // may acknowledge an insertion without changing the DOM. Start with
+        // the existing acknowledged keyboard path; never resend an AX write.
+        let isSafariWebEditor = targetApplication?.bundleIdentifier == "com.apple.Safari"
+            && (element.map { access.isProseMirrorEditor($0) } ?? false)
         targetElement = element
         if let element {
             targetProcessID = access.processIdentifier(of: element) ?? targetApplicationProcessID
@@ -273,13 +283,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
             "axValueLengthUTF16": String(rawText?.utf16.count ?? 0),
             "axCoordinateLengthUTF16": String(codexState?.text.utf16.count ?? text.utf16.count),
             "selectionLocation": String(selection.location), "selectionLength": String(selection.length),
-            "keyboardCompatibility": String(targetApplication?.bundleIdentifier == "com.openai.codex")
+            "keyboardCompatibility": String(isCodexTarget || isSafariWebEditor),
+            "safariWebEditor": String(isSafariWebEditor)
         ])
         return TextSnapshot(
             element: element,
             text: text,
             selection: selection,
-            supportsAXReplacement: hasReadableAXTextState && (element.map {
+            supportsAXReplacement: !isSafariWebEditor && hasReadableAXTextState && (element.map {
                 selectedTextIsSettable(on: $0) || valueIsSettable(on: $0)
             } ?? false),
             targetApplication: targetApplication,
@@ -1377,6 +1388,11 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
 
 @MainActor
 final class SystemAXTextTargetAccess: AXTextTargetAccess {
+    func isProseMirrorEditor(_ element: AXUIElement) -> Bool {
+        stringAttribute(kAXRoleAttribute as String, from: element) == "AXTextArea"
+            && classTokens(in: element).contains("prosemirror")
+    }
+
     func requestInputPermissions() throws {
         guard AXIsProcessTrusted() else {
             throw TextTargetError.accessibilityDenied

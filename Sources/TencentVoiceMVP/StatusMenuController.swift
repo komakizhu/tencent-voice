@@ -18,6 +18,11 @@ final class StatusMenuController: NSObject {
     private var onManageRimeDictionary: (() -> Void)?
     private var onExportRimeConfiguration: (() -> Void)?
     private var onImportRimeConfiguration: (() -> Void)?
+    private var onToggleFailureContext: (() -> Void)?
+    private var onReportInputFailure: (() -> Void)?
+    private var onOpenFailureReports: (() -> Void)?
+    private var failureContextMenuItem: NSMenuItem?
+    private var failureResultMenuItem: NSMenuItem?
     private var archiveMenuItems: [NSMenuItem] = []
     private(set) var statusText = "就绪"
     private(set) var installedMenu: NSMenu?
@@ -81,6 +86,23 @@ final class StatusMenuController: NSObject {
         menu.addItem(settings)
         menu.addItem(record)
         menu.addItem(autoStart)
+        menu.addItem(.separator())
+        let context = NSMenuItem(title: "记录 Codex 故障前一分钟操作", action: #selector(toggleFailureContextPressed), keyEquivalent: "")
+        context.target = self
+        context.toolTip = "仅在内存保留最近一分钟；记录应用、焦点、点击和关键快捷键，不记录正文、录音或截图。点击报告才保存。"
+        menu.addItem(context)
+        let failure = NSMenuItem(title: "报告输入失效", action: #selector(reportInputFailurePressed), keyEquivalent: "")
+        failure.target = self
+        failure.toolTip = "保存最近一分钟的操作场记和输入诊断日志到本机；请提前启用操作记录。"
+        menu.addItem(failure)
+        let result = NSMenuItem(title: "报告保存在本机诊断目录", action: nil, keyEquivalent: "")
+        result.isEnabled = false
+        menu.addItem(result)
+        let openReports = NSMenuItem(title: "打开失效报告目录", action: #selector(openFailureReportsPressed), keyEquivalent: "")
+        openReports.target = self
+        menu.addItem(openReports)
+        failureContextMenuItem = context
+        failureResultMenuItem = result
         menu.addItem(NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         installedMenu = menu
         usageMenuItemView = usageView
@@ -142,7 +164,10 @@ final class StatusMenuController: NSObject {
         onSelectRimeTheme: @escaping (String) -> Void,
         onManageRimeDictionary: @escaping () -> Void,
         onExportRimeConfiguration: @escaping () -> Void,
-        onImportRimeConfiguration: @escaping () -> Void
+        onImportRimeConfiguration: @escaping () -> Void,
+        onToggleFailureContext: @escaping () -> Void = {},
+        onReportInputFailure: @escaping () -> Void = {},
+        onOpenFailureReports: @escaping () -> Void = {}
     ) {
         self.onSettings = onSettings
         self.onCalibrateUsage = onCalibrateUsage
@@ -152,7 +177,23 @@ final class StatusMenuController: NSObject {
         self.onManageRimeDictionary = onManageRimeDictionary
         self.onExportRimeConfiguration = onExportRimeConfiguration
         self.onImportRimeConfiguration = onImportRimeConfiguration
+        self.onToggleFailureContext = onToggleFailureContext
+        self.onReportInputFailure = onReportInputFailure
+        self.onOpenFailureReports = onOpenFailureReports
     }
+
+    func update(failureContextEnabled: Bool) {
+        failureContextMenuItem?.state = failureContextEnabled ? .on : .off
+    }
+
+    func update(failureReportResult: String, path: String? = nil) {
+        failureResultMenuItem?.title = failureReportResult
+        failureResultMenuItem?.toolTip = path
+    }
+
+    @objc private func toggleFailureContextPressed() { onToggleFailureContext?() }
+    @objc private func reportInputFailurePressed() { onReportInputFailure?() }
+    @objc private func openFailureReportsPressed() { onOpenFailureReports?() }
 
     func update(rimeThemes snapshot: RimeThemeSnapshot) {
         guard let submenu = rimeThemeMenuItem?.submenu else { return }
@@ -221,6 +262,9 @@ final class StatusMenuController: NSObject {
         onManageRimeDictionary = nil
         onExportRimeConfiguration = nil
         onImportRimeConfiguration = nil
+        onToggleFailureContext = nil
+        onReportInputFailure = nil
+        onOpenFailureReports = nil
     }
 
     private func removeStatusItem() {
@@ -236,6 +280,8 @@ final class StatusMenuController: NSObject {
         rimeThemeMenuItem = nil
         rimeDictionaryMenuItem = nil
         archiveMenuItems = []
+        failureContextMenuItem = nil
+        failureResultMenuItem = nil
     }
 
     private func statusImage() -> NSImage {

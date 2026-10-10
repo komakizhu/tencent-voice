@@ -12,6 +12,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let loginItemManager: LoginItemManager
     private let coordinator: SessionCoordinator
     private let sessionLogger: SessionLogger
+    private let failureContext = InputFailureContextRecorder()
+    private var failureReportTask: Task<Void, Never>?
+    private var failureContextMainMenuItem: NSMenuItem?
+    private let failureContextDefaults = UserDefaults(suiteName: "local.tencent.voice.mvp") ?? .standard
     private let localUsageStore: LocalUsageStore
     private let sharedUsageStore: SharedUsageStore
     private let rimeThemeStore: RimeThemeStore
@@ -160,8 +164,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             onImportRimeConfiguration: { [weak self] in
                 self?.importRimeConfiguration()
+            },
+            onToggleFailureContext: { [weak self] in
+                self?.toggleFailureContext()
+            },
+            onReportInputFailure: { [weak self] in
+                self?.reportInputFailure()
+            },
+            onOpenFailureReports: { [weak self] in
+                self?.openFailureReports()
             }
         )
+        applyFailureContextSetting()
         menu.update(autoStartEnabled: loginItemManager.isEnabled)
         refreshRimeThemes()
         recoverPendingConfigurationImports()
@@ -189,6 +203,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         settingsItem.target = self
         appMenu.addItem(settingsItem)
+        let context = NSMenuItem(title: "记录 Codex 故障前一分钟操作", action: #selector(toggleFailureContext), keyEquivalent: "")
+        context.target = self
+        failureContextMainMenuItem = context
+        appMenu.addItem(context)
+        let failure = NSMenuItem(title: "报告输入失效", action: #selector(reportInputFailure), keyEquivalent: "")
+        failure.target = self
+        appMenu.addItem(failure)
+        let openReports = NSMenuItem(title: "打开失效报告目录", action: #selector(openFailureReports), keyEquivalent: "")
+        openReports.target = self
+        appMenu.addItem(openReports)
         appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         let appItem = NSMenuItem()
@@ -220,6 +244,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        failureContext.stop()
         nativeF5MonitorTask?.cancel()
         usageMonitorTask?.cancel()
         rimeThemeSelectionTask?.cancel()
@@ -435,6 +460,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let data = try DiagnosticJSON.encoder().encode(report)
         try data.write(to: url, options: .atomic)
         return url
+    }
+
+    private func applyFailureContextSetting() {
+        let enabled = failureContextDefaults.bool(forKey: "inputFailureContextEnabled")
+        failureContext.setEnabled(enabled)
+        sessionLogger.setFailureContextEnabled(enabled)
+        menu.update(failureContextEnabled: enabled)
+        failureContextMainMenuItem?.state = enabled ? .on : .off
+    }
+
+    @objc private func toggleFailureContext() {
+        failureContextDefaults.set(!failureContext.isEnabled, forKey: "inputFailureContextEnabled")
+        applyFailureContextSetting()
+    }
+
+    @objc private func reportInputFailure() {
+        guard failureReportTask == nil else { return }
+        let now = Date()
+        let context = failureContext.snapshot(at: now)
+        sessionLogger.recordDiagnosticAction("input_failure_report_requested", fields: [
+            "contextEnabled": String(context.enabled)
+        ])
+        let events = context.enabled ? sessionLogger.failureEvents(at: now) : sessionLogger.recentEntries(limit: 300)
+            .filter { $0.timestamp >= now.addingTimeInterval(-60) && $0.timestamp <= now }
+        let report = InputFailureReport(schemaVersion: 1, id: UUID(), generatedAt: now, desktopContext: context,
+            diagnosticReport: DiagnosticReportBuilder(permissionChecker: permissionChecker,
+                credentialStore: credentialStore, settingsStore: settingsStore, logger: sessionLogger).build(events: events),
+            diagnosticEventsTruncated: !context.enabled || sessionLogger.failureContextEventsTruncated)
+        let directory = sessionLogger.persistenceDirectoryURL.deletingLastPathComponent()
+            .appendingPathComponent("input-failure-reports", isDirectory: true)
+        let destination = directory.appendingPathComponent("InputFailure-\(report.id.uuidString).json")
+        menu.update(failureReportResult: "正在保存失效报告…")
+        failureReportTask = Task { @MainActor [weak self] in
+            defer { self?.failureReportTask = nil }
+            do {
+                try await Task.detached(priority: .utility) {
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    try DiagnosticJSON.encoder().encode(report).write(to: destination, options: .atomic)
+                }.value
+                let title = context.enabled ? "失效报告已保存" : "已保存诊断；操作记录未开启"
+                self?.menu.update(failureReportResult: title, path: destination.path)
+                self?.sessionLogger.recordDiagnosticAction("input_failure_report_saved", fields: [
+                    "reportID": report.id.uuidString, "contextEnabled": String(context.enabled),
+                    "desktopEventCount": String(context.events.count), "diagnosticEventCount": String(events.count)
+                ])
+            } catch {
+                self?.menu.update(failureReportResult: "失效报告保存失败", path: error.localizedDescription)
+            }
+        }
+    }
+
+    @objc private func openFailureReports() {
+        let directory = sessionLogger.persistenceDirectoryURL.deletingLastPathComponent()
+            .appendingPathComponent("input-failure-reports", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if !NSWorkspace.shared.open(directory) { throw DiagnosticLogExportError.unavailable }
+        } catch {
+            menu.update(failureReportResult: "无法打开失效报告目录", path: error.localizedDescription)
+        }
     }
 
     private func defaultDiagnosticLogFilename() -> String {

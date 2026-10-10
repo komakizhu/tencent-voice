@@ -567,7 +567,7 @@ final class DiagnosticReportBuilder {
         self.suppliedAppInfo = appInfo
     }
 
-    func build() -> DiagnosticReport {
+    func build(events: [SessionLogEntry]? = nil) -> DiagnosticReport {
         let settings = settingsStore.load()
         let permissions = permissionChecker.report()
         let credentials = credentialInfo()
@@ -581,7 +581,7 @@ final class DiagnosticReportBuilder {
                 persistentSessionLogEnabled: settings.saveTextLogs,
                 safeCopyEnabled: settings.safeCopyEnabled
             ),
-            events: mergedEvents(),
+            events: events ?? mergedEvents(),
             logDirectoryPath: logger.persistenceDirectoryURL.path
         )
     }

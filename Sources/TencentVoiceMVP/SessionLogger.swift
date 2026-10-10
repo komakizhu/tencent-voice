@@ -220,6 +220,22 @@ final class SessionLogger {
     private var inMemoryEntries: [SessionLogEntry] = []
     private let diagnosticActionSessionID = UUID()
     private let inMemoryLimit = 300
+    private var failureContextEnabled = false
+    private var failureContextEvents: [SessionLogEntry] = []
+    private var lastFailureContextPrune = Date.distantPast
+    private(set) var failureContextEventsTruncated = false
+
+    func setFailureContextEnabled(_ enabled: Bool) {
+        failureContextEnabled = enabled
+        failureContextEvents = []
+        failureContextEventsTruncated = false
+        lastFailureContextPrune = .distantPast
+    }
+
+    func failureEvents(at date: Date) -> [SessionLogEntry] {
+        failureContextEvents.filter { $0.timestamp >= date.addingTimeInterval(-60) && $0.timestamp <= date }
+            .sorted { $0.timestamp < $1.timestamp }
+    }
 
     init(
         enabled: @escaping () -> Bool,
@@ -234,6 +250,18 @@ final class SessionLogger {
     }
 
     func append(_ entry: SessionLogEntry) throws {
+        if failureContextEnabled {
+            let now = Date()
+            if now.timeIntervalSince(lastFailureContextPrune) >= 1 {
+                failureContextEvents.removeAll { $0.timestamp < now.addingTimeInterval(-60) }
+                lastFailureContextPrune = now
+            }
+            failureContextEvents.append(entry)
+            if failureContextEvents.count > 12000 {
+                failureContextEvents.removeFirst(failureContextEvents.count - 12000)
+                failureContextEventsTruncated = true
+            }
+        }
         inMemoryEntries.append(entry)
         if inMemoryEntries.count > inMemoryLimit {
             inMemoryEntries.removeFirst(inMemoryEntries.count - inMemoryLimit)
