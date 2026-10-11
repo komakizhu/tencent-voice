@@ -6,6 +6,82 @@ private typealias ReplayTextRange = TencentVoiceMVP.TextRange
 
 @MainActor
 final class AXTextTargetReplayTests: XCTestCase {
+    func testRealAXReplayContinuesAfterCodexRemovesFinalEmptyParagraphOnFirstCharacter() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "\n", selection: .init(location: 0, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.coordinateIncludesStructuralSeparators = true
+        access.writeSnapshots = [
+            .init(rawText: "甲", coordinateText: "甲", selection: .init(location: 1, length: 0)),
+            .init(rawText: "甲乙", coordinateText: "甲乙", selection: .init(location: 2, length: 0))
+        ]
+        let sender = ReplayKeyboardEventSender(access: access)
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target, pacingClock: clock)
+
+        try injector.begin()
+        injector.apply(projection: projection("甲", revision: 1))
+        await finish(injector, finalText: "甲", advancing: clock)
+        injector.apply(projection: projection("甲乙", revision: 2))
+        await finish(injector, finalText: "甲乙", advancing: clock)
+
+        XCTAssertEqual(access.rawText, "甲乙")
+        XCTAssertEqual(access.coordinateText, "甲乙")
+        XCTAssertEqual(access.selection, .init(location: 2, length: 0))
+        XCTAssertEqual(sender.appendPosts, 2, "each character growth is posted once")
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+        XCTAssertTrue(injector.drainDiagnostics().contains {
+            $0.event == "keyboard_write_acknowledged"
+                && $0.fields["receiptRepresentationTransition"] == "trailing_newline_collapsed"
+        })
+    }
+
+    func testDiagnosticReportsImmediateReadFailureWithoutChangingRetryPolicy() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "\n", selection: .init(location: 0, length: 0),
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.proseMirror = true
+        access.coordinateIncludesStructuralSeparators = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+        _ = try target.capture()
+        try target.paste("你好")
+        access.nextTextReadError = .writeFailed
+        do {
+            try await target.acknowledgeKeyboardWrite()
+            XCTFail("Diagnostic instrumentation must preserve the existing failure")
+        } catch {
+            XCTAssertEqual(error as? TextTargetError, .writeFailed)
+        }
+        let diagnostic = try XCTUnwrap(target.drainDiagnostics().first { $0.event == "keyboard_write_unconfirmed" })
+        XCTAssertEqual(diagnostic.fields["readAttempts"], "1")
+        XCTAssertEqual(diagnostic.fields["comparison"], "unreadable")
+        XCTAssertEqual(sender.totalPosts, 1)
+    }
+
+    func testSystemAXReadFailureRecordsStatusAndDrainsWithoutContent() throws {
+        let access = SystemAXTextTargetAccess()
+        _ = try? access.text(in: AXUIElementCreateSystemWide())
+        let diagnostic = try XCTUnwrap(access.drainReadDiagnostics().first)
+        XCTAssertEqual(diagnostic.event, "ax_read_failed")
+        XCTAssertEqual(diagnostic.fields["axAttribute"], kAXValueAttribute as String)
+        XCTAssertNotEqual(diagnostic.fields["axStatus"], "0")
+        XCTAssertEqual(diagnostic.fields.count, 2)
+        XCTAssertTrue(access.drainReadDiagnostics().isEmpty)
+    }
+
     func testSafariProseMirrorUsesAcknowledgedKeyboardInputDespiteWritableAX() async throws {
         for draft in ["\n", "已有草稿\n"] {
             let access = ReplayAXTextTargetAccess(
@@ -170,6 +246,56 @@ final class AXTextTargetReplayTests: XCTestCase {
         let injector = TextInjector(target: AXTextTarget(access: access))
         try injector.begin()
         XCTAssertEqual(injector.modeDescription, "ax")
+    }
+
+    func testObsidianUsesKeyboardAcknowledgementWhenAXWriteIsMisleading() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "已有",
+            selection: .init(location: 2, length: 0),
+            application: .init(name: "Obsidian", bundleIdentifier: "md.obsidian", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            )
+        )
+        let injector = TextInjector(target: target, pacingClock: clock)
+
+        try injector.begin()
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+
+        access.readSnapshotsAfterNextWrite = [
+            .init(rawText: "已有", coordinateText: "已有", selection: .init(location: 2, length: 0)),
+            .init(rawText: "已有语音", coordinateText: "已有语音", selection: .init(location: 4, length: 0))
+        ]
+        injector.apply(projection: projection("语音", revision: 1))
+        await finish(injector, finalText: "语音", advancing: clock)
+
+        XCTAssertEqual(access.rawText, "已有语音")
+        XCTAssertEqual(access.axTextWrites, 0)
+        XCTAssertEqual(sender.appendPosts, 1)
+        XCTAssertEqual(injector.errorCount, 0)
+
+        access.readSnapshotsAfterNextWrite = [
+            .init(rawText: "已有语音", coordinateText: "已有语音", selection: .init(location: 4, length: 0)),
+            .init(rawText: "已有语境", coordinateText: "已有语境", selection: .init(location: 4, length: 0))
+        ]
+        injector.apply(projection: projection("语境", revision: 2))
+        await finish(injector, finalText: "语境", advancing: clock)
+
+        XCTAssertEqual(access.rawText, "已有语境")
+        XCTAssertEqual(access.axTextWrites, 0)
+        XCTAssertEqual(sender.totalPosts, 2, "a delayed readback must not resend the keyboard event")
+        XCTAssertEqual(sender.selectionPosts, 1)
+        XCTAssertEqual(sender.replacementPosts, 1)
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
     }
 
     func testCodexMainAndCommentReplayAcceptMoreThanThousandCharacters() async throws {
@@ -602,7 +728,7 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertTrue(
             diagnostics.contains {
                 $0.event == "keyboard_write_unconfirmed"
-                    && $0.fields["comparison"] == "documentMismatch"
+                    && $0.fields["comparison"] != "matched"
             }
         )
     }
@@ -1055,6 +1181,7 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var selection: ReplayTextRange
     var placeholderEvidenceValue: AXPlaceholderEvidence
     var failNextTextReads = 0
+    var nextTextReadError: TextTargetError?
     var alwaysFailTextReads = false
     var failNextSelectionReads = 0
     var failNextCoordinateReads = 0
@@ -1120,6 +1247,10 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
 
     func text(in element: AXUIElement) throws -> String? {
         textReadCount += 1
+        if let error = nextTextReadError {
+            nextTextReadError = nil
+            throw error
+        }
         if !queuedTextReadSnapshots.isEmpty {
             let snapshot = queuedTextReadSnapshots.removeFirst()
             rawText = snapshot.rawText

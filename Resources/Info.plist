@@ -17,7 +17,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.4.0</string>
 	<key>CFBundleVersion</key>
-	<string>117</string>
+	<string>120</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>

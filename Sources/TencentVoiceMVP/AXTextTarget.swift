@@ -20,7 +20,7 @@ private struct PendingKeyboardReplacement {
 }
 
 private struct PendingKeyboardRepresentationTransition {
-    let alternate: KeyboardDocumentState
+    let alternates: [KeyboardDocumentState]
     let sessionGeneration: UInt64
     let operationGeneration: UInt64
 }
@@ -40,10 +40,12 @@ protocol AXTextTargetAccess {
     func setSelection(_ range: TextRange, on element: AXUIElement) throws -> Int32
     func setSelectedText(_ text: String, on element: AXUIElement) throws -> Int32
     func setValue(_ text: String, on element: AXUIElement) throws -> Int32
+    func drainReadDiagnostics() -> [TextInputDiagnostic]
 }
 
 extension AXTextTargetAccess {
     func isProseMirrorEditor(_ element: AXUIElement) -> Bool { false }
+    func drainReadDiagnostics() -> [TextInputDiagnostic] { [] }
 }
 
 @MainActor
@@ -84,6 +86,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
     private var keyboardGeneration: UInt64 = 0
     private var keyboardOperationGeneration: UInt64 = 0
     private var isCodexTarget = false
+    private var isObsidianTarget = false
     private var isSafariWebEditor = false
     private var targetElement: AXUIElement?
     private var targetProcessID: pid_t?
@@ -120,6 +123,9 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
     }
 
     func drainDiagnostics() -> [TextInputDiagnostic] {
+        for diagnostic in access.drainReadDiagnostics() {
+            recordDiagnostic(diagnostic.event, diagnostic.fields, context: diagnosticOperationContext ?? previousDiagnosticOperationContext)
+        }
         defer { diagnostics.removeAll(keepingCapacity: true) }
         var result = diagnostics
         if droppedDiagnosticCount > 0 {
@@ -159,6 +165,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
     }
 
     func capture() throws -> TextSnapshot {
+        _ = access.drainReadDiagnostics()
         keyboardGeneration &+= 1
         keyboardOperationGeneration = 0
         pendingKeyboardWrite = nil
@@ -188,6 +195,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         let targetApplication = currentApplication()
         targetApplicationProcessID = targetApplication.map { pid_t($0.processIdentifier) }
         isCodexTarget = targetApplication?.bundleIdentifier == "com.openai.codex"
+        isObsidianTarget = targetApplication?.bundleIdentifier == "md.obsidian"
         isSafariWebEditor = false
 
         // Some Electron/WebKit controls expose neither a stable AX value nor
@@ -292,7 +300,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
             element: element,
             text: text,
             selection: selection,
-            supportsAXReplacement: !isSafariWebEditor && hasReadableAXTextState && (element.map {
+            supportsAXReplacement: !isSafariWebEditor && !isObsidianTarget && hasReadableAXTextState && (element.map {
                 selectedTextIsSettable(on: $0) || valueIsSettable(on: $0)
             } ?? false),
             targetApplication: targetApplication,
@@ -598,7 +606,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         var lastObservedState: KeyboardDocumentState?
         var lastComparison: KeyboardDocumentComparison?
         var usedRepresentationTransition = false
+        let acknowledgementContext = diagnosticOperationContext ?? previousDiagnosticOperationContext
+        var readAttempts = 0
         let read = { () throws -> KeyboardDocumentState in
+            readAttempts += 1
             let observed = try self.readKeyboardDocumentObservation(
                 generation: generation,
                 phase: "acknowledgement"
@@ -612,22 +623,38 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
                 allowingStructuralRawDifference: self.isCodexTarget
             )
             lastComparison = comparison
-            guard comparison != .matched else { return true }
+            if comparison == .matched {
+                if self.matchesKeyboardReceipt(observed: observed, expected: expected) {
+                    return true
+                }
+                if self.isCodexTarget, observed.rawText != expected.rawText {
+                    lastComparison = .rawTextMismatch
+                } else {
+                    lastComparison = .rawMappingUnavailable
+                }
+            }
             guard let transition = pendingRepresentationTransition,
                   transition.sessionGeneration == generation,
-                  transition.operationGeneration == operationGeneration,
-                  let expectedRawText = transition.alternate.rawText,
-                  observed.rawText == expectedRawText,
-                  observed.mapping == transition.alternate.mapping,
-                  observed.compare(
-                      to: transition.alternate,
-                      allowingStructuralRawDifference: self.isCodexTarget
-                  ) == .matched else {
+                  transition.operationGeneration == operationGeneration else {
                 return false
             }
-            usedRepresentationTransition = true
-            lastComparison = .matched
-            return true
+            for alternate in transition.alternates {
+                let alternateComparison = observed.compare(
+                    to: alternate,
+                    allowingStructuralRawDifference: self.isCodexTarget
+                )
+                guard alternateComparison == .matched else { continue }
+                lastComparison = alternateComparison
+                guard self.matchesKeyboardReceipt(observed: observed, expected: alternate) else {
+                    lastComparison = observed.rawText == alternate.rawText
+                        ? .rawMappingUnavailable
+                        : .rawTextMismatch
+                    continue
+                }
+                usedRepresentationTransition = true
+                return true
+            }
+            return false
         }
         do {
             let acknowledgedState: KeyboardDocumentState
@@ -643,14 +670,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
                 ) {
                     self.recordDiagnostic(
                         "keyboard_selection_acknowledged",
-                        context: self.previousDiagnosticOperationContext
+                        context: acknowledgementContext
                     )
                     try self.keyboardEventSender.replaceSelection(with: replacement.insertion, processID: self.eventProcessID)
                     self.replacementWasSent = true
                     self.lastKeyboardDispatch = self.writeTiming.now()
                     self.recordDiagnostic(
                         "keyboard_replacement_submitted",
-                        context: self.previousDiagnosticOperationContext
+                        context: acknowledgementContext
                     )
                 }
             } else {
@@ -682,11 +709,15 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
                 "receiptRepresentationTransition": usedRepresentationTransition
                     ? KeyboardReceiptRepresentation.trailingNewlineCollapsed
                     : "none"
-            ], context: previousDiagnosticOperationContext)
+            ], context: acknowledgementContext)
         } catch {
+            let evidence: [String: String] = [
+                "elapsedMilliseconds": String((writeTiming.now() - start) / 1_000_000),
+                "readAttempts": String(readAttempts)
+            ]
             recordDiagnostic(
                 "keyboard_write_unconfirmed",
-                [
+                evidence.merging([
                     "code": DiagnosticErrorFormatter.code(for: error),
                     "comparison": lastComparison?.rawValue ?? "unreadable",
                     "observedLengthUTF16": String(lastObservedState?.text.utf16.count ?? 0),
@@ -694,8 +725,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
                     "receiptRepresentationTransition": pendingRepresentationTransition != nil
                         ? KeyboardReceiptRepresentation.trailingNewlineCollapsed
                         : "none"
-                ],
-                context: previousDiagnosticOperationContext
+                ]) { _, new in new },
+                context: acknowledgementContext
             )
             pendingKeyboardRepresentationTransition = nil
             recoverPendingSelectionIfSafe(generation: generation)
@@ -757,32 +788,34 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         if previousText == nil,
            let rawDocumentForTransition,
            let rawRangeForTransition,
-           let mappingForTransition,
-           let alternate = trailingNewlineCollapsedReceipt(
-               document: document,
-               range: range,
-               text: text,
-               rawDocument: rawDocumentForTransition,
-               rawRange: rawRangeForTransition,
-               mapping: mappingForTransition
-           ) {
-            pendingKeyboardRepresentationTransition = PendingKeyboardRepresentationTransition(
-                alternate: alternate,
-                sessionGeneration: keyboardGeneration,
-                operationGeneration: operationGeneration ?? keyboardOperationGeneration
+           let mappingForTransition {
+            let alternates = trailingNewlineCollapsedReceipts(
+                document: document,
+                range: range,
+                text: text,
+                rawDocument: rawDocumentForTransition,
+                rawRange: rawRangeForTransition,
+                mapping: mappingForTransition
             )
+            if !alternates.isEmpty {
+                pendingKeyboardRepresentationTransition = PendingKeyboardRepresentationTransition(
+                    alternates: alternates,
+                    sessionGeneration: keyboardGeneration,
+                    operationGeneration: operationGeneration ?? keyboardOperationGeneration
+                )
+            }
         }
         return primary
     }
 
-    private func trailingNewlineCollapsedReceipt(
+    private func trailingNewlineCollapsedReceipts(
         document: String,
         range: TextRange,
         text: String,
         rawDocument: String,
         rawRange: TextRange,
         mapping: AXTextCoordinateMapping
-    ) -> KeyboardDocumentState? {
+    ) -> [KeyboardDocumentState] {
         guard isCodexTarget,
               !text.isEmpty,
               !text.unicodeScalars.contains(where: isStructuralSeparator),
@@ -796,14 +829,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
               rawRange.location == rawDocument.utf16.count - 1,
               utf16Unit(at: range.location, in: document) == 0x0A,
               utf16Unit(at: rawRange.location, in: rawDocument) == 0x0A else {
-            return nil
+            return []
         }
 
         let documentTrailingNewlineCount = trailingNewlineCount(in: document)
         let rawTrailingNewlineCount = trailingNewlineCount(in: rawDocument)
         guard documentTrailingNewlineCount > 0,
               documentTrailingNewlineCount == rawTrailingNewlineCount else {
-            return nil
+            return []
         }
 
         let alternateSelection = TextRange(
@@ -820,17 +853,17 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
               alternateCoordinate.substring(
                   with: NSRange(location: insertedTextEnd, length: 1)
               ) == "\n" else {
-            return nil
+            return []
         }
         alternateCoordinate.deleteCharacters(
             in: NSRange(location: insertedTextEnd, length: 1)
         )
 
-        let alternateRaw = NSMutableString(string: rawDocument)
+        let retainedSeparatorRaw = NSMutableString(string: rawDocument)
         if rawTrailingNewlineCount == 1 {
             // With one empty paragraph the AXValue line feed is the separator
             // before the new paragraph, so the inserted text follows it.
-            alternateRaw.replaceCharacters(
+            retainedSeparatorRaw.replaceCharacters(
                 in: NSRange(location: rawRange.location + 1, length: 0),
                 with: text
             )
@@ -838,53 +871,105 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
             // With multiple empty paragraphs Chromium drops only the final
             // placeholder line feed. Keep all preceding paragraph separators,
             // insert before that marker, then remove exactly that marker.
-            alternateRaw.replaceCharacters(
+            retainedSeparatorRaw.replaceCharacters(
                 in: NSRange(location: rawRange.location, length: 0),
                 with: text
             )
             let removedMarkerLocation = rawRange.location + text.utf16.count
-            guard utf16Unit(at: removedMarkerLocation, in: alternateRaw as String) == 0x0A else {
-                return nil
+            guard utf16Unit(at: removedMarkerLocation, in: retainedSeparatorRaw as String) == 0x0A else {
+                return []
             }
-            alternateRaw.deleteCharacters(
+            retainedSeparatorRaw.deleteCharacters(
                 in: NSRange(location: removedMarkerLocation, length: 1)
             )
         }
         let alternateText = alternateCoordinate as String
-        let alternateRawText = alternateRaw as String
-        let probe = AXTextCoordinateProbe { requestedRange in
-            guard requestedRange.location >= 0,
-                  requestedRange.length >= 0,
-                  requestedRange.location <= alternateText.utf16.count,
-                  requestedRange.length <= alternateText.utf16.count - requestedRange.location else {
-                return nil
-            }
-            return (alternateText as NSString).substring(
-                with: NSRange(
-                    location: requestedRange.location,
-                    length: requestedRange.length
-                )
-            )
-        }
-        guard let resolved = try? AXTextDocumentResolver.resolve(
-            rawText: alternateRawText,
-            selection: alternateSelection,
-            placeholderEvidence: .init(),
-            probe: probe
-        ),
-        resolved.rawText == alternateRawText,
-        resolved.text == alternateText,
-        resolved.selection == alternateSelection,
-        resolved.mapping.source == .axStringForRange,
-        resolved.mapping.rawRange(for: alternateSelection) != nil else {
-            return nil
-        }
-        return KeyboardDocumentState(
-            text: resolved.text,
-            selection: resolved.selection,
-            rawText: resolved.rawText,
-            mapping: resolved.mapping
+        let retainedSeparatorRawText = retainedSeparatorRaw as String
+
+        // Codex may either retain the separator before the new paragraph or
+        // remove the final empty-paragraph marker altogether. Both states are
+        // finite, derived from the same pre-write mapping, and are accepted
+        // only when the complete state is read back.
+        let collapsedFinalRaw = NSMutableString(string: rawDocument)
+        collapsedFinalRaw.replaceCharacters(
+            in: NSRange(location: rawRange.location, length: 0),
+            with: text
         )
+        let collapsedMarkerLocation = rawRange.location + text.utf16.count
+        guard utf16Unit(at: collapsedMarkerLocation, in: collapsedFinalRaw as String) == 0x0A else {
+            return []
+        }
+        collapsedFinalRaw.deleteCharacters(
+            in: NSRange(location: collapsedMarkerLocation, length: 1)
+        )
+
+        var candidates: [KeyboardDocumentState] = []
+        for rawText in [retainedSeparatorRawText, collapsedFinalRaw as String] {
+            guard candidates.allSatisfy({ $0.rawText != rawText }) else { continue }
+            let probe = AXTextCoordinateProbe { requestedRange in
+                guard requestedRange.location >= 0,
+                      requestedRange.length >= 0,
+                      requestedRange.location <= alternateText.utf16.count,
+                      requestedRange.length <= alternateText.utf16.count - requestedRange.location else {
+                    return nil
+                }
+                return (alternateText as NSString).substring(
+                    with: NSRange(
+                        location: requestedRange.location,
+                        length: requestedRange.length
+                    )
+                )
+            }
+            guard let resolved = try? AXTextDocumentResolver.resolve(
+                rawText: rawText,
+                selection: alternateSelection,
+                placeholderEvidence: .init(),
+                probe: probe
+            ),
+            resolved.rawText == rawText,
+            resolved.text == alternateText,
+            resolved.selection == alternateSelection,
+            resolved.mapping.source == .axStringForRange,
+            resolved.mapping.rawRange(for: alternateSelection) != nil else {
+                continue
+            }
+            candidates.append(KeyboardDocumentState(
+                text: resolved.text,
+                selection: resolved.selection,
+                rawText: resolved.rawText,
+                mapping: resolved.mapping
+            ))
+        }
+        return candidates
+    }
+
+    private func matchesKeyboardReceipt(
+        observed: KeyboardDocumentState,
+        expected: KeyboardDocumentState
+    ) -> Bool {
+        guard observed.text == expected.text,
+              observed.selection == expected.selection else {
+            return false
+        }
+        if isCodexTarget {
+            guard let expectedRawText = expected.rawText,
+                  observed.rawText == expectedRawText,
+                  let observedRawText = observed.rawText,
+                  let observedMapping = observed.mapping,
+                  AXTextDocumentResolver.isValidCoordinateMapping(
+                      observedMapping,
+                      rawText: observedRawText,
+                      coordinateText: observed.text
+                  ) else {
+                return false
+            }
+            if let expectedMapping = expected.mapping,
+               observedMapping != expectedMapping {
+                return false
+            }
+            return true
+        }
+        return observed.rawText == expected.rawText
     }
 
     private func utf16Unit(at offset: Int, in text: String) -> UInt16? {
@@ -1431,6 +1516,21 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
 
 @MainActor
 final class SystemAXTextTargetAccess: AXTextTargetAccess {
+    private var readDiagnostics: [TextInputDiagnostic] = []
+
+    func drainReadDiagnostics() -> [TextInputDiagnostic] {
+        defer { readDiagnostics.removeAll(keepingCapacity: true) }
+        return readDiagnostics
+    }
+
+    private func recordReadStatus(_ status: AXError, attribute: String) {
+        guard status != .success else { return }
+        let fields = ["axAttribute": attribute, "axStatus": String(status.rawValue)]
+        guard readDiagnostics.last?.fields != fields else { return }
+        if readDiagnostics.count >= 16 { readDiagnostics.removeFirst() }
+        readDiagnostics.append(TextInputDiagnostic(timestamp: Date(), event: "ax_read_failed", fields: fields))
+    }
+
     func isProseMirrorEditor(_ element: AXUIElement) -> Bool {
         stringAttribute(kAXRoleAttribute as String, from: element) == "AXTextArea"
             && classTokens(in: element).contains("prosemirror")
@@ -1511,6 +1611,7 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
             rangeValue,
             &result
         )
+        recordReadStatus(status, attribute: kAXStringForRangeParameterizedAttribute as String)
         switch status {
         case .success:
             guard let result else { return nil }
@@ -1631,6 +1732,9 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
     private func attribute(_ name: String, from element: AXUIElement) throws -> CFTypeRef? {
         var value: CFTypeRef?
         let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        if [kAXFocusedUIElementAttribute, kAXValueAttribute, kAXSelectedTextRangeAttribute].contains(name) {
+            recordReadStatus(status, attribute: name)
+        }
         switch status {
         case .success:
             return value

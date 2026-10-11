@@ -475,6 +475,7 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
             "targetElementProcessID", "frontmostApplicationMatchesTarget", "elementSame",
             "selectedRangeNonEmpty", "localDispatchCompleted", "targetCompletionConfirmed",
             "phase", "expectedDocumentLength", "actualDocumentLength",
+            "axAttribute", "axStatus", "readAttempts", "elapsedMilliseconds",
             "plannedKeyboardEventCount", "postedKeyboardEventCount", "unicodeBlockCount",
             "shiftKeyEventCount", "unicodeKeyEventCount", "deleteKeyEventCount",
             "failureCode", "failureOccurredAt", "degradationRecordedAt",
