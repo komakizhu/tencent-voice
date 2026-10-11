@@ -75,26 +75,13 @@ struct KeyboardDocumentState: Equatable {
                 }
                 return .matched
             }
-            let textUTF16 = Array(text.utf16)
-            guard mapping.coordinateDocumentLength == text.utf16.count,
-                  mapping.rawDocumentLength == rawText?.utf16.count,
-                  mapping.rawBoundaryOffsets.count == text.utf16.count + 1,
-                  mapping.rawBoundaryOffsets.first == 0,
-                  mapping.rawBoundaryOffsets.last == rawText?.utf16.count,
-                  mapping.rawBoundaryOffsets.enumerated().allSatisfy({ index, offset in
-                      if offset >= 0 {
-                          return offset <= mapping.rawDocumentLength
-                      }
-                      guard index > 0, index < text.utf16.count else { return false }
-                      return textUTF16[index - 1] >= 0xD800 && textUTF16[index - 1] <= 0xDBFF
-                          && textUTF16[index] >= 0xDC00 && textUTF16[index] <= 0xDFFF
-                  }) else {
+            guard let rawText,
+                  AXTextDocumentResolver.isValidCoordinateMapping(
+                      mapping,
+                      rawText: rawText,
+                      coordinateText: text
+                  ) else {
                 return .rawMappingUnavailable
-            }
-            var previousOffset = 0
-            for offset in mapping.rawBoundaryOffsets where offset >= 0 {
-                guard offset >= previousOffset else { return .rawMappingUnavailable }
-                previousOffset = offset
             }
             return .matched
         }

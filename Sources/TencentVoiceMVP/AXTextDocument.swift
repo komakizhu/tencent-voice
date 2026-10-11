@@ -184,6 +184,26 @@ enum AXTextDocumentResolver {
         )
     }
 
+    static func isValidCoordinateMapping(
+        _ mapping: AXTextCoordinateMapping,
+        rawText: String,
+        coordinateText: String
+    ) -> Bool {
+        guard mapping.source == .axStringForRange
+                || mapping.source == .axValueAfterPlaceholderTransition,
+              mapping.rawPlaceholderRange == nil,
+              mapping.rawDocumentLength == rawText.utf16.count,
+              mapping.coordinateDocumentLength == coordinateText.utf16.count,
+              let expected = rawBoundaryMapping(
+                  rawText: rawText,
+                  coordinateText: coordinateText
+              ) else {
+            return false
+        }
+        return mapping.omittedStructuralSeparatorCount == expected.omittedSeparatorCount
+            && mapping.rawBoundaryOffsets == expected.rawBoundaryOffsets
+    }
+
     static func resolveUsingValidatedAXValueAfterPlaceholder(
         rawText: String,
         selection: TextRange,

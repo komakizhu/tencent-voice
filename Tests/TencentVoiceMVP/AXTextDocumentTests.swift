@@ -94,6 +94,129 @@ final class AXTextDocumentTests: XCTestCase {
         XCTAssertEqual(state.mapping.coordinateDocumentLength, coordinateText.utf16.count)
     }
 
+    func testKeyboardDocumentStateAcceptsLeadingStructuralSeparatorMapping() throws {
+        let raw = "\n" + String(repeating: "字", count: 13)
+        let coordinateText = String(repeating: "字", count: 13)
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: coordinateText.utf16.count, length: 0),
+            placeholderEvidence: AXPlaceholderEvidence(),
+            probe: prefixProbe(coordinateText)
+        )
+        let observed = KeyboardDocumentState(
+            text: state.text,
+            selection: state.selection,
+            rawText: state.rawText,
+            mapping: state.mapping
+        )
+
+        XCTAssertEqual(
+            observed.compare(to: observed, allowingStructuralRawDifference: true),
+            .matched
+        )
+        XCTAssertEqual(state.mapping.rawRange(for: .init(location: 0, length: 0)), .init(location: 1, length: 0))
+        XCTAssertEqual(state.mapping.rawRange(for: .init(location: 13, length: 0)), .init(location: 14, length: 0))
+    }
+
+    func testKeyboardDocumentStateAcceptsMultipleLeadingStructuralSeparators() throws {
+        for prefix in ["\n\n", "\n\r\u{2028}"] {
+            let coordinateText = "保留草稿😀"
+            let state = try AXTextDocumentResolver.resolve(
+                rawText: prefix + coordinateText,
+                selection: .init(location: coordinateText.utf16.count, length: 0),
+                placeholderEvidence: AXPlaceholderEvidence(),
+                probe: prefixProbe(coordinateText)
+            )
+            let observed = KeyboardDocumentState(
+                text: state.text,
+                selection: state.selection,
+                rawText: state.rawText,
+                mapping: state.mapping
+            )
+
+            XCTAssertEqual(
+                observed.compare(to: observed, allowingStructuralRawDifference: true),
+                .matched,
+                "prefix: \(prefix.debugDescription)"
+            )
+            XCTAssertEqual(state.mapping.omittedStructuralSeparatorCount, prefix.unicodeScalars.count)
+        }
+    }
+
+    func testKeyboardDocumentStateRejectsInconsistentStructuralMapping() throws {
+        let raw = "\n有效草稿"
+        let coordinateText = "有效草稿"
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: coordinateText.utf16.count, length: 0),
+            placeholderEvidence: AXPlaceholderEvidence(),
+            probe: prefixProbe(coordinateText)
+        )
+        let mapping = state.mapping
+        let forgedOffsets = mapping.rawBoundaryOffsets.enumerated().map { index, offset in
+            index == 0 ? 0 : offset
+        }
+        let forgedOffsetMapping = AXTextCoordinateMapping(
+            source: mapping.source,
+            rawDocumentLength: mapping.rawDocumentLength,
+            coordinateDocumentLength: mapping.coordinateDocumentLength,
+            omittedStructuralSeparatorCount: mapping.omittedStructuralSeparatorCount,
+            rawBoundaryOffsets: forgedOffsets,
+            rawPlaceholderRange: mapping.rawPlaceholderRange
+        )
+        let forgedSeparatorCountMapping = AXTextCoordinateMapping(
+            source: mapping.source,
+            rawDocumentLength: mapping.rawDocumentLength,
+            coordinateDocumentLength: mapping.coordinateDocumentLength,
+            omittedStructuralSeparatorCount: 0,
+            rawBoundaryOffsets: mapping.rawBoundaryOffsets,
+            rawPlaceholderRange: mapping.rawPlaceholderRange
+        )
+
+        for forgedMapping in [forgedOffsetMapping, forgedSeparatorCountMapping] {
+            let observed = KeyboardDocumentState(
+                text: state.text,
+                selection: state.selection,
+                rawText: state.rawText,
+                mapping: forgedMapping
+            )
+            XCTAssertEqual(
+                observed.compare(to: observed, allowingStructuralRawDifference: true),
+                .rawMappingUnavailable
+            )
+        }
+    }
+
+    func testKeyboardDocumentStateRejectsSurrogateBoundaryMapping() throws {
+        let raw = "😀\n好"
+        let coordinateText = "😀好"
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: coordinateText.utf16.count, length: 0),
+            placeholderEvidence: AXPlaceholderEvidence(),
+            probe: prefixProbe(coordinateText)
+        )
+        let invalidMapping = AXTextCoordinateMapping(
+            source: state.mapping.source,
+            rawDocumentLength: state.mapping.rawDocumentLength,
+            coordinateDocumentLength: state.mapping.coordinateDocumentLength,
+            omittedStructuralSeparatorCount: state.mapping.omittedStructuralSeparatorCount,
+            rawBoundaryOffsets: [0, 2, 3, 4],
+            rawPlaceholderRange: nil
+        )
+        let observed = KeyboardDocumentState(
+            text: state.text,
+            selection: state.selection,
+            rawText: state.rawText,
+            mapping: invalidMapping
+        )
+
+        XCTAssertEqual(
+            observed.compare(to: observed, allowingStructuralRawDifference: true),
+            .rawMappingUnavailable
+        )
+    }
+
     func testAXCoordinatesDoNotRemoveNewlinesWhenRangeReadIncludesThem() throws {
         let raw = "第一段\n\n第二段"
         let state = try AXTextDocumentResolver.resolve(

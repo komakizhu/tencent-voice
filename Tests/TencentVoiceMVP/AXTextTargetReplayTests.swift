@@ -719,6 +719,33 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
     }
 
+    func testRealAXReplayAcceptsLeadingStructuralSeparatorDuringRevision() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "\n草稿",
+            selection: .init(location: 2, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("新增草", revision: 1))
+        try await injector.finish(finalText: "新增草")
+        injector.apply(projection: projection("新增后", revision: 2))
+        try await injector.finish(finalText: "新增后")
+
+        XCTAssertEqual(access.rawText, "\n草稿新增后")
+        XCTAssertEqual(sender.selectionPosts, 1)
+        XCTAssertEqual(sender.replacementPosts, 1)
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+    }
+
     func testRealAXReplayKeepsAccessibilitySelectionInCoordinateSpace() async throws {
         let access = ReplayAXTextTargetAccess(
             text: "第一\n第二",
