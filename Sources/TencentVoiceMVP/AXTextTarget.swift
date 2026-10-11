@@ -84,6 +84,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
     private var keyboardGeneration: UInt64 = 0
     private var keyboardOperationGeneration: UInt64 = 0
     private var isCodexTarget = false
+    private var isSafariWebEditor = false
     private var targetElement: AXUIElement?
     private var targetProcessID: pid_t?
     private var targetApplicationProcessID: pid_t?
@@ -187,6 +188,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         let targetApplication = currentApplication()
         targetApplicationProcessID = targetApplication.map { pid_t($0.processIdentifier) }
         isCodexTarget = targetApplication?.bundleIdentifier == "com.openai.codex"
+        isSafariWebEditor = false
 
         // Some Electron/WebKit controls expose neither a stable AX value nor
         // a stable focused AX element while the DOM is being rebuilt. That is
@@ -196,7 +198,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         // Safari's ProseMirror editor advertises writable AX attributes but
         // may acknowledge an insertion without changing the DOM. Start with
         // the existing acknowledged keyboard path; never resend an AX write.
-        let isSafariWebEditor = targetApplication?.bundleIdentifier == "com.apple.Safari"
+        isSafariWebEditor = targetApplication?.bundleIdentifier == "com.apple.Safari"
             && (element.map { access.isProseMirrorEditor($0) } ?? false)
         targetElement = element
         if let element {
@@ -550,6 +552,12 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         guard generation == keyboardGeneration else { throw CancellationError() }
         try ensureTargetApplicationIsFrontmost()
         let element = try focusedElement()
+        if let targetElement, !CFEqual(element, targetElement) {
+            guard isSafariWebEditor else { throw TextTargetError.targetChanged }
+            try reacquireSafariTarget(element, phase: "\(phase)_before_read")
+        } else if targetElement == nil {
+            throw TextTargetError.targetChanged
+        }
         guard let targetElement, CFEqual(element, targetElement) else {
             throw TextTargetError.targetChanged
         }
@@ -560,7 +568,9 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
             try ensureTargetApplicationIsFrontmost()
             let afterElement = try focusedElement()
             guard CFEqual(afterElement, targetElement) else {
-                throw TextTargetError.targetChanged
+                guard isSafariWebEditor else { throw TextTargetError.targetChanged }
+                try reacquireSafariTarget(afterElement, phase: "\(phase)_after_read")
+                throw KeyboardWriteReadError.retryable
             }
             return state
         } catch KeyboardWriteReadError.retryable {
@@ -1051,9 +1061,42 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         guard let targetElement else { return }
         let currentElement = try focusedElement()
         guard CFEqual(currentElement, targetElement) else {
+            if isSafariWebEditor {
+                try reacquireSafariTarget(currentElement, phase: "identity_check")
+                guard let expectedState = currentConfirmedKeyboardState(),
+                      let currentState = try? keyboardDocumentState(in: currentElement),
+                      currentState.compare(
+                          to: expectedState,
+                          allowingStructuralRawDifference: false
+                      ) == .matched else {
+                    recordDiagnostic("safari_keyboard_target_reacquire_rejected", [
+                        "phase": "identity_check",
+                        "reason": "document_mismatch"
+                    ])
+                    throw TextTargetError.targetChanged
+                }
+                return
+            }
             recordDiagnostic("keyboard_focus_changed")
             throw TextTargetError.targetChanged
         }
+    }
+
+    private func reacquireSafariTarget(_ element: AXUIElement, phase: String) throws {
+        guard isSafariWebEditor,
+              access.isProseMirrorEditor(element) else {
+            recordDiagnostic("safari_keyboard_target_reacquire_rejected", [
+                "phase": phase,
+                "reason": "not_prose_mirror_editor"
+            ])
+            throw TextTargetError.targetChanged
+        }
+        targetElement = element
+        targetProcessID = access.processIdentifier(of: element) ?? targetProcessID
+        recordDiagnostic("safari_keyboard_target_reacquired", [
+            "phase": phase,
+            "targetApplicationUnchanged": "true"
+        ])
     }
 
     private func ensureKeyboardTargetIsSafe() throws {

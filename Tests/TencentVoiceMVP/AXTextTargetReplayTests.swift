@@ -37,6 +37,131 @@ final class AXTextTargetReplayTests: XCTestCase {
         }
     }
 
+    func testSafariProseMirrorReacquiresRebuiltAXElementWithoutResending() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "\n",
+            selection: .init(location: 0, length: 0),
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.proseMirror = true
+        access.coordinateIncludesStructuralSeparators = true
+        access.focusedElementRebuildsBeforeNextWrite = 1
+        access.focusedElementRebuildsAfterNextWrite = 1
+        access.readSnapshotsAfterNextWrite = [
+            .init(rawText: "\n", coordinateText: "\n", selection: .init(location: 0, length: 0)),
+            .init(rawText: "你好\n", coordinateText: "你好\n", selection: .init(location: 2, length: 0))
+        ]
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("你好", revision: 1))
+        try await injector.finish(finalText: "你好")
+
+        XCTAssertEqual(access.rawText, "你好\n")
+        XCTAssertEqual(sender.totalPosts, 1)
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+        XCTAssertTrue(injector.drainDiagnostics().contains { $0.event == "safari_keyboard_target_reacquired" })
+    }
+
+    func testSafariProseMirrorDoesNotResendAfterExternalEditDuringAcknowledgement() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "草稿",
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.proseMirror = true
+        access.readSnapshotsAfterNextWrite = [
+            .init(rawText: "用户编辑", coordinateText: "用户编辑", selection: .init(location: 4, length: 0))
+        ]
+        let sender = ReplayKeyboardEventSender(access: access)
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("草稿语音", revision: 1))
+        await finish(injector, finalText: "草稿语音", advancing: clock)
+
+        XCTAssertEqual(access.rawText, "用户编辑")
+        XCTAssertEqual(sender.totalPosts, 1)
+        XCTAssertEqual(injector.errorCount, 1)
+        XCTAssertEqual(injector.modeDescription, "disabled_after_error")
+        XCTAssertEqual(injector.degradationCode, "text_target_write_failed")
+    }
+
+    func testSafariProseMirrorReacquiresDuringTailReplacementWithoutResending() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "已有\n",
+            selection: .init(location: 2, length: 0),
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.proseMirror = true
+        access.selectionRangeIsSettable = true
+        access.coordinateIncludesStructuralSeparators = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("你好", revision: 1))
+        try await injector.finish(finalText: "你好")
+        XCTAssertEqual(access.rawText, "已有你好\n")
+
+        access.focusedElementRebuildsAfterNextWrite = 1
+        injector.apply(projection: projection("您好", revision: 2))
+        try await injector.finish(finalText: "您好")
+
+        XCTAssertEqual(access.rawText, "已有您好\n")
+        XCTAssertEqual(sender.totalPosts, 2)
+        XCTAssertEqual(sender.replacementPosts, 1)
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertTrue(injector.drainDiagnostics().contains { $0.event == "safari_keyboard_target_reacquired" })
+    }
+
+    func testSafariProseMirrorStopsWithoutResendingAfterApplicationSwitch() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "",
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.proseMirror = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("已有", revision: 1))
+        try await injector.finish(finalText: "已有")
+        let posts = sender.totalPosts
+
+        access.currentApplicationOverride = .init(
+            name: "Notes", bundleIdentifier: "com.apple.Notes", processIdentifier: 9002
+        )
+        injector.apply(projection: projection("已有继续", revision: 2))
+        try await injector.finish(finalText: "已有继续")
+
+        XCTAssertEqual(sender.totalPosts, posts)
+        XCTAssertEqual(injector.errorCount, 1)
+        XCTAssertEqual(injector.degradationCode, "text_target_changed")
+    }
+
     func testSafariNativeFieldKeepsAXReplacement() throws {
         let access = ReplayAXTextTargetAccess(
             text: "搜索", application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
@@ -898,6 +1023,7 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     let element = AXUIElementCreateApplication(9001)
     private let otherElement = AXUIElementCreateApplication(9002)
     let application: TextTargetApplication
+    var currentApplicationOverride: TextTargetApplication?
     var rawText: String
     var selection: ReplayTextRange
     var placeholderEvidenceValue: AXPlaceholderEvidence
@@ -911,6 +1037,11 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var textAttributesAreSettable = false
     private(set) var axTextWrites = 0
     var focusChanged = false
+    var focusedElementRebuildsBeforeNextWrite = 0
+    var focusedElementRebuildsAfterNextWrite = 0
+    private var focusedElementRebuildCount = 0
+    var readSnapshotsAfterNextWrite: [ReplayAXSnapshot] = []
+    var queuedTextReadSnapshots: [ReplayAXSnapshot] = []
     var coordinateIncludesStructuralSeparators = false
     var collapseStructuralSeparatorsAfterNextWrite = false
     var transitionRawOverride: String?
@@ -942,16 +1073,32 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     func requestInputPermissions() throws {
         if let permissionError { throw permissionError }
     }
-    func currentApplication() -> TextTargetApplication? { application }
+    func currentApplication() -> TextTargetApplication? { currentApplicationOverride ?? application }
 
     func focusedElement() throws -> AXUIElement {
-        focusChanged ? otherElement : element
+        if focusedElementRebuildsBeforeNextWrite > 0 {
+            focusedElementRebuildsBeforeNextWrite -= 1
+            return rebuiltElement
+        }
+        if focusedElementRebuildCount > 0 {
+            focusedElementRebuildCount -= 1
+            return rebuiltElement
+        }
+        return focusChanged ? otherElement : element
     }
+
+    private let rebuiltElement = AXUIElementCreateApplication(9003)
 
     func processIdentifier(of element: AXUIElement) -> pid_t? { 9001 }
 
     func text(in element: AXUIElement) throws -> String? {
         textReadCount += 1
+        if !queuedTextReadSnapshots.isEmpty {
+            let snapshot = queuedTextReadSnapshots.removeFirst()
+            rawText = snapshot.rawText
+            coordinateOverride = snapshot.coordinateText
+            selection = snapshot.selection
+        }
         if alwaysFailTextReads || failNextTextReads > 0 {
             if failNextTextReads > 0 { failNextTextReads -= 1 }
             throw KeyboardWriteReadError.retryable
@@ -992,7 +1139,9 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
             || (textAttributesAreSettable && [kAXSelectedTextAttribute as String, kAXValueAttribute as String].contains(attribute))
     }
 
-    func isProseMirrorEditor(_ element: AXUIElement) -> Bool { proseMirror }
+    func isProseMirrorEditor(_ element: AXUIElement) -> Bool {
+        proseMirror && !CFEqual(element, otherElement)
+    }
 
     func setSelection(_ range: ReplayTextRange, on element: AXUIElement) throws -> Int32 {
         selection = range
@@ -1070,6 +1219,13 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
         placeholderEvidenceValue = .init()
     }
 
+    func armPostWriteReplay() {
+        focusedElementRebuildCount = focusedElementRebuildsAfterNextWrite
+        focusedElementRebuildsAfterNextWrite = 0
+        queuedTextReadSnapshots = readSnapshotsAfterNextWrite
+        readSnapshotsAfterNextWrite.removeAll()
+    }
+
     private func rawRange(for range: ReplayTextRange) -> ReplayTextRange {
         if placeholderEvidenceValue != .init() {
             return .init(location: 0, length: rawText.utf16.count)
@@ -1136,11 +1292,13 @@ private final class ReplayKeyboardEventSender: AXTextTargetKeyboardEventSending 
         replacementPosts += 1
         access.applyReplacement(text, range: pendingSelection ?? access.selection)
         pendingSelection = nil
+        access.armPostWriteReplay()
     }
 
     func send(_ text: String, processID: pid_t?) throws {
         appendPosts += 1
         access.applyAppend(text)
+        access.armPostWriteReplay()
     }
 
     func replaceTrailingText(_ previousText: String, with text: String, processID: pid_t?) throws {
@@ -1151,5 +1309,6 @@ private final class ReplayKeyboardEventSender: AXTextTargetKeyboardEventSending 
         )
         replacementPosts += 1
         access.applyReplacement(text, range: range)
+        access.armPostWriteReplay()
     }
 }

@@ -13,7 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let coordinator: SessionCoordinator
     private let sessionLogger: SessionLogger
     private let failureContext = InputFailureContextRecorder()
-    private var failureReportTask: Task<Void, Never>?
+    private var failureReportTasks: [UUID: Task<Void, Never>] = [:]
     private var failureContextMainMenuItem: NSMenuItem?
     private let failureContextDefaults = UserDefaults(suiteName: "local.tencent.voice.mvp") ?? .standard
     private let localUsageStore: LocalUsageStore
@@ -245,6 +245,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         failureContext.stop()
+        failureReportTasks.values.forEach { $0.cancel() }
+        failureReportTasks.removeAll()
         nativeF5MonitorTask?.cancel()
         usageMonitorTask?.cancel()
         rimeThemeSelectionTask?.cancel()
@@ -476,7 +478,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func reportInputFailure() {
-        guard failureReportTask == nil else { return }
         let now = Date()
         let context = failureContext.snapshot(at: now)
         sessionLogger.recordDiagnosticAction("input_failure_report_requested", fields: [
@@ -492,8 +493,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .appendingPathComponent("input-failure-reports", isDirectory: true)
         let destination = directory.appendingPathComponent("InputFailure-\(report.id.uuidString).json")
         menu.update(failureReportResult: "正在保存失效报告…")
-        failureReportTask = Task { @MainActor [weak self] in
-            defer { self?.failureReportTask = nil }
+        failureReportTasks[report.id] = Task { @MainActor [weak self] in
+            defer { self?.failureReportTasks.removeValue(forKey: report.id) }
             do {
                 try await Task.detached(priority: .utility) {
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

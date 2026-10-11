@@ -4,17 +4,17 @@
 
 用户最新指示：在 App 内记录故障前一分钟，重点观察 Codex；并先修复已明确的 Safari ChatGPT 不上屏问题。已实现 Safari ProseMirror 的键盘输入分流与 App 内故障场记。Codex 和微信上屏逻辑保持原样；后续根据用户报告做 RCA。此前每小时的外部检查已暂停。
 
-独立分支：`codex/task-20261010`。工作目录：`/Users/mac2/.codex/worktrees/task-20261010/Rime+腾讯语音+自适应词库`。基线测试 416 个通过；修改后全量测试 423 个通过。Safari 组完整构建 Build113；故障场记组完整构建 Build114，签名验证、Info.plist 校验及可执行文件检查均通过。用户随后要求提交；App 尚未安装替换正在运行的版本。
+独立分支：`codex/task-20261010`。工作目录：`/Users/mac2/.codex/worktrees/task-20261010/Rime+腾讯语音+自适应词库`。基线测试 416 个通过；修改后全量测试 423 个通过。Safari 组完整构建 Build113；故障场记组完整构建 Build114；重复报告保存修复后完整构建 Build115，签名验证、Info.plist 校验及可执行文件检查均通过。用户随后要求提交；App 尚未安装替换正在运行的版本。
 
 ## App 内使用
 
-运行 `dist/Rime Voice Build114.app`。菜单中先开启“记录 Codex 故障前一分钟操作”（默认关闭，独立保存启用选择）；遇到问题立即点“报告输入失效”，再点“打开失效报告目录”。隐藏状态栏图标时，应用主菜单也有相同入口。报告位于 `~/Library/Application Support/TencentVoiceMVP/input-failure-reports/InputFailure-<UUID>.json`，不会自动上传。
+运行 `dist/Rime Voice Build115.app`。菜单中先开启“记录 Codex 故障前一分钟操作”（默认关闭，独立保存启用选择）；遇到问题立即点“报告输入失效”，再点“打开失效报告目录”。每次点击都会生成新的 UUID 文件并独立保存，连续点击会保留每一份，不会刷新或覆盖上一次；隐藏状态栏图标时，应用主菜单也有相同入口。报告位于 `~/Library/Application Support/TencentVoiceMVP/input-failure-reports/InputFailure-<UUID>.json`，不会自动上传。
 
 桌面记录为内存滚动缓冲：前台应用变化、点击及坐标、滚动、Codex 已知导航/剪贴板快捷键（包含 Command+Option+N）、不含字符的键盘活动标记。每 500ms 在独立后台队列只读查询 Codex AX 焦点和窗口身份、角色、选择范围、可用时的字符数量；不会读窗口标题或 AXValue，不采集普通打字内容、录音、截图或剪贴板。安全输入启用时不记录键盘活动。关闭记录清空缓冲。
 
 报告包含精确请求的一分钟时间范围、实际启用起点、当前权限/监视器状态、截断计数，以及同一分钟的现有输入诊断事件。输入日志即使没有开启磁盘持久化，也会在启用场记后保留最多 12000 条相关内存事件；桌面缓冲最多 2000 条。截断或未启用记录时会明确标记。500ms AX 采样可能错过更短的焦点变化，权限不足或安全输入会限制可见事件；没有事件不等于操作未发生。
 
-Safari 修复只针对 Safari 内 AXTextArea 且 DOM class 包含 ProseMirror 的编辑器：避开返回成功却未上屏的 AX 文本写入，复用既有键盘输入及回执校验。Safari 原生输入框仍走原 AX 路径。真实 Safari 语音验收尚待用户运行新版；没有自动激活 Safari 或向用户草稿注入测试文本。
+Safari 修复只针对 Safari 内 AXTextArea 且 DOM class 包含 ProseMirror 的编辑器：避开返回成功却未上屏的 AX 文本写入，复用既有键盘输入及回执校验。Safari 原生输入框仍走原 AX 路径。Build115 的真实报告确认该分流已生效（`safariWebEditor=true`、`keyboardCompatibility=true`），但键盘路径在连续输入中仍可能出现 `text_target_changed` 回执失败，详见后续报告；没有自动激活 Safari 或向用户草稿注入测试文本。
 
 ## 监控方式
 
@@ -53,3 +53,9 @@ Safari 避开 AX 假成功写入的修复已实现。只读确认 Safari 的 AXS
 ## 后续故障记录
 
 由本聊天的定期后台检查或用户报告触发分析后追加。
+
+- 2026-10-10 14:56:22（UTC 06:56:22），报告 `InputFailure-12213862-1612-4A47-AC1F-38B373E57FEA.json`，来源 Build114，已保存在 `~/Library/Application Support/TencentVoiceMVP/input-failure-reports/`，前一份报告仍保留。报告覆盖 14:55:22–14:56:22；桌面场记无丢弃事件，未记录普通输入文字、截图或安全输入内容，但这一分钟只有 5 条桌面事件。
+- Safari 会话 `1FEADE0A-E5C9-4B4E-B100-783973EE62D1`（14:55:22.646–14:55:40.512）：105 次输入操作均确认，无失败码。
+- Safari 会话 `5D097E95-6F40-43F9-8CCD-3378A22F5124`（14:55:45.813–14:56:15.136）：初始目标识别为 Safari ProseMirror 编辑器，AX 可读可写、键盘兼容；前 22 次操作确认。14:55:51.513（UTC 06:55:51.513）第 23 次操作未确认，失败码 `text_target_write_failed`，随后进入 safe_copy；14:55:51.823 记录 safe_copy。现有报告能确认是写入回执失败，不能仅凭场记确定具体鼠标动作或 DOM 变化原因。
+- 2026-10-10 14:57:56（UTC 06:57:56），报告 `InputFailure-6A6D5A97-C151-452B-911C-49C26576B070.json`，来源 Build115，已独立保存在同一目录；当前共 3 份报告，均未覆盖。报告覆盖 14:56:56–14:57:56，桌面场记 21 条、丢弃 0 条；记录到 Finder、Codex 与 Safari 的切换，但 Safari 的 AX 焦点细节仍由输入诊断事件记录。
+- Safari 会话 `565CE78A-30D3-401D-A781-8FB7A11F0C31`（14:57:27.926–14:57:50.406）：初始目标为 Safari ProseMirror 编辑器，`safariWebEditor=true`、`keyboardCompatibility=true`，前 23 次操作确认。14:57:35.623（UTC 06:57:35.623）第 24 次操作未确认，失败码 `text_target_changed`，随后进入 safe_copy；这说明 Build115 已进入预期的 Safari 键盘分流，但连续输入期间目标回执仍会失效，尚不能认为 Safari 问题已解决。
