@@ -476,6 +476,7 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
             "selectedRangeNonEmpty", "localDispatchCompleted", "targetCompletionConfirmed",
             "phase", "expectedDocumentLength", "actualDocumentLength",
             "axAttribute", "axStatus", "readAttempts", "elapsedMilliseconds",
+            "expectedSelectionLocation", "expectedSelectionLength", "actualSelectionLocation", "actualSelectionLength",
             "plannedKeyboardEventCount", "postedKeyboardEventCount", "unicodeBlockCount",
             "shiftKeyEventCount", "unicodeKeyEventCount", "deleteKeyEventCount",
             "failureCode", "failureOccurredAt", "degradationRecordedAt",

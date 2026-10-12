@@ -2,6 +2,11 @@ import ApplicationServices
 import AppKit
 import Foundation
 
+struct AXAttributeReadFailure: Error {
+    let attribute: String
+    let status: Int32
+}
+
 private enum KeyboardDocumentStateReadError: Error {
     case retryable
     case unavailable
@@ -713,7 +718,12 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         } catch {
             let evidence: [String: String] = [
                 "elapsedMilliseconds": String((writeTiming.now() - start) / 1_000_000),
-                "readAttempts": String(readAttempts)
+                "readAttempts": String(readAttempts),
+                "expectedDocumentLength": String(receipt.text.utf16.count),
+                "expectedSelectionLocation": String(receipt.selection.location),
+                "expectedSelectionLength": String(receipt.selection.length),
+                "actualSelectionLocation": String(lastObservedState?.selection.location ?? -1),
+                "actualSelectionLength": String(lastObservedState?.selection.length ?? -1)
             ]
             recordDiagnostic(
                 "keyboard_write_unconfirmed",
@@ -1008,6 +1018,21 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
     }
 
     private func keyboardDocumentState(in element: AXUIElement, confirming: Bool = false) throws -> KeyboardDocumentState {
+        do {
+            return try readKeyboardDocumentState(in: element, confirming: confirming)
+        } catch let failure as AXAttributeReadFailure {
+            // Safari can briefly return kAXErrorFailure while publishing its
+            // web editor AX snapshot. Retry the read within the existing deadline;
+            // a fresh matching document and selection are still required.
+            if isSafariWebEditor, failure.status == AXError.failure.rawValue,
+               [kAXValueAttribute as String, kAXSelectedTextRangeAttribute as String].contains(failure.attribute) {
+                throw KeyboardWriteReadError.retryable
+            }
+            throw TextTargetError.writeFailed
+        }
+    }
+
+    private func readKeyboardDocumentState(in element: AXUIElement, confirming: Bool) throws -> KeyboardDocumentState {
         guard let rawText = try access.text(in: element),
               let selection = try access.selection(in: element) else {
             throw KeyboardDocumentStateReadError.unavailable
@@ -1742,6 +1767,8 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
             throw TextTargetError.unsupported
         case .cannotComplete:
             throw KeyboardWriteReadError.retryable
+        case .failure where [kAXValueAttribute as String, kAXSelectedTextRangeAttribute as String].contains(name):
+            throw AXAttributeReadFailure(attribute: name, status: status.rawValue)
         default:
             throw TextTargetError.writeFailed
         }
