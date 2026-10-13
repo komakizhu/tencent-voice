@@ -102,6 +102,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
     private let writeTiming: AXTextTargetWriteTiming
     private let preflightTimeoutNanoseconds: UInt64
     private let acknowledgementTimeoutNanoseconds: UInt64
+    private let evidenceObserver: ((TextInputDiagnostic, AXUIElement?, pid_t?) -> Void)?
     private var diagnostics: [TextInputDiagnostic] = []
     private var droppedDiagnosticCount = 0
     private var diagnosticOperationContext: TextInputDiagnosticContext?
@@ -113,12 +114,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
 
     init(
         operationObserver: ((String) -> Void)? = nil,
+        evidenceObserver: ((TextInputDiagnostic, AXUIElement?, pid_t?) -> Void)? = nil,
         access: (any AXTextTargetAccess)? = nil,
         keyboardEventSender: (any AXTextTargetKeyboardEventSending)? = nil,
         writeTiming: AXTextTargetWriteTiming = .init(),
         preflightTimeoutNanoseconds: UInt64 = 5_000_000_000,
         acknowledgementTimeoutNanoseconds: UInt64 = 5_000_000_000
     ) {
+        self.evidenceObserver = evidenceObserver
         self.access = access ?? SystemAXTextTargetAccess()
         self.keyboardEventSender = keyboardEventSender
             ?? KeyboardEventSender(stageObserver: operationObserver)
@@ -156,13 +159,17 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         _ fields: [String: String] = [:],
         context: TextInputDiagnosticContext? = nil
     ) {
+        var merged = (context ?? diagnosticOperationContext)?.fields ?? [:]
+        merged.merge(fields) { _, new in new }
+        merged["inputSessionGeneration"] = String(keyboardGeneration)
+        merged["keyboardOperationGeneration"] = String(keyboardOperationGeneration)
+        let diagnostic = TextInputDiagnostic(timestamp: Date(), event: event, fields: merged)
+        evidenceObserver?(diagnostic, targetElement, targetApplicationProcessID ?? targetProcessID)
         guard diagnostics.count < 64 else {
             droppedDiagnosticCount += 1
             return
         }
-        var merged = (context ?? diagnosticOperationContext)?.fields ?? [:]
-        merged.merge(fields) { _, new in new }
-        diagnostics.append(TextInputDiagnostic(timestamp: Date(), event: event, fields: merged))
+        diagnostics.append(diagnostic)
     }
 
     func currentApplication() -> TextTargetApplication? {
@@ -1021,11 +1028,22 @@ final class AXTextTarget: KeyboardAcknowledgingTarget {
         do {
             return try readKeyboardDocumentState(in: element, confirming: confirming)
         } catch let failure as AXAttributeReadFailure {
-            // Safari can briefly return kAXErrorFailure while publishing its
-            // web editor AX snapshot. Retry the read within the existing deadline;
-            // a fresh matching document and selection are still required.
-            if isSafariWebEditor, failure.status == AXError.failure.rawValue,
+            // kAXErrorInvalidUIElement is -25202: the AX handle is stale,
+            // even when the focus read still returned the same handle. Obtain
+            // the focused editor again, then let the bounded read loop confirm
+            // its full document and caret. Never resend the pending write.
+            if isSafariWebEditor, failure.status == AXError.invalidUIElement.rawValue,
                [kAXValueAttribute as String, kAXSelectedTextRangeAttribute as String].contains(failure.attribute) {
+                try ensureTargetApplicationIsFrontmost()
+                let focused = try focusedElement()
+                if !CFEqual(focused, element) {
+                    try reacquireSafariTarget(focused, phase: "invalid_element_read")
+                }
+                recordDiagnostic("safari_keyboard_invalid_element_retry", [
+                    "axAttribute": failure.attribute,
+                    "axStatus": String(failure.status),
+                    "elementSame": String(CFEqual(focused, element))
+                ])
                 throw KeyboardWriteReadError.retryable
             }
             throw TextTargetError.writeFailed
@@ -1767,7 +1785,7 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
             throw TextTargetError.unsupported
         case .cannotComplete:
             throw KeyboardWriteReadError.retryable
-        case .failure where [kAXValueAttribute as String, kAXSelectedTextRangeAttribute as String].contains(name):
+        case .invalidUIElement where [kAXValueAttribute as String, kAXSelectedTextRangeAttribute as String].contains(name):
             throw AXAttributeReadFailure(attribute: name, status: status.rawValue)
         default:
             throw TextTargetError.writeFailed

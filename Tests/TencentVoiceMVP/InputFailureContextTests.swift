@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import XCTest
 @testable import TencentVoiceMVP
 
@@ -18,6 +19,29 @@ final class InputFailureContextTests: XCTestCase {
         XCTAssertTrue(buffer.events.isEmpty)
     }
 
+    func testFrozenFailureSurvivesLateReportAndClearsWhenDisabled() {
+        let start = Date(timeIntervalSince1970: 1000)
+        var buffer = InputContextBuffer()
+        buffer.start(at: start)
+        buffer.append(.init(timestamp: start, event: "capture", fields: ["documentLength": "81"]), now: start)
+        let failure = start.addingTimeInterval(5)
+        buffer.append(.init(timestamp: failure, event: "keyboard_write_unconfirmed", fields: ["operationID": "1"]), now: failure)
+        buffer.freezeFailure(at: failure)
+        XCTAssertEqual(buffer.latestFailure?.collectionStatus["failureProbeStatus"], "pending")
+        buffer.appendFailureProbe(.init(timestamp: failure.addingTimeInterval(1), event: "input_editor_probe", fields: ["targetID": "2"]), failureAt: failure)
+        XCTAssertEqual(buffer.latestFailure?.collectionStatus["failureProbeStatus"], "completed")
+        XCTAssertTrue(buffer.snapshot(at: start.addingTimeInterval(600)).events.isEmpty)
+        XCTAssertEqual(buffer.latestFailure?.events.map(\.event), ["capture", "keyboard_write_unconfirmed", "input_editor_probe"])
+        let nextFailure = start.addingTimeInterval(601)
+        buffer.freezeFailure(at: nextFailure)
+        buffer.appendFailureProbe(.init(timestamp: failure, event: "stale_probe", fields: [:]), failureAt: failure)
+        XCTAssertFalse(buffer.latestFailure?.events.contains { $0.event == "stale_probe" } ?? true)
+        buffer.stop()
+        XCTAssertNil(buffer.latestFailure)
+        buffer.freezeFailure(at: nextFailure)
+        XCTAssertNil(buffer.latestFailure)
+    }
+
     func testOverflowAndShortCoverageAreVisibleAndExpire() {
         let start = Date(timeIntervalSince1970: 1000)
         var buffer = InputContextBuffer(capacity: 2)
@@ -32,6 +56,112 @@ final class InputFailureContextTests: XCTestCase {
         XCTAssertEqual(report.events.map(\.event), ["1", "2"])
         XCTAssertEqual(buffer.snapshot(at: start.addingTimeInterval(63)).droppedEventCount, 0)
         XCTAssertTrue(buffer.events.isEmpty)
+    }
+
+    func testFrozenEvidenceRoundTripsWithoutPersistingText() throws {
+        let now = Date(timeIntervalSince1970: 1000)
+        var buffer = InputContextBuffer()
+        buffer.start(at: now)
+        buffer.append(.init(timestamp: now, event: "keyboard_write_unconfirmed",
+            fields: DiagnosticLogSanitizer.fields(["documentLength": "81", "text": "私密草稿"])), now: now)
+        buffer.freezeFailure(at: now)
+        let evidence = InputFailureEvidence(desktopContext: try XCTUnwrap(buffer.latestFailure),
+            diagnosticEvents: [], diagnosticEventsTruncated: false)
+        let data = try DiagnosticJSON.encoder().encode(evidence)
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("私密草稿"))
+        let decoded = try DiagnosticJSON.decoder().decode(InputFailureEvidence.self, from: data)
+        XCTAssertEqual(decoded.desktopContext.events.first?.fields["documentLength"], "81")
+        XCTAssertEqual(decoded.desktopContext.collectionStatus["failureProbeStatus"], "pending")
+    }
+
+    func testProbeSeparatesReportedFocusFromAnotherEditorThatActuallyClaimsFocus() throws {
+        let window = AXUIElementCreateApplication(9102)
+        let draft = AXUIElementCreateApplication(9103)
+        let sidebar = AXUIElementCreateApplication(9104)
+        let probe = InputContextAXProbe(isTrusted: { true }, secureInputActive: { false }, readAttribute: { name, node in
+            switch name {
+            case "AXFocusedWindow": return (.success, window)
+            case "AXFocusedUIElement": return (.success, draft)
+            case "AXChildren": return (.success, (CFEqual(node, window) ? [draft, sidebar] : []) as CFArray)
+            case "AXRole": return (.success, (CFEqual(node, window) ? "AXWindow" : "AXTextArea") as CFString)
+            case "AXSubrole": return (.success, "" as CFString)
+            case "AXFocused": return (.success, NSNumber(value: CFEqual(node, sidebar)))
+            case "AXValue": return (.success, (CFEqual(node, sidebar) ? "甲" : String(repeating: "私", count: 81)) as CFString)
+            case "AXNumberOfCharacters": return (.success, NSNumber(value: CFEqual(node, sidebar) ? 1 : 81))
+            case "AXSelectedTextRange":
+                var range = CFRange(location: CFEqual(node, sidebar) ? 1 : 81, length: 0)
+                return (.success, AXValueCreate(.cfRange, &range))
+            default: return (.noValue, nil)
+            }
+        })
+        let sample = probe.sample(pid: 9101, target: draft, includeEditors: true)
+        XCTAssertEqual(sample["targetMatchesSystemFocus"], "true")
+        XCTAssertEqual(sample["target.axValueLengthUTF16"], "81")
+        XCTAssertEqual(sample["target.AXFocused"], "0")
+        XCTAssertEqual(sample["editorCount"], "2")
+        XCTAssertEqual(sample["editor0.AXFocused"], "1")
+        XCTAssertEqual(sample["editor0.axValueLengthUTF16"], "1")
+        XCTAssertNotEqual(sample["editor0.elementID"], sample["targetID"])
+        XCTAssertEqual(sample["editorTraversalTruncated"], "false")
+        let next = probe.sample(pid: 9101, target: draft, includeEditors: true)
+        XCTAssertEqual(next["editor0.elementID"], sample["editor0.elementID"])
+        XCTAssertEqual(next["targetID"], sample["targetID"])
+        let encoded = try JSONSerialization.data(withJSONObject: sample)
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("私私"))
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("甲"))
+    }
+
+    func testProbeSkipsSecureBodyAndPreservesExactReadError() {
+        let field = AXUIElementCreateApplication(9201)
+        var reads: [String] = []
+        let probe = InputContextAXProbe(isTrusted: { true }, secureInputActive: { false }, readAttribute: { name, _ in
+            reads.append(name)
+            switch name {
+            case "AXFocusedUIElement": return (.success, field)
+            case "AXRole": return (.success, "AXTextField" as CFString)
+            case "AXSubrole": return (.success, "AXSecureTextField" as CFString)
+            case "AXFocusedWindow": return (.invalidUIElement, nil)
+            default: return (.noValue, nil)
+            }
+        })
+        let sample = probe.sample(pid: 9201, includeEditors: true)
+        XCTAssertFalse(reads.contains("AXValue"))
+        XCTAssertFalse(reads.contains("AXSelectedTextRange"))
+        XCTAssertTrue(sample.values.contains("-25202"))
+    }
+
+    func testEditorWalkReachesDeepComposerBeforeLongConversationConsumesBudget() {
+        var walk = InputContextEditorWalk(root: 0)
+        var foundComposer = false
+        while let node = walk.next(children: { node in
+            if node < 20 { return [node + 1] }
+            if node == 20 { return Array(100...500) + [999] }
+            return []
+        }) {
+            if node == 999 { foundComposer = true }
+        }
+        XCTAssertTrue(foundComposer, "Codex exposes the composer below deep containers, after conversation content")
+        XCTAssertLessThanOrEqual(walk.visitedCount, 160)
+        XCTAssertTrue(walk.truncated)
+    }
+
+    func testEditorWalkFindsSiblingInputsAndBoundsWideAndDeepTrees() {
+        let children = [0: [1, 2], 1: [3], 2: [4], 3: [], 4: []]
+        var walk = InputContextEditorWalk(root: 0)
+        var nodes: [Int] = []
+        while let node = walk.next(children: { children[$0] ?? [] }) { nodes.append(node) }
+        XCTAssertEqual(nodes, [0, 2, 4, 1, 3])
+        XCTAssertFalse(walk.truncated)
+        var wide = InputContextEditorWalk(root: 0, nodeLimit: 3)
+        var wideNodes: [Int] = []
+        while let node = wide.next(children: { $0 == 0 ? Array(1...1000) : [] }) { wideNodes.append(node) }
+        XCTAssertEqual(wideNodes, [0, 1000, 999])
+        XCTAssertTrue(wide.truncated)
+        var deep = InputContextEditorWalk(root: 0, depthLimit: 2)
+        var deepNodes: [Int] = []
+        while let node = deep.next(children: { [$0 + 1] }) { deepNodes.append(node) }
+        XCTAssertEqual(deepNodes, [0, 1, 2])
+        XCTAssertTrue(deep.truncated)
     }
 
     func testKeyFilterRecordsForkWithoutOrdinaryOrUnknownModifiedTyping() {
@@ -61,6 +191,7 @@ final class InputFailureContextTests: XCTestCase {
 
     @MainActor
     func testReportMenuInvokesCallbacksAndShowsRecorderState() throws {
+        _ = NSApplication.shared
         let menuController = StatusMenuController()
         let menu = menuController.makeMenu()
         var toggles = 0
