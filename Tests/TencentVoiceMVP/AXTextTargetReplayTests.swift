@@ -6,6 +6,476 @@ private typealias ReplayTextRange = TencentVoiceMVP.TextRange
 
 @MainActor
 final class AXTextTargetReplayTests: XCTestCase {
+    func testCodexReportShapedEmptyParagraphStatesContinueAfterFirstCharacter() async throws {
+        let cases = [
+            (prefixLength: 341, emptyParagraphCount: 3),
+            (prefixLength: 340, emptyParagraphCount: 4),
+            (prefixLength: 336, emptyParagraphCount: 8)
+        ]
+
+        for testCase in cases {
+            let prefix = String(repeating: "甲", count: testCase.prefixLength)
+            let before = prefix + String(repeating: "\n", count: testCase.emptyParagraphCount)
+            let insertionOffset = 342 - testCase.prefixLength
+            let afterFirst = prefix
+                + String(repeating: "\n", count: insertionOffset)
+                + "乙"
+                + String(repeating: "\n", count: testCase.emptyParagraphCount - insertionOffset - 1)
+            let afterAppend = prefix
+                + String(repeating: "\n", count: insertionOffset)
+                + "乙丙"
+            let afterRevision = prefix
+                + String(repeating: "\n", count: insertionOffset)
+                + "乙丁"
+
+            XCTAssertEqual(before.utf16.count, 344)
+            XCTAssertEqual(afterFirst.utf16.count, 344)
+            XCTAssertEqual(afterFirst.utf16.count, before.utf16.count)
+
+            let access = ReplayAXTextTargetAccess(
+                text: before,
+                selection: .init(location: 342, length: 0),
+                application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+            )
+            access.coordinateOverride = before
+            access.writeSnapshots = [
+                .init(rawText: afterFirst, coordinateText: afterFirst, selection: .init(location: 343, length: 0)),
+                .init(rawText: afterAppend, coordinateText: afterAppend, selection: .init(location: 344, length: 0)),
+                .init(rawText: afterRevision, coordinateText: afterRevision, selection: .init(location: 344, length: 0))
+            ]
+            let sender = ReplayKeyboardEventSender(access: access)
+            let target = AXTextTarget(access: access, keyboardEventSender: sender,
+                acknowledgementTimeoutNanoseconds: 20_000_000)
+
+            _ = try target.capture()
+            try target.paste("乙")
+            try await target.acknowledgeKeyboardWrite()
+            try target.paste("丙")
+            try await target.acknowledgeKeyboardWrite()
+            try target.replaceTrailingText("乙丙", with: "乙丁")
+            try await target.acknowledgeKeyboardWrite()
+
+            XCTAssertEqual(access.rawText, afterRevision)
+            XCTAssertEqual(access.selection, .init(location: 344, length: 0))
+            XCTAssertEqual(sender.appendPosts, 2)
+            XCTAssertEqual(sender.replacementPosts, 1)
+            XCTAssertFalse(target.drainDiagnostics().contains { $0.event == "keyboard_write_unconfirmed" })
+        }
+    }
+
+    func testCodexTrailingEmptyParagraphCandidatesCoverEachInsertionPosition() async throws {
+        let prefix = "草稿"
+        let emptyParagraphCount = 4
+
+        for insertionOffset in 0..<emptyParagraphCount {
+            let before = prefix + String(repeating: "\n", count: emptyParagraphCount)
+            let after = prefix
+                + String(repeating: "\n", count: insertionOffset)
+                + "甲"
+                + String(repeating: "\n", count: emptyParagraphCount - insertionOffset - 1)
+            let insertionLocation = prefix.utf16.count + insertionOffset
+            let access = ReplayAXTextTargetAccess(
+                text: before,
+                selection: .init(location: insertionLocation, length: 0),
+                application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+            )
+            access.coordinateOverride = before
+            access.writeSnapshots = [
+                .init(
+                    rawText: after,
+                    coordinateText: after,
+                    selection: .init(location: insertionLocation + 1, length: 0)
+                )
+            ]
+            let sender = ReplayKeyboardEventSender(access: access)
+            let target = AXTextTarget(
+                access: access,
+                keyboardEventSender: sender,
+                acknowledgementTimeoutNanoseconds: 20_000_000
+            )
+
+            _ = try target.capture()
+            try target.paste("甲")
+            try await target.acknowledgeKeyboardWrite()
+
+            XCTAssertEqual(access.rawText, after, "failed at trailing insertion offset \(insertionOffset)")
+            XCTAssertEqual(access.selection, .init(location: insertionLocation + 1, length: 0))
+            XCTAssertEqual(sender.totalPosts, 1)
+            let diagnostics = target.drainDiagnostics()
+            XCTAssertFalse(diagnostics.contains { $0.event == "keyboard_write_unconfirmed" })
+            let acknowledgement = try XCTUnwrap(diagnostics.first { $0.event == "keyboard_write_acknowledged" })
+            let expectedClass: String = switch insertionOffset {
+            case 0: "first_trailing_newline"
+            case emptyParagraphCount - 1: "last_trailing_newline"
+            case emptyParagraphCount - 2: "second_last_trailing_newline"
+            default: "middle_trailing_newline"
+            }
+            XCTAssertEqual(acknowledgement.fields["ackInsertionPositionClass"], expectedClass)
+        }
+    }
+
+    func testCodexReport81To82CanComeFromEitherWrongEditorOrStaleAXState() async throws {
+        var failures: [[String: String]] = []
+        for capturedWrongEditor in [true, false] {
+            let original = String(repeating: "甲", count: 81)
+            let access = ReplayAXTextTargetAccess(text: original,
+                application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001))
+            var visibleCapturedEditor = original
+            var visibleOtherEditor = ""
+            let sender = ReplayKeyboardEventSender(access: access)
+            sender.appendOverride = { text in
+                if capturedWrongEditor { visibleOtherEditor += text }
+                else { visibleCapturedEditor += text }
+            }
+            var now: UInt64 = 0
+            let target = AXTextTarget(access: access, keyboardEventSender: sender,
+                writeTiming: .init(now: { now }, sleep: { now += $0 }),
+                acknowledgementTimeoutNanoseconds: 5_000_000_000)
+            _ = try target.capture()
+            try target.paste("乙")
+            do {
+                try await target.acknowledgeKeyboardWrite()
+                XCTFail("Stale readback must not be accepted or trigger another send")
+            } catch { }
+            let failed = try XCTUnwrap(target.drainDiagnostics().first { $0.event == "keyboard_write_unconfirmed" })
+            XCTAssertEqual(failed.fields["expectedDocumentLength"], "82")
+            XCTAssertEqual(failed.fields["observedLengthUTF16"], "81")
+            XCTAssertEqual(failed.fields["expectedSelectionLocation"], "82")
+            XCTAssertEqual(failed.fields["actualSelectionLocation"], "81")
+            XCTAssertEqual(failed.fields["comparison"], "documentMismatch")
+            XCTAssertEqual(sender.totalPosts, 1)
+            XCTAssertEqual(visibleCapturedEditor, capturedWrongEditor ? original : original + "乙")
+            XCTAssertEqual(visibleOtherEditor, capturedWrongEditor ? "乙" : "")
+            failures.append(failed.fields)
+        }
+        XCTAssertEqual(failures[0], failures[1], "Existing reports cannot distinguish these two independently reproduced causes")
+    }
+
+    func testEvidenceObserverCorrelatesCaptureDispatchAndFailureWithoutResendingOrText() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "私密草稿", application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.proseMirror = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        var evidence: [TextInputDiagnostic] = []
+        var targetPresent = false
+        let target = AXTextTarget(evidenceObserver: { diagnostic, element, pid in
+            evidence.append(diagnostic)
+            targetPresent = element != nil
+            XCTAssertEqual(pid, 9001)
+        }, access: access, keyboardEventSender: sender)
+        _ = try target.capture()
+        try target.paste("机密输入")
+        access.nextTextReadError = TextTargetError.writeFailed
+        do {
+            try await target.acknowledgeKeyboardWrite()
+            XCTFail("Unreadable confirmation must still stop")
+        } catch { XCTAssertEqual(error as? TextTargetError, .writeFailed) }
+        let captured = try XCTUnwrap(evidence.first { $0.event == "input_target_captured" })
+        let submitted = try XCTUnwrap(evidence.first { $0.event == "keyboard_write_submitted" })
+        let failed = try XCTUnwrap(evidence.first { $0.event == "keyboard_write_unconfirmed" })
+        XCTAssertEqual(captured.fields["inputSessionGeneration"], failed.fields["inputSessionGeneration"])
+        XCTAssertEqual(submitted.fields["keyboardOperationGeneration"], failed.fields["keyboardOperationGeneration"])
+        XCTAssertEqual(failed.fields["keyboardOperationGeneration"], "1")
+        XCTAssertTrue(targetPresent)
+        XCTAssertEqual(sender.totalPosts, 1)
+        XCTAssertFalse(evidence.flatMap { $0.fields.values }.contains { $0.contains("私密草稿") || $0.contains("机密输入") })
+    }
+
+    func testRealAXReplayContinuesAfterCodexRemovesFinalEmptyParagraphOnFirstCharacter() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "\n", selection: .init(location: 0, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.coordinateIncludesStructuralSeparators = true
+        access.writeSnapshots = [
+            .init(rawText: "甲", coordinateText: "甲", selection: .init(location: 1, length: 0)),
+            .init(rawText: "甲乙", coordinateText: "甲乙", selection: .init(location: 2, length: 0))
+        ]
+        let sender = ReplayKeyboardEventSender(access: access)
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target, pacingClock: clock)
+
+        try injector.begin()
+        injector.apply(projection: projection("甲", revision: 1))
+        await finish(injector, finalText: "甲", advancing: clock)
+        injector.apply(projection: projection("甲乙", revision: 2))
+        await finish(injector, finalText: "甲乙", advancing: clock)
+
+        XCTAssertEqual(access.rawText, "甲乙")
+        XCTAssertEqual(access.coordinateText, "甲乙")
+        XCTAssertEqual(access.selection, .init(location: 2, length: 0))
+        XCTAssertEqual(sender.appendPosts, 2, "each character growth is posted once")
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+        XCTAssertTrue(injector.drainDiagnostics().contains {
+            $0.event == "keyboard_write_acknowledged"
+                && $0.fields["receiptRepresentationTransition"] == "trailing_newline_collapsed"
+        })
+    }
+
+    func testDiagnosticReportsImmediateReadFailureWithoutChangingRetryPolicy() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "\n", selection: .init(location: 0, length: 0),
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.proseMirror = true
+        access.coordinateIncludesStructuralSeparators = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+        _ = try target.capture()
+        try target.paste("你好")
+        access.nextTextReadError = TextTargetError.writeFailed
+        do {
+            try await target.acknowledgeKeyboardWrite()
+            XCTFail("Diagnostic instrumentation must preserve the existing failure")
+        } catch {
+            XCTAssertEqual(error as? TextTargetError, .writeFailed)
+        }
+        let diagnostic = try XCTUnwrap(target.drainDiagnostics().first { $0.event == "keyboard_write_unconfirmed" })
+        XCTAssertEqual(diagnostic.fields["readAttempts"], "1")
+        XCTAssertEqual(diagnostic.fields["comparison"], "unreadable")
+        XCTAssertEqual(sender.totalPosts, 1)
+    }
+
+    func testAcknowledgementEvidenceRetainsEarlyStateAfterLaterMismatch() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "草稿", application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.coordinateIncludesStructuralSeparators = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        var observedDiagnostics: [TextInputDiagnostic] = []
+        var now: UInt64 = 0
+        let target = AXTextTarget(
+            evidenceObserver: { diagnostic, _, _ in observedDiagnostics.append(diagnostic) },
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(now: { now }, sleep: { now += $0 }),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+
+        _ = try target.capture()
+        try target.paste("甲")
+        access.failNextCoordinateReads = 1
+        access.queuedTextReadSnapshots = [
+            .init(rawText: "草稿甲乙", coordinateText: "草稿甲乙", selection: .init(location: 4, length: 0)),
+            .init(rawText: "草稿甲乙", coordinateText: "草稿甲乙", selection: .init(location: 4, length: 0)),
+            .init(rawText: "草稿甲乙丙", coordinateText: "草稿甲乙丙", selection: .init(location: 5, length: 0))
+        ]
+
+        do {
+            try await target.acknowledgeKeyboardWrite()
+            XCTFail("A later mismatching state must remain unconfirmed")
+        } catch { XCTAssertEqual(error as? TextTargetError, .writeFailed) }
+
+        let diagnostic = try XCTUnwrap(target.drainDiagnostics().first { $0.event == "keyboard_write_unconfirmed" })
+        XCTAssertEqual(diagnostic.fields["ackCandidateCount"], "1")
+        XCTAssertEqual(diagnostic.fields["ackFirstReadableAXValueLengthUTF16"], "4")
+        XCTAssertEqual(diagnostic.fields["ackFirstReadableCoordinateLengthUTF16"], "4")
+        XCTAssertEqual(diagnostic.fields["ackFirstChangedAXValueLengthUTF16"], "4")
+        XCTAssertEqual(diagnostic.fields["ackFirstChangedSelectionLocation"], "4")
+        XCTAssertEqual(diagnostic.fields["ackFirstChangedCandidateMatches"], "false")
+        XCTAssertEqual(diagnostic.fields["ackFinalAXValueLengthUTF16"], "5")
+        XCTAssertEqual(diagnostic.fields["ackFinalSelectionLocation"], "5")
+        XCTAssertEqual(diagnostic.fields["ackFinalCandidateMatches"], "false")
+        XCTAssertFalse(diagnostic.fields["ackFirstReadErrorCode", default: ""].isEmpty)
+        XCTAssertEqual(diagnostic.fields["observedAXValueLengthUTF16"], "5")
+        XCTAssertEqual(DiagnosticLogSanitizer.fields(diagnostic.fields)["observedAXValueLengthUTF16"], "5")
+        XCTAssertFalse(diagnostic.fields.values.contains { $0.contains("草稿") || $0.contains("甲乙") })
+        XCTAssertEqual(sender.totalPosts, 1)
+        XCTAssertEqual(diagnostic.fields["inputSessionGeneration"], "1")
+        XCTAssertEqual(diagnostic.fields["keyboardOperationGeneration"], "1")
+        XCTAssertTrue(observedDiagnostics.contains { $0.event == "keyboard_write_unconfirmed" })
+    }
+
+    func testReplacementReadFailureDoesNotReusePreDispatchCandidateMatch() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "甲乙",
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+
+        _ = try target.capture()
+        try target.replaceTrailingText("乙", with: "丁")
+        sender.onReplacement = { access.persistentTextReadError = TextTargetError.writeFailed }
+        do {
+            try await target.acknowledgeKeyboardWrite()
+            XCTFail("A post-dispatch read failure must remain unconfirmed")
+        } catch { XCTAssertEqual(error as? TextTargetError, .writeFailed) }
+
+        let diagnostic = try XCTUnwrap(target.drainDiagnostics().first { $0.event == "keyboard_write_unconfirmed" })
+        XCTAssertEqual(diagnostic.fields["comparison"], "unreadable")
+        XCTAssertEqual(diagnostic.fields["ackFinalCandidateMatches"], "")
+        XCTAssertEqual(diagnostic.fields["ackFirstReadableSelectionLocation"], "1")
+        XCTAssertEqual(diagnostic.fields["ackFirstReadErrorCode"], "text_target_write_failed")
+        XCTAssertEqual(sender.totalPosts, 1)
+    }
+
+    func testSafariAXFailureDuringConfirmationRecoversWithoutResending() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "草稿", application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.proseMirror = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+        _ = try target.capture()
+        try target.paste("甲")
+        access.nextTextReadError = AXAttributeReadFailure(attribute: kAXValueAttribute as String, status: -25202)
+        try await target.acknowledgeKeyboardWrite()
+        try await target.writeKeyboardText(previousText: "", with: "乙")
+        XCTAssertEqual(access.rawText, "草稿甲乙")
+        XCTAssertEqual(sender.totalPosts, 2)
+        XCTAssertTrue(target.drainDiagnostics().contains { $0.event == "keyboard_state_read_retryable" })
+    }
+
+    func testSafariPersistentAXFailureTimesOutWithoutResending() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "", application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.proseMirror = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        var now: UInt64 = 0
+        let target = AXTextTarget(access: access, keyboardEventSender: sender,
+            writeTiming: .init(now: { now }, sleep: { now += $0 }),
+            acknowledgementTimeoutNanoseconds: 20_000_000)
+        _ = try target.capture()
+        try target.paste("甲")
+        access.persistentTextReadError = AXAttributeReadFailure(attribute: kAXValueAttribute as String, status: -25202)
+        do {
+            try await target.acknowledgeKeyboardWrite()
+            XCTFail("Unreadable state cannot confirm")
+        } catch { XCTAssertEqual(error as? TextTargetError, .writeFailed) }
+        XCTAssertEqual(now, 20_000_000)
+        XCTAssertEqual(sender.totalPosts, 1)
+    }
+
+    func testAXReadFailureRecoveryIsLimitedToSafariEditorAndKnownAttributes() async throws {
+        for (bundle, proseMirror, attribute, status) in [
+            ("md.obsidian", false, kAXValueAttribute as String, -25202),
+            ("com.apple.Safari", true, "AXOtherAttribute", -25202),
+            ("com.apple.Safari", true, kAXValueAttribute as String, AXError.failure.rawValue)
+        ] {
+            let access = ReplayAXTextTargetAccess(text: "", application: .init(name: "App", bundleIdentifier: bundle, processIdentifier: 9001))
+            access.proseMirror = proseMirror
+            let sender = ReplayKeyboardEventSender(access: access)
+            let target = AXTextTarget(access: access, keyboardEventSender: sender)
+            _ = try target.capture()
+            try target.paste("甲")
+            access.nextTextReadError = AXAttributeReadFailure(attribute: attribute, status: status)
+            do {
+                try await target.acknowledgeKeyboardWrite()
+                XCTFail("Unrelated failures must remain terminal")
+            } catch { XCTAssertEqual(error as? TextTargetError, .writeFailed) }
+            XCTAssertEqual(sender.totalPosts, 1)
+            XCTAssertFalse(target.drainDiagnostics().contains { $0.event == "keyboard_state_read_retryable" })
+        }
+    }
+
+    func testSafariPreflightReadFailureRecoversBeforeSending() async throws {
+        let access = ReplayAXTextTargetAccess(text: "", application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001))
+        access.proseMirror = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+        _ = try target.capture()
+        access.nextTextReadError = AXAttributeReadFailure(attribute: kAXValueAttribute as String, status: -25202)
+        try await target.writeKeyboardText(previousText: "", with: "甲")
+        XCTAssertEqual(access.rawText, "甲")
+        XCTAssertEqual(sender.totalPosts, 1)
+    }
+
+    func testSafariExtraCharactersRemainUnconfirmedWithUsefulEvidence() async throws {
+        let access = ReplayAXTextTargetAccess(text: String(repeating: "草", count: 497),
+            selection: .init(location: 496, length: 0),
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001))
+        access.proseMirror = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        var now: UInt64 = 0
+        let target = AXTextTarget(access: access, keyboardEventSender: sender,
+            writeTiming: .init(now: { now }, sleep: { now += $0 }),
+            acknowledgementTimeoutNanoseconds: 20_000_000)
+        _ = try target.capture()
+        try target.paste("甲")
+        access.rawText += "乙丙"
+        access.selection = .init(location: 499, length: 0)
+        do {
+            try await target.acknowledgeKeyboardWrite()
+            XCTFail("Extra characters cannot be accepted as a receipt")
+        } catch { XCTAssertEqual(error as? TextTargetError, .writeFailed) }
+        XCTAssertEqual(sender.totalPosts, 1)
+        let diagnostic = try XCTUnwrap(target.drainDiagnostics().first { $0.event == "keyboard_write_unconfirmed" })
+        XCTAssertEqual(diagnostic.fields["expectedDocumentLength"], "498")
+        XCTAssertEqual(diagnostic.fields["observedLengthUTF16"], "500")
+        XCTAssertEqual(diagnostic.fields["expectedSelectionLocation"], "497")
+        XCTAssertEqual(diagnostic.fields["actualSelectionLocation"], "499")
+        XCTAssertEqual(diagnostic.fields["comparison"], "documentMismatch")
+    }
+
+    func testSafariInvalidHandleRecoveryPreservesLongDraftAndTailRevision() async throws {
+        XCTAssertEqual(AXError.invalidUIElement.rawValue, -25202)
+        for draft in ["草稿", String(repeating: "草😀", count: 500)] {
+            let access = ReplayAXTextTargetAccess(text: draft, application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001))
+            access.proseMirror = true
+            let sender = ReplayKeyboardEventSender(access: access)
+            let target = AXTextTarget(access: access, keyboardEventSender: sender)
+            _ = try target.capture()
+            try target.paste("你好")
+            access.nextTextReadError = AXAttributeReadFailure(attribute: kAXValueAttribute as String, status: -25202)
+            access.onTextReadFailure = { access.focusedElementRebuildsBeforeNextWrite = 1 }
+            try await target.acknowledgeKeyboardWrite()
+            try target.replaceTrailingText("你好", with: "您好")
+            access.nextSelectionReadError = AXAttributeReadFailure(attribute: kAXSelectedTextRangeAttribute as String, status: -25202)
+            try await target.acknowledgeKeyboardWrite()
+            XCTAssertEqual(access.rawText, draft + "您好")
+            XCTAssertEqual(access.selection.location, draft.utf16.count + 2)
+            XCTAssertEqual(sender.appendPosts, 1)
+            XCTAssertEqual(sender.replacementPosts, 1)
+            XCTAssertTrue(target.drainDiagnostics().contains { $0.event == "safari_keyboard_target_reacquired" && $0.fields["phase"] == "invalid_element_read" })
+        }
+    }
+
+    func testSafariApplicationSwitchDuringInvalidHandleRecoveryStops() async throws {
+        let access = ReplayAXTextTargetAccess(text: "", application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001))
+        access.proseMirror = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+        _ = try target.capture()
+        try target.paste("甲")
+        access.nextTextReadError = AXAttributeReadFailure(attribute: kAXValueAttribute as String, status: -25202)
+        access.onTextReadFailure = {
+            access.currentApplicationOverride = .init(name: "Notes", bundleIdentifier: "com.apple.Notes", processIdentifier: 9002)
+        }
+        do {
+            try await target.acknowledgeKeyboardWrite()
+            XCTFail("Application changes must stop recovery")
+        } catch { XCTAssertEqual(error as? TextTargetError, .targetChanged) }
+        XCTAssertEqual(sender.totalPosts, 1)
+    }
+
+    func testSystemAXReadFailureRecordsStatusAndDrainsWithoutContent() throws {
+        let access = SystemAXTextTargetAccess()
+        _ = try? access.text(in: AXUIElementCreateSystemWide())
+        let diagnostic = try XCTUnwrap(access.drainReadDiagnostics().first)
+        XCTAssertEqual(diagnostic.event, "ax_read_failed")
+        XCTAssertEqual(diagnostic.fields["axAttribute"], kAXValueAttribute as String)
+        XCTAssertNotEqual(diagnostic.fields["axStatus"], "0")
+        XCTAssertEqual(diagnostic.fields.count, 2)
+        XCTAssertTrue(access.drainReadDiagnostics().isEmpty)
+    }
+
     func testSafariProseMirrorUsesAcknowledgedKeyboardInputDespiteWritableAX() async throws {
         for draft in ["\n", "已有草稿\n"] {
             let access = ReplayAXTextTargetAccess(
@@ -170,6 +640,301 @@ final class AXTextTargetReplayTests: XCTestCase {
         let injector = TextInjector(target: AXTextTarget(access: access))
         try injector.begin()
         XCTAssertEqual(injector.modeDescription, "ax")
+    }
+
+    func testObsidianUsesKeyboardAcknowledgementWhenAXWriteIsMisleading() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "已有",
+            selection: .init(location: 2, length: 0),
+            application: .init(name: "Obsidian", bundleIdentifier: "md.obsidian", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            )
+        )
+        let injector = TextInjector(target: target, pacingClock: clock)
+
+        try injector.begin()
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+
+        access.readSnapshotsAfterNextWrite = [
+            .init(rawText: "已有", coordinateText: "已有", selection: .init(location: 2, length: 0)),
+            .init(rawText: "已有语音", coordinateText: "已有语音", selection: .init(location: 4, length: 0))
+        ]
+        injector.apply(projection: projection("语音", revision: 1))
+        await finish(injector, finalText: "语音", advancing: clock)
+
+        XCTAssertEqual(access.rawText, "已有语音")
+        XCTAssertEqual(access.axTextWrites, 0)
+        XCTAssertEqual(sender.appendPosts, 1)
+        XCTAssertEqual(injector.errorCount, 0)
+
+        access.readSnapshotsAfterNextWrite = [
+            .init(rawText: "已有语音", coordinateText: "已有语音", selection: .init(location: 4, length: 0)),
+            .init(rawText: "已有语境", coordinateText: "已有语境", selection: .init(location: 4, length: 0))
+        ]
+        injector.apply(projection: projection("语境", revision: 2))
+        await finish(injector, finalText: "语境", advancing: clock)
+
+        XCTAssertEqual(access.rawText, "已有语境")
+        XCTAssertEqual(access.axTextWrites, 0)
+        XCTAssertEqual(sender.totalPosts, 2, "a delayed readback must not resend the keyboard event")
+        XCTAssertEqual(sender.selectionPosts, 1)
+        XCTAssertEqual(sender.replacementPosts, 1)
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+    }
+
+    func testAXWriteMustWaitForReadbackBeforeAdvancingState() async throws {
+        let before = String(repeating: "草", count: 1068)
+        let firstDocument = NSMutableString(string: before)
+        firstDocument.insert("甲乙", at: 4)
+        let afterFirst = firstDocument as String
+        let secondDocument = NSMutableString(string: afterFirst)
+        secondDocument.replaceCharacters(in: NSRange(location: 4, length: 2), with: "甲乙丙丁")
+        let afterSecond = secondDocument as String
+        let access = ReplayAXTextTargetAccess(
+            text: before,
+            selection: .init(location: 4, length: 0),
+            application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        access.axWriteNoOp = true
+        access.axWriteReadSnapshotsByWrite = [
+            [
+                .init(rawText: before, coordinateText: before, selection: .init(location: 4, length: 0)),
+                .init(rawText: afterFirst, coordinateText: afterFirst, selection: .init(location: 6, length: 0))
+            ],
+            [
+                .init(rawText: afterFirst, coordinateText: afterFirst, selection: .init(location: 6, length: 0)),
+                .init(rawText: afterSecond, coordinateText: afterSecond, selection: .init(location: 8, length: 0))
+            ]
+        ]
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("甲乙", revision: 1))
+        await finish(injector, finalText: "甲乙", advancing: clock)
+        injector.apply(projection: projection("甲乙丙丁", revision: 2))
+        await finish(injector, finalText: "甲乙丙丁", advancing: clock)
+
+        XCTAssertEqual(access.rawText, afterSecond)
+        XCTAssertEqual(access.axTextWrites, 2)
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "ax")
+        let diagnostics = injector.drainDiagnostics()
+        let firstAcknowledgement = try XCTUnwrap(diagnostics.first {
+            $0.event == "ax_write_acknowledged"
+                && $0.fields["axExpectedValueLengthUTF16"] == String(afterFirst.utf16.count)
+        })
+        XCTAssertEqual(firstAcknowledgement.fields["axPreflightFirstReadableAXValueLengthUTF16"], "1068")
+        XCTAssertEqual(firstAcknowledgement.fields["axPreflightFirstReadableSelectionLocation"], "4")
+        XCTAssertEqual(firstAcknowledgement.fields["axFirstReadableAXValueLengthUTF16"], "1068")
+        XCTAssertEqual(firstAcknowledgement.fields["axFirstChangedAXValueLengthUTF16"], "1068")
+        XCTAssertEqual(firstAcknowledgement.fields["axFirstChangedCandidateMatches"], "false")
+        XCTAssertEqual(firstAcknowledgement.fields["axFinalAXValueLengthUTF16"], "1070")
+        XCTAssertEqual(firstAcknowledgement.fields["axFinalSelectionLocation"], "6")
+        XCTAssertGreaterThan(Int(firstAcknowledgement.fields["axPreflightReadAttempts"] ?? "0") ?? 0, 0)
+        XCTAssertGreaterThan(Int(firstAcknowledgement.fields["axReadAttempts"] ?? "0") ?? 0, 1)
+    }
+
+    func testAXWriteValueBranchConfirmsEmojiRevisionAndDoesNotRetry() async throws {
+        let before = "已有草稿"
+        let first = before + "😀甲"
+        let revised = before + "😀乙"
+        let access = ReplayAXTextTargetAccess(
+            text: before,
+            selection: .init(location: before.utf16.count, length: 0),
+            application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+        )
+        access.selectedTextAttributeIsSettable = false
+        access.valueAttributeIsSettable = true
+        access.axWriteReadSnapshotsByWrite = [
+            [
+                .init(rawText: before, coordinateText: before, selection: .init(location: before.utf16.count, length: 0)),
+                .init(rawText: first, coordinateText: first, selection: .init(location: first.utf16.count, length: 0))
+            ],
+            [
+                .init(rawText: first, coordinateText: first, selection: .init(location: first.utf16.count, length: 0)),
+                .init(rawText: revised, coordinateText: revised, selection: .init(location: revised.utf16.count, length: 0))
+            ]
+        ]
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("😀甲", revision: 1))
+        await finish(injector, finalText: "😀甲", advancing: clock)
+        injector.apply(projection: projection("😀乙", revision: 2))
+        await finish(injector, finalText: "😀乙", advancing: clock)
+
+        XCTAssertEqual(access.rawText, revised)
+        XCTAssertEqual(access.axTextWrites, 2)
+        XCTAssertEqual(injector.errorCount, 0)
+        let diagnostics = injector.drainDiagnostics()
+        XCTAssertEqual(diagnostics.filter { $0.event == "ax_write_submitted" }.count, 2)
+        XCTAssertTrue(diagnostics.contains { $0.event == "ax_write_acknowledged" && $0.fields["axWriteKind"] == "value" })
+    }
+
+    func testAXWriteTimeoutStopsWithoutRetryingOrAdvancingAfterNoOp() async throws {
+        let before = String(repeating: "草", count: 1068)
+        let access = ReplayAXTextTargetAccess(
+            text: before,
+            selection: .init(location: 4, length: 0),
+            application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        access.axWriteNoOp = true
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("甲乙", revision: 1))
+        await finish(injector, finalText: "甲乙", advancing: clock)
+        injector.apply(projection: projection("甲乙丙", revision: 2))
+        await finish(injector, finalText: "甲乙丙", advancing: clock)
+
+        XCTAssertEqual(access.rawText, before)
+        XCTAssertEqual(access.axTextWrites, 1, "a successful AX return must never cause a second write")
+        XCTAssertEqual(injector.errorCount, 1)
+        XCTAssertEqual(injector.degradationCode, "text_target_write_failed")
+        let diagnostics = injector.drainDiagnostics()
+        XCTAssertEqual(diagnostics.filter { $0.event == "ax_write_submitted" }.count, 1)
+        XCTAssertEqual(diagnostics.filter { $0.event == "ax_write_unconfirmed" }.count, 1)
+        XCTAssertEqual(diagnostics.first { $0.event == "ax_write_unconfirmed" }?.fields["axFinalCandidateMatches"], "false")
+    }
+
+    func testAXWriteRejectsExternalEditAndFocusChangeBeforeNextOperation() async throws {
+        for change in [ReplayTargetChange.externalEdit, .focus] {
+            let before = "草稿"
+            let access = ReplayAXTextTargetAccess(
+                text: before,
+                selection: .init(location: before.utf16.count, length: 0),
+                application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+            )
+            access.textAttributesAreSettable = true
+            let target = AXTextTarget(access: access, acknowledgementTimeoutNanoseconds: 20_000_000)
+            let injector = TextInjector(target: target)
+
+            try injector.begin()
+            injector.apply(projection: projection("甲", revision: 1))
+            try await injector.finish(finalText: "甲")
+            let writesBeforeChange = access.axTextWrites
+            switch change {
+            case .externalEdit:
+                access.externalEdit("用户编辑")
+            case .focus:
+                access.focusChanged = true
+            }
+            injector.apply(projection: projection("甲乙", revision: 2))
+            try await injector.finish(finalText: "甲乙")
+
+            XCTAssertEqual(access.axTextWrites, writesBeforeChange)
+            XCTAssertEqual(injector.errorCount, 1)
+            XCTAssertEqual(injector.degradationCode, "text_target_changed")
+        }
+    }
+
+    func testAXWritePersistentReadFailureStopsAfterSingleSubmission() async throws {
+        let before = "草稿"
+        let access = ReplayAXTextTargetAccess(
+            text: before,
+            selection: .init(location: before.utf16.count, length: 0),
+            application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        access.onAXTextWrite = { access.persistentTextReadError = KeyboardWriteReadError.retryable }
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("甲", revision: 1))
+        await finish(injector, finalText: "甲", advancing: clock)
+
+        XCTAssertEqual(access.axTextWrites, 1)
+        XCTAssertEqual(injector.errorCount, 1)
+        XCTAssertEqual(injector.degradationCode, "text_target_write_failed")
+        let diagnostics = injector.drainDiagnostics()
+        let failure = try XCTUnwrap(diagnostics.first { $0.event == "ax_write_unconfirmed" })
+        XCTAssertEqual(failure.fields["axFirstReadErrorCode"], "ax_read_retryable")
+        XCTAssertGreaterThan(Int(failure.fields["axReadAttempts"] ?? "0") ?? 0, 1)
+    }
+
+    func testAXWriteCancellationInvalidatesLateReadbackWithoutSecondSubmission() async throws {
+        let before = "草稿"
+        let access = ReplayAXTextTargetAccess(
+            text: before,
+            selection: .init(location: before.utf16.count, length: 0),
+            application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        access.axWriteNoOp = true
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("甲", revision: 1))
+        let finishTask = Task { try? await injector.finish(finalText: "甲") }
+        for _ in 0..<30 {
+            await Task.yield()
+            if access.axTextWrites == 1 { break }
+        }
+        injector.cancel()
+        clock.advance(by: 100_000_000)
+        for _ in 0..<30 { await Task.yield() }
+        await finishTask.value
+
+        XCTAssertEqual(access.axTextWrites, 1)
+        XCTAssertEqual(access.rawText, before)
+        XCTAssertEqual(injector.modeDescription, "inactive")
     }
 
     func testCodexMainAndCommentReplayAcceptMoreThanThousandCharacters() async throws {
@@ -602,7 +1367,7 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertTrue(
             diagnostics.contains {
                 $0.event == "keyboard_write_unconfirmed"
-                    && $0.fields["comparison"] == "documentMismatch"
+                    && $0.fields["comparison"] != "matched"
             }
         )
     }
@@ -1055,6 +1820,10 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var selection: ReplayTextRange
     var placeholderEvidenceValue: AXPlaceholderEvidence
     var failNextTextReads = 0
+    var nextTextReadError: (any Error)?
+    var persistentTextReadError: (any Error)?
+    var nextSelectionReadError: (any Error)?
+    var onTextReadFailure: (() -> Void)?
     var alwaysFailTextReads = false
     var failNextSelectionReads = 0
     var failNextCoordinateReads = 0
@@ -1062,7 +1831,10 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var selectionRangeIsSettable = false
     var proseMirror = false
     var textAttributesAreSettable = false
+    var selectedTextAttributeIsSettable: Bool?
+    var valueAttributeIsSettable: Bool?
     private(set) var axTextWrites = 0
+    var onAXTextWrite: (() -> Void)?
     var focusChanged = false
     var focusedElementRebuildsBeforeNextWrite = 0
     var focusedElementRebuildsAfterNextWrite = 0
@@ -1074,6 +1846,8 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var transitionRawOverride: String?
     var coordinateOverride: String?
     var writeSnapshots: [ReplayAXSnapshot] = []
+    var axWriteNoOp = false
+    var axWriteReadSnapshotsByWrite: [[ReplayAXSnapshot]] = []
     private(set) var textReadCount = 0
     private(set) var coordinateReadCount = 0
 
@@ -1120,6 +1894,13 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
 
     func text(in element: AXUIElement) throws -> String? {
         textReadCount += 1
+        if let error = persistentTextReadError { throw error }
+        if let error = nextTextReadError {
+            nextTextReadError = nil
+            onTextReadFailure?()
+            onTextReadFailure = nil
+            throw error
+        }
         if !queuedTextReadSnapshots.isEmpty {
             let snapshot = queuedTextReadSnapshots.removeFirst()
             rawText = snapshot.rawText
@@ -1134,6 +1915,10 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     }
 
     func selection(in element: AXUIElement) throws -> ReplayTextRange? {
+        if let error = nextSelectionReadError {
+            nextSelectionReadError = nil
+            throw error
+        }
         if failNextSelectionReads > 0 {
             failNextSelectionReads -= 1
             throw KeyboardWriteReadError.retryable
@@ -1162,8 +1947,16 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     }
 
     func isAttributeSettable(_ attribute: String, on element: AXUIElement) -> Bool {
-        (selectionRangeIsSettable && attribute == (kAXSelectedTextRangeAttribute as String))
-            || (textAttributesAreSettable && [kAXSelectedTextAttribute as String, kAXValueAttribute as String].contains(attribute))
+        if attribute == (kAXSelectedTextRangeAttribute as String) {
+            return selectionRangeIsSettable
+        }
+        if attribute == (kAXSelectedTextAttribute as String) {
+            return selectedTextAttributeIsSettable ?? textAttributesAreSettable
+        }
+        if attribute == (kAXValueAttribute as String) {
+            return valueAttributeIsSettable ?? textAttributesAreSettable
+        }
+        return false
     }
 
     func isProseMirrorEditor(_ element: AXUIElement) -> Bool {
@@ -1177,15 +1970,29 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
 
     func setSelectedText(_ text: String, on element: AXUIElement) throws -> Int32 {
         axTextWrites += 1
-        applyReplacement(text, range: selection)
+        onAXTextWrite?()
+        onAXTextWrite = nil
+        if !axWriteNoOp {
+            applyReplacement(text, range: selection)
+        }
+        if !axWriteReadSnapshotsByWrite.isEmpty {
+            queuedTextReadSnapshots = axWriteReadSnapshotsByWrite.removeFirst()
+        }
         return AXError.success.rawValue
     }
 
     func setValue(_ text: String, on element: AXUIElement) throws -> Int32 {
         axTextWrites += 1
-        rawText = text
-        selection = .init(location: coordinateText.utf16.count, length: 0)
+        onAXTextWrite?()
+        onAXTextWrite = nil
+        if !axWriteNoOp {
+            rawText = text
+            selection = .init(location: coordinateText.utf16.count, length: 0)
+        }
         placeholderEvidenceValue = .init()
+        if !axWriteReadSnapshotsByWrite.isEmpty {
+            queuedTextReadSnapshots = axWriteReadSnapshotsByWrite.removeFirst()
+        }
         return AXError.success.rawValue
     }
 
@@ -1297,6 +2104,8 @@ private final class ReplayKeyboardEventSender: AXTextTargetKeyboardEventSending 
     private(set) var selectionPosts = 0
     private(set) var replacementPosts = 0
     var dropNextSelection = false
+    var appendOverride: ((String) -> Void)?
+    var onReplacement: (() -> Void)?
 
     var totalPosts: Int { appendPosts + replacementPosts }
 
@@ -1320,10 +2129,13 @@ private final class ReplayKeyboardEventSender: AXTextTargetKeyboardEventSending 
         access.applyReplacement(text, range: pendingSelection ?? access.selection)
         pendingSelection = nil
         access.armPostWriteReplay()
+        onReplacement?()
+        onReplacement = nil
     }
 
     func send(_ text: String, processID: pid_t?) throws {
         appendPosts += 1
+        if let appendOverride { appendOverride(text); return }
         access.applyAppend(text)
         access.armPostWriteReplay()
     }
