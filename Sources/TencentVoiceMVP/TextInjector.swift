@@ -57,6 +57,7 @@ final class TextInjector {
     private let pacingClock: KeyboardPacingClock
     private var keyboardPacer: KeyboardCharacterPacer?
     private var keyboardWriter: AcknowledgedKeyboardWriter?
+    private var axWriter: AcknowledgedAXWriter?
     private var snapshot: TextSnapshot?
     private var ownedRange = TextRange(location: 0, length: 0)
     private var lastDocumentText = ""
@@ -163,6 +164,7 @@ final class TextInjector {
             // each keyboard operation.
             let requiresKeyboardInput = captured.targetApplication?.bundleIdentifier == "com.openai.codex"
             mode = captured.supportsAXReplacement && !requiresKeyboardInput ? .ax : .keyboardLiveTail
+            installAXWriterIfNeeded()
             installKeyboardPacerIfNeeded()
         } catch TextTargetError.unsupported, TextTargetError.targetChanged, TextTargetError.writeFailed {
             resetForBegin()
@@ -223,7 +225,7 @@ final class TextInjector {
     }
 
     func beginFinalization() {
-        guard mode == .keyboardLiveTail else { return }
+        guard mode == .keyboardLiveTail || mode == .ax else { return }
         inputPhase = .finalizing
         recordDiagnostic("text_input_phase", ["phase": inputPhase.rawValue, "reason": "asr_finalization_started"])
         keyboardPacer?.beginFinalization()
@@ -254,7 +256,17 @@ final class TextInjector {
             } catch {
                 enterSafeCopy(after: error)
             }
-        case .safeCopy, .ax, .inactive, .disabledAfterError:
+        case .ax:
+            do {
+                try await axWriter?.finish(completionText)
+                recordDiagnostic("text_input_phase", ["phase": inputPhase.rawValue, "reason": "finished"])
+            } catch is CancellationError {
+                // Cancellation invalidates the pending AX operation; it is a
+                // lifecycle transition, not a target write failure.
+            } catch {
+                enterSafeCopy(after: error)
+            }
+        case .safeCopy, .inactive, .disabledAfterError:
             break
         }
 
@@ -281,7 +293,13 @@ final class TextInjector {
             } catch {
                 enterSafeCopy(after: error)
             }
-        case .safeCopy, .ax, .inactive, .disabledAfterError:
+        case .ax:
+            // There is no synchronous way to make an unconfirmed AX write
+            // successful. Cancel the queue and leave the target unchanged
+            // until a later session can establish a fresh snapshot.
+            axWriter?.cancel()
+            recordDiagnostic("text_input_phase", ["phase": inputPhase.rawValue, "reason": "finished_immediately_ax_cancelled"])
+        case .safeCopy, .inactive, .disabledAfterError:
             break
         }
 
@@ -318,8 +336,16 @@ final class TextInjector {
     }
 
     private func applyAX(_ projection: ASRProjection) {
-        guard projection.text != lastProjectionText,
-              let snapshot else { return }
+        guard projection.text != lastProjectionText else { return }
+        if let axWriter {
+            do {
+                try axWriter.accept(projection.text)
+            } catch {
+                enterSafeCopy(after: error)
+            }
+            return
+        }
+        guard let snapshot else { return }
         do {
             let previousRange = ownedRange
             let previousDocumentText = lastDocumentText
@@ -547,6 +573,112 @@ final class TextInjector {
         keyboardPacer?.beginSession()
     }
 
+    private func installAXWriterIfNeeded() {
+        guard mode == .ax,
+              let snapshot,
+              let acknowledging = target as? any AXAcknowledgingTarget else { return }
+        axWriter = AcknowledgedAXWriter(
+            target: acknowledging,
+            snapshot: snapshot,
+            onCommit: { [weak self] previousProjection, _, previousRange, submittedProjection, receipt in
+                guard let self else { return }
+                self.ownedRange = receipt.writtenRange
+                self.lastDocumentText = receipt.text
+                self.writeCount += 1
+                let prefix = sharedTextPrefix(previousProjection, submittedProjection)
+                let replaced = previousProjection.count - prefix.count
+                self.maximumTrailingReplacementLength = max(
+                    self.maximumTrailingReplacementLength,
+                    replaced
+                )
+                if replaced > self.deepReplacementThreshold {
+                    self.deepReplacementCount += 1
+                }
+                _ = previousRange
+            },
+            onFailure: { [weak self] error in
+                self?.enterSafeCopy(after: error)
+            },
+            operationContextProvider: { [weak self] previousProjection, submittedProjection, previousDocument, previousRange in
+                guard let self else { return nil }
+                return self.makeAXWriterOperation(
+                    previousProjection: previousProjection,
+                    submittedProjection: submittedProjection,
+                    previousDocument: previousDocument,
+                    previousRange: previousRange
+                )
+            }
+        )
+    }
+
+    private func makeAXWriterOperation(
+        previousProjection: String,
+        submittedProjection: String,
+        previousDocument: String,
+        previousRange: TextRange
+    ) -> AcknowledgedAXWriter.OperationContext {
+        let operationID = nextOperationID + 1
+        nextOperationID = operationID
+        let created = TextInputDiagnosticClock.milliseconds()
+        let commonPrefix = sharedTextPrefix(previousProjection, submittedProjection)
+        let previousTail = String(previousProjection.dropFirst(commonPrefix.count))
+        let replacementTail = String(submittedProjection.dropFirst(commonPrefix.count))
+        let expectedDocument = NSMutableString(string: previousDocument)
+        expectedDocument.replaceCharacters(
+            in: NSRange(location: previousRange.location, length: previousRange.length),
+            with: submittedProjection
+        )
+        let expectedDocumentText = expectedDocument as String
+        var fields = currentProjectionDiagnosticFields
+        let operationFields: [String: String] = [
+            "operationID": String(operationID),
+            "operationType": previousTail.isEmpty ? "append" : "tail_replacement",
+            "inputModeBeforeOperation": modeDescription,
+            "operationStatus": "queued",
+            "operationCreatedMonotonicMilliseconds": String(created),
+            "operationQueuedMonotonicMilliseconds": String(created),
+            "desiredLengthCharacters": String(submittedProjection.count),
+            "desiredLengthUTF16": String(submittedProjection.utf16.count),
+            "submittedLengthCharacters": String(previousProjection.count),
+            "submittedLengthUTF16": String(previousProjection.utf16.count),
+            "submittedLengthAfterCharacters": String(submittedProjection.count),
+            "submittedLengthAfterUTF16": String(submittedProjection.utf16.count),
+            "observedLengthCharacters": "unknown",
+            "observedLengthUTF16": "unknown",
+            "axExpectedValueLengthUTF16": String(expectedDocumentText.utf16.count),
+            "axExpectedSelectionLocation": String(previousRange.location + submittedProjection.utf16.count),
+            "axExpectedSelectionLength": "0",
+            "commonPrefixLengthCharacters": String(commonPrefix.count),
+            "commonPrefixLengthUTF16": String(commonPrefix.utf16.count),
+            "previousTailLengthCharacters": String(previousTail.count),
+            "previousTailLengthUTF16": String(previousTail.utf16.count),
+            "replacementTailLengthCharacters": String(replacementTail.count),
+            "replacementTailLengthUTF16": String(replacementTail.utf16.count),
+            "characterUnit": "Character",
+            "utf16Unit": "UTF16",
+            "plannedSelectionUnit": "UTF16",
+            "plannedSelectionLocation": String(previousRange.location),
+            "plannedSelectionLength": String(previousRange.length),
+            "expectedEndLocation": String(previousRange.location + submittedProjection.utf16.count),
+            "writeCountMeaning": "acknowledged_target_write"
+        ]
+        fields.merge(operationFields) { _, new in new }
+        let state = KeyboardWriteOperationState(fields: fields)
+        let context = TextInputDiagnosticContext(
+            operationID: operationID,
+            operationType: fields["operationType"] ?? "append",
+            fields: fields
+        )
+        return AcknowledgedAXWriter.OperationContext(
+            diagnostic: context,
+            onDispatch: { [state] in state.markDispatch() },
+            onFinish: { [weak self, state] status, error in
+                guard let self else { return }
+                self.recordDiagnostic("input_operation", state.finish(status: status, error: error))
+            }
+        )
+    }
+
     private func makeKeyboardWriterOperation(
         previousText: String,
         desiredText: String
@@ -766,6 +898,7 @@ final class TextInjector {
     private func enterSafeCopy(after error: Error) {
         guard mode != .safeCopy, mode != .disabledAfterError else { return }
         let modeBeforeDegradation = modeDescription
+        axWriter?.cancel()
         keyboardWriter?.cancel()
         keyboardPacer?.cancel()
         mode = safeCopyEnabled ? .safeCopy : .disabledAfterError
@@ -788,6 +921,8 @@ final class TextInjector {
     }
 
     private func resetForBegin() {
+        axWriter?.cancel()
+        axWriter = nil
         keyboardWriter?.cancel()
         keyboardWriter = nil
         keyboardPacer?.cancel()
@@ -818,6 +953,8 @@ final class TextInjector {
     }
 
     private func reset() {
+        axWriter?.cancel()
+        axWriter = nil
         keyboardWriter?.cancel()
         keyboardWriter = nil
         keyboardPacer?.cancel()

@@ -119,10 +119,10 @@ final class InputFailureContextRecorder {
 
     func observeTarget(_ diagnostic: TextInputDiagnostic, element: AXUIElement?, pid: pid_t?, logger: SessionLogger) {
         guard isEnabled else { return }
-        let failure = diagnostic.event == "keyboard_write_unconfirmed"
+        let failure = ["keyboard_write_unconfirmed", "ax_write_unconfirmed"].contains(diagnostic.event)
         let capture = diagnostic.event == "input_target_captured"
-        let dispatch = diagnostic.event == "keyboard_write_submitted"
-        let acknowledged = diagnostic.event == "keyboard_write_acknowledged"
+        let dispatch = ["keyboard_write_submitted", "ax_write_submitted"].contains(diagnostic.event)
+        let acknowledged = ["keyboard_write_acknowledged", "ax_write_acknowledged"].contains(diagnostic.event)
         guard failure || capture || dispatch || acknowledged else { return }
         let now = diagnostic.timestamp
         if failure {

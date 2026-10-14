@@ -82,6 +82,12 @@ struct TextSnapshot {
     }
 }
 
+struct AXTextWriteReceipt: Equatable, Sendable {
+    let text: String
+    let selection: TextRange
+    let writtenRange: TextRange
+}
+
 @MainActor
 protocol TextTarget: AnyObject {
     func drainDiagnostics() -> [TextInputDiagnostic]
@@ -92,6 +98,21 @@ protocol TextTarget: AnyObject {
     func paste(_ text: String) throws
     func replaceTrailingText(_ previousText: String, with text: String) throws
     func copyToClipboard(_ text: String) throws
+}
+
+// AX writes are submitted synchronously by the accessibility API, but the
+// target is not considered updated until a later read confirms the complete
+// document and selection. Only AXTextTarget adopts this internal seam; test
+// and legacy targets keep the synchronous TextTarget replacement fallback.
+@MainActor
+protocol AXAcknowledgingTarget: TextTarget {
+    func writeAXText(
+        snapshot: TextSnapshot,
+        range: TextRange,
+        expectedText: String,
+        with text: String
+    ) async throws -> AXTextWriteReceipt
+    func cancelAXWrite()
 }
 
 extension TextTarget {

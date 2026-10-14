@@ -271,7 +271,11 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
                 "mixed_input_rebased": "用户编辑后已冻结旧语音投影，并从当前光标继续输入新的语音内容。",
                 "mixed_input_ambiguous": "识别修订跨越了已冻结的语音边界，未猜测新旧内容，已暂停自动写入。",
                 "ax_write_failed": "AX 写入接口返回失败，具体属性和返回码已记录。",
-                "ax_read_failed": "AX 读取接口返回失败，具体属性和返回码已记录。"
+                "ax_read_failed": "AX 读取接口返回失败，具体属性和返回码已记录。",
+                "ax_write_submitted": "AX 写入接口返回成功，正在等待正文和选区读回确认；已关联本次操作。",
+                "ax_write_waiting": "AX 写入已提交，尚未把目标状态标记为完成；确认期间未重复发送。",
+                "ax_write_acknowledged": "AX 写入后的正文、选区和目标身份已读回匹配，已推进后续状态。",
+                "ax_write_unconfirmed": "AX 写入返回成功但正文或选区未在期限内确认，已停止继续写入且没有补发。"
             ]
             for code in diagnosticMessages.keys.sorted() {
                 let matching = sessionEvents.filter { $0.event == code }
@@ -481,7 +485,22 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
             "shiftKeyEventCount", "unicodeKeyEventCount", "deleteKeyEventCount",
             "failureCode", "failureOccurredAt", "degradationRecordedAt",
             "degradationRecordedOnASREvent", "degradationRecordTiming", "inputModeBeforeOperation",
-            "inputModeBeforeDegradation", "sourceBuild"
+            "inputModeBeforeDegradation", "sourceBuild", "axWriteStatus", "axWriteKind",
+            "axExpectedValueLengthUTF16", "axExpectedSelectionLocation", "axExpectedSelectionLength",
+            "axOperationGeneration", "axFailureCode", "axReadAttempts", "axElapsedMilliseconds",
+            "axFinalCandidateMatches", "axFirstChangedCandidateMatches", "axFirstReadErrorCode",
+            "axFirstReadErrorElapsedMilliseconds", "axFirstReadableAXValueLengthUTF16",
+            "axFirstReadableSelectionLocation", "axFirstReadableSelectionLength",
+            "axFirstReadableTargetIdentityMatches", "axFirstChangedAXValueLengthUTF16",
+            "axFirstChangedSelectionLocation", "axFirstChangedSelectionLength",
+            "axFirstChangedTargetIdentityMatches", "axFinalAXValueLengthUTF16",
+            "axFinalSelectionLocation", "axFinalSelectionLength", "axFinalTargetIdentityMatches",
+            "axPreflightReadAttempts", "axPreflightFirstReadErrorCode",
+            "axPreflightFirstReadErrorElapsedMilliseconds", "axPreflightFirstReadableAXValueLengthUTF16",
+            "axPreflightFirstReadableSelectionLocation", "axPreflightFirstReadableSelectionLength",
+            "axPreflightFirstReadableTargetIdentityMatches", "axPreflightFirstChangedAXValueLengthUTF16",
+            "axPreflightFirstChangedSelectionLocation", "axPreflightFirstChangedSelectionLength",
+            "axPreflightFirstChangedTargetIdentityMatches", "failureStage", "sourceBuild"
         ]
         return keys.compactMap { key in
             guard let value = event.metadata[key] else { return nil }

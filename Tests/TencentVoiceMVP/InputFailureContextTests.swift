@@ -74,6 +74,44 @@ final class InputFailureContextTests: XCTestCase {
         XCTAssertEqual(decoded.desktopContext.collectionStatus["failureProbeStatus"], "pending")
     }
 
+    @MainActor
+    func testAXWriteUnconfirmedFreezesTheEarliestDiagnosticEvidence() throws {
+        let recorder = InputFailureContextRecorder()
+        let logger = SessionLogger(enabled: { false })
+        logger.setFailureContextEnabled(true)
+        recorder.setEnabled(true)
+        defer { recorder.stop() }
+        let now = Date()
+        try logger.append(.init(
+            timestamp: now,
+            event: "ax_write_submitted",
+            metadata: ["operationID": "7", "axWriteStatus": "0"]
+        ))
+        let diagnostic = TextInputDiagnostic(
+            timestamp: now.addingTimeInterval(0.1),
+            event: "ax_write_unconfirmed",
+            fields: DiagnosticLogSanitizer.fields([
+                "operationID": "7",
+                "axExpectedValueLengthUTF16": "1070",
+                "axFinalAXValueLengthUTF16": "1068",
+                "axFinalCandidateMatches": "false",
+                "text": "private draft"
+            ])
+        )
+        recorder.observeTarget(
+            diagnostic,
+            element: AXUIElementCreateApplication(9001),
+            pid: 9001,
+            logger: logger
+        )
+
+        let evidence = try XCTUnwrap(recorder.latestFailure)
+        XCTAssertEqual(evidence.desktopContext.events.last?.event, "ax_write_unconfirmed")
+        XCTAssertEqual(evidence.desktopContext.events.last?.fields["axFinalAXValueLengthUTF16"], "1068")
+        XCTAssertFalse(evidence.desktopContext.events.last?.fields.values.contains("private draft") ?? true)
+        XCTAssertEqual(evidence.diagnosticEvents.first?.event, "ax_write_submitted")
+    }
+
     func testProbeSeparatesReportedFocusFromAnotherEditorThatActuallyClaimsFocus() throws {
         let window = AXUIElementCreateApplication(9102)
         let draft = AXUIElementCreateApplication(9103)
