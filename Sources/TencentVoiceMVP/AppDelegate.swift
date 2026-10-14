@@ -12,7 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let loginItemManager: LoginItemManager
     private let coordinator: SessionCoordinator
     private let sessionLogger: SessionLogger
-    private let failureContext = InputFailureContextRecorder()
+    private let failureContext: InputFailureContextRecorder
     private var failureReportTasks: [UUID: Task<Void, Never>] = [:]
     private var failureContextMainMenuItem: NSMenuItem?
     private let failureContextDefaults = UserDefaults(suiteName: "local.tencent.voice.mvp") ?? .standard
@@ -47,6 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sharedUsageStore = SharedUsageStore()
         let rimeThemeStore = RimeThemeStore()
         let permissionChecker = SystemPrivacyPermissionChecker()
+        let failureContext = InputFailureContextRecorder()
         let sessionLogger = SessionLogger(enabled: { settingsStore.load().saveTextLogs })
         let rimeBackupRetentionStore = RimeBackupRetentionStore(
             policy: RimeBackupSettings.loadPolicy()
@@ -96,10 +97,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.rimeLocalSupportRoot = localSupportRoot
         self.rimeLocalDirectory = localRimeDirectory
         self.sessionLogger = sessionLogger
+        self.failureContext = failureContext
         coordinator = SessionCoordinator(
             asr: TencentASRClient(),
             audio: SystemAudioCapture(),
-            textTarget: AXTextTarget(),
+            textTarget: AXTextTarget(evidenceObserver: { diagnostic, element, pid in
+                failureContext.observeTarget(diagnostic, element: element, pid: pid, logger: sessionLogger)
+            }),
             settingsStore: settingsStore,
             credentialStore: credentialStore,
             logger: sessionLogger,
@@ -488,7 +492,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let report = InputFailureReport(schemaVersion: 1, id: UUID(), generatedAt: now, desktopContext: context,
             diagnosticReport: DiagnosticReportBuilder(permissionChecker: permissionChecker,
                 credentialStore: credentialStore, settingsStore: settingsStore, logger: sessionLogger).build(events: events),
-            diagnosticEventsTruncated: !context.enabled || sessionLogger.failureContextEventsTruncated)
+            diagnosticEventsTruncated: !context.enabled || sessionLogger.failureContextEventsTruncated,
+            latestFailure: failureContext.latestFailure)
         let directory = sessionLogger.persistenceDirectoryURL.deletingLastPathComponent()
             .appendingPathComponent("input-failure-reports", isDirectory: true)
         let destination = directory.appendingPathComponent("InputFailure-\(report.id.uuidString).json")

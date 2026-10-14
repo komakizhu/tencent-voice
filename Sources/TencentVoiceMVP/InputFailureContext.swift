@@ -22,6 +22,7 @@ struct InputContextWindow: Codable, Sendable {
 // The buffer never stores ordinary key codes, typed characters, titles or AXValue.
 struct InputContextBuffer {
     private(set) var events: [InputContextEvent] = []
+    private(set) var latestFailure: InputContextWindow?
     private(set) var startedAt: Date?
     private var dropped: [Date] = []
     let capacity: Int
@@ -30,12 +31,14 @@ struct InputContextBuffer {
 
     mutating func start(at date: Date) {
         events = []
+        latestFailure = nil
         dropped = []
         startedAt = date
     }
 
     mutating func stop() {
         events = []
+        latestFailure = nil
         dropped = []
         startedAt = nil
     }
@@ -58,6 +61,21 @@ struct InputContextBuffer {
             droppedEventCount: dropped.count, events: events.filter { $0.timestamp <= now })
     }
 
+    mutating func freezeFailure(at date: Date) {
+        guard startedAt != nil else { return }
+        latestFailure = snapshot(at: date)
+        latestFailure?.collectionStatus["failureProbeStatus"] = "pending"
+    }
+
+    mutating func appendFailureProbe(_ event: InputContextEvent, failureAt: Date) {
+        guard let window = latestFailure, window.capturedAt == failureAt else { return }
+        latestFailure = InputContextWindow(requestedStart: window.requestedStart,
+            recordingStartedAt: window.recordingStartedAt, capturedAt: window.capturedAt,
+            enabled: window.enabled, droppedEventCount: window.droppedEventCount,
+            events: window.events + [event], collectionStatus: window.collectionStatus)
+        latestFailure?.collectionStatus["failureProbeStatus"] = "completed"
+    }
+
     private mutating func prune(at now: Date) {
         let start = now.addingTimeInterval(-60)
         events.removeAll { $0.timestamp < start }
@@ -76,66 +94,6 @@ enum InputContextKeyFilter {
     }
 }
 
-// AX queries run on a separate serial queue, never in the input event handler.
-private final class InputContextAXProbe: @unchecked Sendable {
-    private var previousFocus: AXUIElement?
-    private var previousWindow: AXUIElement?
-    private var focusID = 0
-    private var windowID = 0
-
-    func sample(pid: pid_t) -> [String: String] {
-        guard AXIsProcessTrusted() else { return ["axAvailable": "false"] }
-        let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.1)
-        var result = ["axAvailable": "true"]
-        if let window = element("AXFocusedWindow", in: app) {
-            if previousWindow.map({ CFEqual($0, window) }) != true {
-                windowID += 1
-                previousWindow = window
-            }
-            result["windowID"] = String(windowID)
-        }
-        guard let focus = element("AXFocusedUIElement", in: app) else {
-            result["focusAvailable"] = "false"
-            return result
-        }
-        AXUIElementSetMessagingTimeout(focus, 0.1)
-        if previousFocus.map({ CFEqual($0, focus) }) != true {
-            focusID += 1
-            previousFocus = focus
-        }
-        result["focusID"] = String(focusID)
-        result["focusAvailable"] = "true"
-        result["role"] = attribute("AXRole", in: focus) as? String
-        result["subrole"] = attribute("AXSubrole", in: focus) as? String
-        var owner: pid_t = 0
-        if AXUIElementGetPid(focus, &owner) == .success { result["focusOwnerPID"] = String(owner) }
-        if result["subrole"] != "AXSecureTextField" {
-            if let value = attribute("AXSelectedTextRange", in: focus), CFGetTypeID(value) == AXValueGetTypeID() {
-                var range = CFRange()
-                if AXValueGetValue(unsafeBitCast(value, to: AXValue.self), .cfRange, &range) {
-                    result["selectionLocation"] = String(range.location)
-                    result["selectionLength"] = String(range.length)
-                }
-            }
-            if let count = attribute("AXNumberOfCharacters", in: focus) as? NSNumber {
-                result["documentLength"] = count.stringValue
-            }
-        }
-        return result
-    }
-
-    private func attribute(_ name: String, in element: AXUIElement) -> CFTypeRef? {
-        var value: CFTypeRef?
-        return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
-    }
-
-    private func element(_ name: String, in node: AXUIElement) -> AXUIElement? {
-        guard let value = attribute(name, in: node), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
-        return (value as! AXUIElement)
-    }
-}
-
 @MainActor
 final class InputFailureContextRecorder {
     private(set) var isEnabled = false
@@ -149,6 +107,53 @@ final class InputFailureContextRecorder {
     private var previousSample: [String: String]?
     private var lastActivity: Date = .distantPast
     private var generation = 0
+    private var latestFailureDiagnostics: [SessionLogEntry] = []
+    private var latestFailureDiagnosticsTruncated = false
+    private var lastOperationProbe: Date = .distantPast
+
+    var latestFailure: InputFailureEvidence? {
+        guard let context = buffer.latestFailure else { return nil }
+        return InputFailureEvidence(desktopContext: context, diagnosticEvents: latestFailureDiagnostics,
+            diagnosticEventsTruncated: latestFailureDiagnosticsTruncated)
+    }
+
+    func observeTarget(_ diagnostic: TextInputDiagnostic, element: AXUIElement?, pid: pid_t?, logger: SessionLogger) {
+        guard isEnabled else { return }
+        let failure = ["keyboard_write_unconfirmed", "ax_write_unconfirmed"].contains(diagnostic.event)
+        let capture = diagnostic.event == "input_target_captured"
+        let dispatch = ["keyboard_write_submitted", "ax_write_submitted"].contains(diagnostic.event)
+        let acknowledged = ["keyboard_write_acknowledged", "ax_write_acknowledged"].contains(diagnostic.event)
+        guard failure || capture || dispatch || acknowledged else { return }
+        let now = diagnostic.timestamp
+        if failure {
+            record(diagnostic.event, fields: DiagnosticLogSanitizer.fields(diagnostic.fields), at: now)
+            buffer.freezeFailure(at: now)
+            latestFailureDiagnostics = logger.failureEvents(at: now)
+            latestFailureDiagnosticsTruncated = logger.failureContextEventsTruncated
+        }
+        guard failure || capture || now.timeIntervalSince(lastOperationProbe) >= 1 else { return }
+        lastOperationProbe = now
+        guard let pid else { return }
+        let reference = InputContextElementReference(element: element)
+        let token = generation
+        let probe = self.probe
+        let queue = probeQueue
+        Task { @MainActor [weak self] in
+            let details = await withCheckedContinuation { continuation in
+                queue.async { continuation.resume(returning: probe.sample(pid: pid, target: reference.element, includeEditors: true)) }
+            }
+            guard let self, self.isEnabled, self.generation == token else { return }
+            var fields = DiagnosticLogSanitizer.fields(diagnostic.fields)
+            fields.merge(details) { _, new in new }
+            fields["phase"] = diagnostic.event
+            fields["pid"] = String(pid)
+            fields["requestedAt"] = now.ISO8601Format()
+            fields["frontmostPIDAtCompletion"] = String(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0)
+            let event = InputContextEvent(timestamp: Date(), event: "input_editor_probe", fields: fields)
+            self.buffer.append(event, now: event.timestamp)
+            if failure { self.buffer.appendFailureProbe(event, failureAt: now) }
+        }
+    }
 
     func setEnabled(_ enabled: Bool) {
         guard enabled != isEnabled else { return }
@@ -198,13 +203,18 @@ final class InputFailureContextRecorder {
         previousSample = nil
         lastActivity = .distantPast
         buffer.stop()
+        latestFailureDiagnostics = []
+        latestFailureDiagnosticsTruncated = false
+        lastOperationProbe = .distantPast
     }
 
     func snapshot(at date: Date) -> InputContextWindow {
         var window = buffer.snapshot(at: date)
         window.collectionStatus = ["globalMonitorInstalled": String(globalMonitor != nil),
             "accessibilityGranted": String(AXIsProcessTrusted()), "secureInputActive": String(IsSecureEventInputEnabled()),
-            "focusPollingIntervalMilliseconds": "500", "typedCharactersRecorded": "false", "screenshotsRecorded": "false"]
+            "focusPollingIntervalMilliseconds": "500", "typedCharactersRecorded": "false", "screenshotsRecorded": "false", "latestFailureRetained": String(buffer.latestFailure != nil),
+            "editorProbeNodeLimit": "160", "editorProbeDepthLimit": "64",
+            "editorProbeTraversal": "reverse_depth_first", "editorProbeBudgetMilliseconds": "250"]
         return window
     }
 
@@ -220,13 +230,14 @@ final class InputFailureContextRecorder {
         let app = NSWorkspace.shared.frontmostApplication
         var fields = ["application": app?.bundleIdentifier ?? "unknown", "pid": String(app?.processIdentifier ?? 0)]
         if event.type == .keyDown {
-            guard app?.bundleIdentifier == "com.openai.codex", !event.isARepeat, !IsSecureEventInputEnabled() else { return }
+            guard ["com.openai.codex", "com.apple.Safari", "md.obsidian"].contains(app?.bundleIdentifier ?? ""),
+                  !event.isARepeat, !IsSecureEventInputEnabled() else { return }
             if let shortcut = InputContextKeyFilter.shortcut(keyCode: event.keyCode, flags: event.modifierFlags) {
                 fields["shortcut"] = shortcut
-                record("codex_shortcut", fields: fields, at: now)
+                record(app?.bundleIdentifier == "com.openai.codex" ? "codex_shortcut" : "application_shortcut", fields: fields, at: now)
             } else if now.timeIntervalSince(lastActivity) >= 1 {
                 lastActivity = now
-                record("codex_keyboard_activity", fields: fields, at: now)
+                record(app?.bundleIdentifier == "com.openai.codex" ? "codex_keyboard_activity" : "application_keyboard_activity", fields: fields, at: now)
             }
         } else if event.type == .scrollWheel {
             guard now.timeIntervalSince(lastActivity) >= 1 else { return }
@@ -252,7 +263,7 @@ final class InputFailureContextRecorder {
         if app?.bundleIdentifier == "com.openai.codex", let pid = app?.processIdentifier {
             let probe = self.probe
             let details = await withCheckedContinuation { continuation in
-                probeQueue.async { continuation.resume(returning: probe.sample(pid: pid)) }
+                probeQueue.async { continuation.resume(returning: probe.sample(pid: pid, includeEditors: true)) }
             }
             guard isEnabled, generation == token else { return }
             // Do not attribute a slow AX result to an app that is no longer active.
@@ -267,6 +278,12 @@ final class InputFailureContextRecorder {
     }
 }
 
+struct InputFailureEvidence: Codable, Sendable {
+    let desktopContext: InputContextWindow
+    let diagnosticEvents: [SessionLogEntry]
+    let diagnosticEventsTruncated: Bool
+}
+
 struct InputFailureReport: Codable, Sendable {
     let schemaVersion: Int
     let id: UUID
@@ -274,4 +291,5 @@ struct InputFailureReport: Codable, Sendable {
     let desktopContext: InputContextWindow
     let diagnosticReport: DiagnosticReport
     let diagnosticEventsTruncated: Bool
+    var latestFailure: InputFailureEvidence? = nil
 }
