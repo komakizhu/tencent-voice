@@ -101,10 +101,14 @@ fi
 
 EXTERNAL_VOLUME="/Volumes/T7_1T"
 EXTERNAL_CODEX_ROOT="$EXTERNAL_VOLUME/codex"
+EXTERNAL_AGENT_WORK_ROOT="$EXTERNAL_VOLUME/Agent/work"
 EXTERNAL_VOLUME_UUID="E70D0032-CFF1-499D-81A2-DA2A661FCAD5"
 BUILD_ON_EXTERNAL=0
 case "$APP_DIR" in
-    "$EXTERNAL_CODEX_ROOT"/*) BUILD_ON_EXTERNAL=1 ;;
+    "$EXTERNAL_CODEX_ROOT"/*|"$EXTERNAL_AGENT_WORK_ROOT"/*) BUILD_ON_EXTERNAL=1 ;;
+esac
+case "$PROJECT_DIR" in
+    "$EXTERNAL_CODEX_ROOT"/*|"$EXTERNAL_AGENT_WORK_ROOT"/*) BUILD_ON_EXTERNAL=1 ;;
 esac
 
 if [[ "$BUILD_ON_EXTERNAL" == "1" ]]; then
@@ -118,26 +122,38 @@ if [[ "$BUILD_ON_EXTERNAL" == "1" ]]; then
         echo "refusing external build: $EXTERNAL_VOLUME is not the writable expected APFS volume" >&2
         exit 1
     fi
-    for storage_path in "${TVMVP_SWIFTPM_SCRATCH_PATH:-}" "${TVMVP_SWIFTPM_CACHE_PATH:-}" \
-        "${TVMVP_SWIFTPM_SECURITY_PATH:-}" "${TVMVP_BUILD_TMPDIR:-}"; do
-        case "$storage_path" in
-            "$EXTERNAL_CODEX_ROOT"/*) ;;
-            *) echo "external builds require all SwiftPM caches and temporary files under $EXTERNAL_CODEX_ROOT" >&2; exit 1 ;;
-        esac
-    done
-    SWIFTPM_SCRATCH_PATH="$TVMVP_SWIFTPM_SCRATCH_PATH"
-    SWIFTPM_CACHE_PATH="$TVMVP_SWIFTPM_CACHE_PATH"
-    SWIFTPM_SECURITY_PATH="$TVMVP_SWIFTPM_SECURITY_PATH"
-    BUILD_TMPDIR="$TVMVP_BUILD_TMPDIR"
+    case "$PROJECT_DIR" in
+        "$EXTERNAL_AGENT_WORK_ROOT"/*)
+            SWIFTPM_SCRATCH_PATH="${TVMVP_SWIFTPM_SCRATCH_PATH:-$PROJECT_DIR/.build}"
+            SWIFTPM_CACHE_PATH="${TVMVP_SWIFTPM_CACHE_PATH:-$PROJECT_DIR/.build/swiftpm-cache}"
+            SWIFTPM_SECURITY_PATH="${TVMVP_SWIFTPM_SECURITY_PATH:-$PROJECT_DIR/.build/swiftpm-security}"
+            BUILD_TMPDIR="${TVMVP_BUILD_TMPDIR:-$PROJECT_DIR/.build/tmp}"
+            ;;
+        *)
+            SWIFTPM_SCRATCH_PATH="${TVMVP_SWIFTPM_SCRATCH_PATH:-}"
+            SWIFTPM_CACHE_PATH="${TVMVP_SWIFTPM_CACHE_PATH:-}"
+            SWIFTPM_SECURITY_PATH="${TVMVP_SWIFTPM_SECURITY_PATH:-}"
+            BUILD_TMPDIR="${TVMVP_BUILD_TMPDIR:-}"
+            ;;
+    esac
     for storage_path in "$SWIFTPM_SCRATCH_PATH" "$SWIFTPM_CACHE_PATH" "$SWIFTPM_SECURITY_PATH" "$BUILD_TMPDIR"; do
-        if [[ ! -d "$storage_path" ]]; then
-            echo "external build storage directory must already exist: $storage_path" >&2
+        if [[ -z "$storage_path" ]]; then
+            echo "managed-volume builds require all SwiftPM cache and temporary paths to be configured" >&2
             exit 1
+        fi
+    done
+    for storage_path in "$SWIFTPM_SCRATCH_PATH" "$SWIFTPM_CACHE_PATH" "$SWIFTPM_SECURITY_PATH" "$BUILD_TMPDIR"; do
+        case "$storage_path" in
+            "$EXTERNAL_CODEX_ROOT"/*|"$EXTERNAL_AGENT_WORK_ROOT"/*) ;;
+            *) echo "managed-volume builds require all SwiftPM caches and temporary files under $EXTERNAL_VOLUME/Agent/work or $EXTERNAL_CODEX_ROOT" >&2; exit 1 ;;
+        esac
+        if [[ ! -d "$storage_path" ]]; then
+            mkdir -p -- "$storage_path"
         fi
         RESOLVED_STORAGE_PATH="$(cd -P "$storage_path" && pwd)"
         case "$RESOLVED_STORAGE_PATH" in
-            "$EXTERNAL_CODEX_ROOT"/*) ;;
-            *) echo "refusing storage path outside $EXTERNAL_CODEX_ROOT: $RESOLVED_STORAGE_PATH" >&2; exit 1 ;;
+            "$EXTERNAL_CODEX_ROOT"/*|"$EXTERNAL_AGENT_WORK_ROOT"/*) ;;
+            *) echo "refusing storage path outside managed work roots: $RESOLVED_STORAGE_PATH" >&2; exit 1 ;;
         esac
     done
     export TMPDIR="$BUILD_TMPDIR"
@@ -208,8 +224,21 @@ case "$APP_PARENT" in
         fi
         APP_DIR="$APP_DIR/$APP_NAME"
         ;;
+    "$EXTERNAL_AGENT_WORK_ROOT"|"$EXTERNAL_AGENT_WORK_ROOT"/*)
+        if [[ "$BUILD_ON_EXTERNAL" != "1" ]]; then
+            echo "managed app output must be requested under $EXTERNAL_AGENT_WORK_ROOT" >&2
+            exit 1
+        fi
+        APP_DIR="$APP_PARENT"
+        if (( ${#MISSING_PARENTS[@]} > 0 )); then
+            for missing_parent in "${MISSING_PARENTS[@]}"; do
+                APP_DIR="$APP_DIR/$missing_parent"
+            done
+        fi
+        APP_DIR="$APP_DIR/$APP_NAME"
+        ;;
     *)
-        echo "output app must be inside $DIST_ROOT or $EXTERNAL_CODEX_ROOT: $APP_DIR" >&2
+        echo "output app must be inside $DIST_ROOT, $EXTERNAL_AGENT_WORK_ROOT, or $EXTERNAL_CODEX_ROOT: $APP_DIR" >&2
         exit 1
         ;;
 esac

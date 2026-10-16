@@ -12,6 +12,198 @@ struct TextTargetApplication: Codable, Equatable, Sendable {
     let processIdentifier: Int32
 }
 
+enum AXTextAncestorScanStatus: String, Equatable, Sendable {
+    case webArea
+    case completeWithoutWebArea
+    case truncated
+    case cycle
+    case readFailure
+}
+
+struct AXTextAncestorScanResult: Equatable, Sendable {
+    let status: AXTextAncestorScanStatus
+    let webAreaDepth: Int?
+}
+
+/// Shared, bounded ancestor walk used by production AX discovery and replay tests.
+/// The walk includes the focused text element as depth zero and never guesses when
+/// the tree cannot be classified within the budget.
+struct AXTextAncestorScanner {
+    static func scan<Node>(
+        start: Node,
+        nodeLimit: Int = 64,
+        deadlineReached: () -> Bool = { false },
+        role: (Node) -> String?,
+        parent: (Node) -> Node?,
+        equals: (Node, Node) -> Bool,
+        onWebArea: ((Node, Int) -> Void)? = nil
+    ) -> AXTextAncestorScanResult {
+        guard nodeLimit > 0 else {
+            return AXTextAncestorScanResult(status: .truncated, webAreaDepth: nil)
+        }
+
+        var node = start
+        var visited: [Node] = []
+        for depth in 0..<nodeLimit {
+            if deadlineReached() {
+                return AXTextAncestorScanResult(status: .truncated, webAreaDepth: nil)
+            }
+            if visited.contains(where: { equals($0, node) }) {
+                return AXTextAncestorScanResult(status: .cycle, webAreaDepth: nil)
+            }
+            visited.append(node)
+
+            guard let nodeRole = role(node) else {
+                return AXTextAncestorScanResult(status: .readFailure, webAreaDepth: nil)
+            }
+            if deadlineReached() {
+                return AXTextAncestorScanResult(status: .truncated, webAreaDepth: nil)
+            }
+            if nodeRole == "AXWebArea" {
+                onWebArea?(node, depth)
+                return AXTextAncestorScanResult(status: .webArea, webAreaDepth: depth)
+            }
+
+            if deadlineReached() {
+                return AXTextAncestorScanResult(status: .truncated, webAreaDepth: nil)
+            }
+            guard let next = parent(node) else {
+                return AXTextAncestorScanResult(status: .completeWithoutWebArea, webAreaDepth: nil)
+            }
+            if deadlineReached() {
+                return AXTextAncestorScanResult(status: .truncated, webAreaDepth: nil)
+            }
+            node = next
+        }
+        return AXTextAncestorScanResult(status: .truncated, webAreaDepth: nil)
+    }
+}
+
+struct AXTextInputTargetContext: Equatable {
+    let role: String?
+    let hasWebAreaAncestor: Bool
+    let webURL: URL?
+    /// `nil` means the accessibility attribute could not be classified safely.
+    let isReadOnly: Bool?
+    let isSecure: Bool?
+    let ancestorScanStatus: AXTextAncestorScanStatus
+    let webAreaDepth: Int?
+
+    init(
+        role: String?,
+        hasWebAreaAncestor: Bool,
+        webURL: URL?,
+        isReadOnly: Bool?,
+        isSecure: Bool?,
+        ancestorScanStatus: AXTextAncestorScanStatus? = nil,
+        webAreaDepth: Int? = nil
+    ) {
+        self.role = role
+        self.hasWebAreaAncestor = hasWebAreaAncestor
+        self.webURL = webURL
+        self.isReadOnly = isReadOnly
+        self.isSecure = isSecure
+        self.ancestorScanStatus = ancestorScanStatus
+            ?? (hasWebAreaAncestor ? .webArea : .completeWithoutWebArea)
+        self.webAreaDepth = webAreaDepth
+    }
+}
+
+enum AXTextInputStrategy: Equatable {
+    case accessibility
+    case acknowledgedKeyboard(reason: String)
+    case safeStop(reason: String)
+
+    static func select(
+        application: TextTargetApplication?,
+        context: AXTextInputTargetContext?,
+        hasReadableTextState: Bool = true
+    ) -> AXTextInputStrategy {
+        guard let context,
+              context.role == "AXTextArea" || context.role == "AXTextField" else {
+            return .accessibility
+        }
+
+        // Never bypass an explicit read-only or secure signal, including for
+        // legacy application-specific routes.
+        guard context.isReadOnly != true, context.isSecure != true else {
+            return .safeStop(reason: "web_control_not_editable")
+        }
+
+        // Codex, Safari, and Obsidian have existing application-specific
+        // handling below this strategy layer. Preserve those routes when the
+        // web ancestry or editability metadata is temporarily unavailable;
+        // an explicit secure/read-only signal above still wins.
+        let usesSpecializedLegacyRoute = application?.bundleIdentifier == "com.openai.codex"
+            || application?.bundleIdentifier == "com.apple.Safari"
+            || application?.bundleIdentifier == "md.obsidian"
+        if usesSpecializedLegacyRoute {
+            return .accessibility
+        }
+
+        switch context.ancestorScanStatus {
+        case .truncated, .cycle, .readFailure:
+            return .safeStop(reason: "web_ancestor_unclassified")
+        case .webArea:
+            break
+        case .completeWithoutWebArea:
+            return .accessibility
+        }
+        guard context.hasWebAreaAncestor else { return .accessibility }
+
+        // A generic confirmed web control with an unreadable
+        // editability/security attribute is not safe to treat as a normal
+        // text target. Stop before either AX replacement or keyboard input;
+        // do not guess false.
+        guard context.isReadOnly != nil, context.isSecure != nil else {
+            return .safeStop(reason: "web_editability_unknown")
+        }
+        guard hasReadableTextState else {
+            return .safeStop(reason: "web_text_state_unreadable")
+        }
+        return .acknowledgedKeyboard(reason: "web_editable_text_control")
+    }
+
+    var diagnosticName: String {
+        switch self {
+        case .accessibility:
+            return "accessibility"
+        case .acknowledgedKeyboard:
+            return "acknowledged_keyboard"
+        case .safeStop:
+            return "safe_stop"
+        }
+    }
+
+    var diagnosticReason: String {
+        switch self {
+        case .accessibility:
+            return "default"
+        case let .acknowledgedKeyboard(reason):
+            return reason
+        case let .safeStop(reason):
+            return reason
+        }
+    }
+
+    var prefersAcknowledgedKeyboard: Bool {
+        if case .acknowledgedKeyboard = self { return true }
+        return false
+    }
+
+    var requiresSafeStop: Bool {
+        if case .safeStop = self { return true }
+        return false
+    }
+
+    var suppressesAXReplacement: Bool {
+        if case .acknowledgedKeyboard = self {
+            return true
+        }
+        return false
+    }
+}
+
 struct TextReplacementDelta: Equatable, Sendable {
     let prefixUTF16Length: Int
     let previousMiddleUTF16Length: Int
@@ -58,6 +250,7 @@ struct TextSnapshot {
     let targetApplication: TextTargetApplication?
     let placeholderNormalized: Bool
     let coordinateMapping: AXTextCoordinateMapping?
+    let preferredInputStrategy: AXTextInputStrategy
 
     init(
         element: AXUIElement? = nil,
@@ -68,7 +261,8 @@ struct TextSnapshot {
         rawText: String? = nil,
         coordinateText: String? = nil,
         placeholderNormalized: Bool = false,
-        coordinateMapping: AXTextCoordinateMapping? = nil
+        coordinateMapping: AXTextCoordinateMapping? = nil,
+        preferredInputStrategy: AXTextInputStrategy = .accessibility
     ) {
         self.element = element
         self.text = text
@@ -79,6 +273,7 @@ struct TextSnapshot {
         self.targetApplication = targetApplication
         self.placeholderNormalized = placeholderNormalized
         self.coordinateMapping = coordinateMapping
+        self.preferredInputStrategy = preferredInputStrategy
     }
 }
 

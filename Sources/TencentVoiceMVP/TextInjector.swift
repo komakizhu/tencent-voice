@@ -157,12 +157,29 @@ final class TextInjector {
             droppedDiagnosticCount = 0
             currentProjectionDiagnosticFields = [:]
             previousProjectionSegmentID = nil
+            if captured.preferredInputStrategy.requiresSafeStop {
+                mode = safeCopyEnabled ? .safeCopy : .disabledAfterError
+                inputPhase = .safeCopy
+                errorCount = 1
+                degradationCode = captured.preferredInputStrategy.diagnosticReason
+                degradationReason = captured.preferredInputStrategy.diagnosticReason
+                degradationOccurredAt = Date()
+                degradationOccurredMonotonicMilliseconds = TextInputDiagnosticClock.milliseconds()
+                recordDiagnostic("input_strategy_blocked", [
+                    "inputStrategy": captured.preferredInputStrategy.diagnosticName,
+                    "inputStrategyReason": captured.preferredInputStrategy.diagnosticReason,
+                    "degradationMode": modeDescription,
+                    "failureCode": degradationCode ?? "unknown"
+                ])
+                return
+            }
             // Codex advertises writable AX text and returns success even when
             // the next read does not reflect the insertion. Use keyboard input
             // from the start; retrying after an AX write could duplicate text.
             // AXTextTarget still checks the focused element and caret before
             // each keyboard operation.
-            let requiresKeyboardInput = captured.targetApplication?.bundleIdentifier == "com.openai.codex"
+            let requiresKeyboardInput = captured.preferredInputStrategy.prefersAcknowledgedKeyboard
+                || captured.targetApplication?.bundleIdentifier == "com.openai.codex"
             mode = captured.supportsAXReplacement && !requiresKeyboardInput ? .ax : .keyboardLiveTail
             installAXWriterIfNeeded()
             installKeyboardPacerIfNeeded()
