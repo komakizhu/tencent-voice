@@ -692,6 +692,462 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
     }
 
+    func testWebInputRoutingIsGenericAndKeepsSpecializedTargets() {
+        let chrome = TextTargetApplication(
+            name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001
+        )
+        let webContext = AXTextInputTargetContext(
+            role: "AXTextArea",
+            hasWebAreaAncestor: true,
+            webURL: URL(string: "https://example.com"),
+            isReadOnly: false,
+            isSecure: false,
+            ancestorScanStatus: .webArea,
+            webAreaDepth: 11
+        )
+
+        XCTAssertEqual(
+            AXTextInputStrategy.select(application: chrome, context: webContext),
+            .acknowledgedKeyboard(reason: "web_editable_text_control")
+        )
+        XCTAssertEqual(
+            AXTextInputStrategy.select(
+                application: chrome,
+                context: AXTextInputTargetContext(
+                    role: "AXTextField", hasWebAreaAncestor: true, webURL: webContext.webURL,
+                    isReadOnly: false, isSecure: false
+                )
+            ),
+            .acknowledgedKeyboard(reason: "web_editable_text_control")
+        )
+
+        let rejectedContexts = [
+            AXTextInputTargetContext(
+                role: "AXTextArea", hasWebAreaAncestor: false, webURL: webContext.webURL,
+                isReadOnly: false, isSecure: false
+            )
+        ]
+        for context in rejectedContexts {
+            XCTAssertEqual(
+                AXTextInputStrategy.select(application: chrome, context: context),
+                .accessibility
+            )
+        }
+        for context in [
+            AXTextInputTargetContext(
+                role: "AXTextArea", hasWebAreaAncestor: true, webURL: webContext.webURL,
+                isReadOnly: true, isSecure: false
+            ),
+            AXTextInputTargetContext(
+                role: "AXTextArea", hasWebAreaAncestor: true, webURL: webContext.webURL,
+                isReadOnly: false, isSecure: true
+            )
+        ] {
+            XCTAssertEqual(
+                AXTextInputStrategy.select(application: chrome, context: context),
+                .safeStop(reason: "web_control_not_editable")
+            )
+        }
+        XCTAssertEqual(
+            AXTextInputStrategy.select(
+                application: chrome,
+                context: AXTextInputTargetContext(
+                    role: "AXTextArea", hasWebAreaAncestor: true, webURL: webContext.webURL,
+                    isReadOnly: false, isSecure: false, ancestorScanStatus: .truncated
+                )
+            ),
+            .safeStop(reason: "web_ancestor_unclassified")
+        )
+        XCTAssertEqual(
+            AXTextInputStrategy.select(
+                application: chrome,
+                context: AXTextInputTargetContext(
+                    role: "AXTextArea", hasWebAreaAncestor: true, webURL: webContext.webURL,
+                    isReadOnly: nil, isSecure: false, ancestorScanStatus: .webArea
+                )
+            ),
+            .safeStop(reason: "web_editability_unknown")
+        )
+        XCTAssertEqual(
+            AXTextInputStrategy.select(
+                application: TextTargetApplication(
+                    name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001
+                ),
+                context: webContext
+            ),
+            .accessibility
+        )
+        for bundleIdentifier in ["com.openai.codex", "com.apple.Safari", "md.obsidian"] {
+            XCTAssertEqual(
+                AXTextInputStrategy.select(
+                    application: TextTargetApplication(
+                        name: bundleIdentifier,
+                        bundleIdentifier: bundleIdentifier,
+                        processIdentifier: 9001
+                    ),
+                    context: AXTextInputTargetContext(
+                        role: "AXTextArea", hasWebAreaAncestor: true, webURL: nil,
+                        isReadOnly: nil, isSecure: nil, ancestorScanStatus: .readFailure
+                    )
+                ),
+                .accessibility,
+                "specialized route must survive transient classification failure for \(bundleIdentifier)"
+            )
+        }
+    }
+
+    func testWebInputRoutingStopsWhenReadableStateIsMissing() {
+        let context = AXTextInputTargetContext(
+            role: "AXTextArea",
+            hasWebAreaAncestor: true,
+            webURL: nil,
+            isReadOnly: false,
+            isSecure: false,
+            ancestorScanStatus: .webArea
+        )
+        let strategy = AXTextInputStrategy.select(
+            application: TextTargetApplication(
+                name: "Anki", bundleIdentifier: "net.ankiweb.anki", processIdentifier: 9001
+            ),
+            context: context,
+            hasReadableTextState: false
+        )
+        XCTAssertEqual(strategy, .safeStop(reason: "web_text_state_unreadable"))
+    }
+
+    func testAncestorScannerUsesSameBoundForDeepWebAreaAndStopsAtTruncation() {
+        let deepChain = Dictionary(uniqueKeysWithValues: (0...11).map { ($0, $0 + 1) })
+        let deepResult = AXTextAncestorScanner.scan(
+            start: 0,
+            nodeLimit: 64,
+            role: { $0 == 11 ? "AXWebArea" : "AXGroup" },
+            parent: { deepChain[$0] },
+            equals: ==
+        )
+        XCTAssertEqual(deepResult, .init(status: .webArea, webAreaDepth: 11))
+
+        let truncatedResult = AXTextAncestorScanner.scan(
+            start: 0,
+            nodeLimit: 8,
+            role: { _ in "AXGroup" },
+            parent: { $0 + 1 },
+            equals: ==
+        )
+        XCTAssertEqual(truncatedResult.status, .truncated)
+
+        let unreadableResult = AXTextAncestorScanner.scan(
+            start: 0,
+            role: { _ in nil },
+            parent: { _ in nil },
+            equals: ==
+        )
+        XCTAssertEqual(unreadableResult.status, .readFailure)
+    }
+
+    func testChromePoeTextareaWithWritableAXAttributesUsesAcknowledgedKeyboard() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "",
+            selection: .init(location: 0, length: 0),
+            application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        access.axWriteNoOp = true
+        access.configureWebAncestorChain(depth: 11, webURL: URL(string: "https://poe.com/GPT-4o-mini"))
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("甲乙", revision: 1))
+        try await injector.finish(finalText: "甲乙")
+
+        XCTAssertEqual(access.rawText, "甲乙")
+        XCTAssertEqual(access.selection, .init(location: 2, length: 0))
+        XCTAssertEqual(access.axTextWrites, 0, "Poe must not use the Chrome AXSelectedText setter")
+        XCTAssertEqual(sender.appendPosts, 1)
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+        let diagnostics = injector.drainDiagnostics()
+        let capture = try XCTUnwrap(diagnostics.first { $0.event == "input_target_captured" })
+        XCTAssertEqual(capture.fields["inputStrategy"], "acknowledged_keyboard")
+        XCTAssertEqual(capture.fields["inputStrategyReason"], "web_editable_text_control")
+    }
+
+    func testQtWebEngineLikeTextAreaAvoidsMisleadingAXValue() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "已有",
+            selection: .init(location: 2, length: 0),
+            application: .init(name: "Anki", bundleIdentifier: "net.ankiweb.anki", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        access.axWriteNoOp = true
+        access.configureWebAncestorChain(depth: 3)
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("语音", revision: 1))
+        try await injector.finish(finalText: "语音")
+
+        XCTAssertEqual(access.rawText, "已有语音")
+        XCTAssertEqual(access.axTextWrites, 0)
+        XCTAssertEqual(sender.appendPosts, 1)
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+    }
+
+    func testChromePoeRoutingDoesNotGuessWhenAXTextStateIsUnreadable() throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "",
+            selection: .init(location: 0, length: 0),
+            application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+        )
+        access.alwaysFailTextReads = true
+        access.configureWebAncestorChain(depth: 11, webURL: URL(string: "https://poe.com/GPT-4o-mini"))
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+
+        let snapshot = try target.capture()
+        XCTAssertEqual(snapshot.preferredInputStrategy, .safeStop(reason: "web_text_state_unreadable"))
+        XCTAssertFalse(target.requiresKeyboardAcknowledgement)
+
+        let injector = TextInjector(target: target)
+        try injector.begin()
+        injector.apply(projection: projection("不应盲发", revision: 1))
+        try injector.finishImmediately(finalText: "不应盲发")
+        XCTAssertEqual(injector.modeDescription, "disabled_after_error")
+        XCTAssertEqual(sender.totalPosts, 0)
+        XCTAssertEqual(access.axTextWrites, 0)
+    }
+
+    func testUnclassifiedWebAncestorStopsBeforeAXReplacement() throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "已有",
+            selection: .init(location: 2, length: 0),
+            application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        access.configureCyclicAncestorChain()
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+
+        let snapshot = try target.capture()
+        XCTAssertEqual(snapshot.preferredInputStrategy, .safeStop(reason: "web_ancestor_unclassified"))
+        let injector = TextInjector(target: target)
+        try injector.begin()
+        injector.apply(projection: projection("不应发送", revision: 1))
+        try injector.finishImmediately(finalText: "不应发送")
+
+        XCTAssertEqual(sender.totalPosts, 0)
+        XCTAssertEqual(access.axTextWrites, 0)
+        XCTAssertEqual(injector.modeDescription, "disabled_after_error")
+        XCTAssertEqual(injector.degradationCode, "web_ancestor_unclassified")
+    }
+
+    func testWebReadFailureDoesNotFallBackToUnconfirmedKeyboardInput() throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "已有",
+            selection: .init(location: 2, length: 0),
+            application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        access.persistentTextReadError = TextTargetError.writeFailed
+        access.configureWebAncestorChain(depth: 11)
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+
+        let snapshot = try target.capture()
+        XCTAssertEqual(snapshot.preferredInputStrategy, .safeStop(reason: "web_text_state_unreadable"))
+        let injector = TextInjector(target: target)
+        try injector.begin()
+        injector.apply(projection: projection("不应发送", revision: 1))
+        try injector.finishImmediately(finalText: "不应发送")
+
+        XCTAssertEqual(sender.totalPosts, 0)
+        XCTAssertEqual(access.axTextWrites, 0)
+        XCTAssertEqual(injector.degradationCode, "web_text_state_unreadable")
+    }
+
+    func testInvalidWebSelectionIsNotAcceptedAsReadableState() throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "已有",
+            selection: .init(location: 99, length: 0),
+            application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        access.configureWebAncestorChain(depth: 11)
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+
+        let snapshot = try target.capture()
+        XCTAssertEqual(snapshot.preferredInputStrategy, .safeStop(reason: "web_text_state_unreadable"))
+        let injector = TextInjector(target: target)
+        try injector.begin()
+        injector.apply(projection: projection("不应发送", revision: 1))
+        try injector.finishImmediately(finalText: "不应发送")
+
+        XCTAssertEqual(sender.totalPosts, 0)
+        XCTAssertEqual(access.axTextWrites, 0)
+    }
+
+    func testChromePoeKeyboardRoutePreservesDraftCaretAndEmojiRevision() async throws {
+        let draft = "前置😀后缀"
+        let insertionLocation = "前置😀".utf16.count
+        let access = ReplayAXTextTargetAccess(
+            text: draft,
+            selection: .init(location: insertionLocation, length: 0),
+            application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        access.configureWebAncestorChain(depth: 11, webURL: URL(string: "https://poe.com/GPT-4o-mini"))
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection("中文", revision: 1))
+        injector.apply(projection: projection("中文😀", revision: 2))
+        try await injector.finish(finalText: "中文😀")
+
+        XCTAssertEqual(access.rawText, "前置😀中文😀后缀")
+        XCTAssertEqual(access.selection, .init(location: insertionLocation + "中文😀".utf16.count, length: 0))
+        XCTAssertEqual(access.axTextWrites, 0)
+        XCTAssertEqual(sender.totalPosts, 1, "coalesced revision must not duplicate the first draft insertion")
+        XCTAssertEqual(injector.errorCount, 0)
+    }
+
+    func testChromePoeKeyboardRouteStopsAfterNavigationBeforeDispatch() throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "",
+            selection: .init(location: 0, length: 0),
+            application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        access.configureWebAncestorChain(depth: 11, webURL: URL(string: "https://poe.com/GPT-4o-mini"))
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+
+        _ = try target.capture()
+        access.configureNativeAncestorChain()
+
+        XCTAssertThrowsError(try target.paste("不应发送")) { error in
+            XCTAssertEqual(error as? TextTargetError, .targetChanged)
+        }
+        XCTAssertEqual(sender.totalPosts, 0)
+        XCTAssertTrue(target.drainDiagnostics().contains { $0.event == "input_strategy_changed" })
+    }
+
+    func testChromePoeKeyboardRouteWaitsForDelayedReadbackWithoutResending() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "已有",
+            selection: .init(location: 2, length: 0),
+            application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+        )
+        access.textAttributesAreSettable = true
+        access.configureWebAncestorChain(depth: 11, webURL: URL(string: "https://poe.com/GPT-4o-mini"))
+        let sender = ReplayKeyboardEventSender(access: access)
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target, pacingClock: clock)
+
+        try injector.begin()
+        access.readSnapshotsAfterNextWrite = [
+            .init(rawText: "已有", coordinateText: "已有", selection: .init(location: 2, length: 0)),
+            .init(rawText: "已有语音", coordinateText: "已有语音", selection: .init(location: 4, length: 0))
+        ]
+        injector.apply(projection: projection("语音", revision: 1))
+        await finish(injector, finalText: "语音", advancing: clock)
+
+        access.readSnapshotsAfterNextWrite = [
+            .init(rawText: "已有语音", coordinateText: "已有语音", selection: .init(location: 4, length: 0)),
+            .init(rawText: "已有语境", coordinateText: "已有语境", selection: .init(location: 4, length: 0))
+        ]
+        injector.apply(projection: projection("语境", revision: 2))
+        await finish(injector, finalText: "语境", advancing: clock)
+
+        XCTAssertEqual(access.rawText, "已有语境")
+        XCTAssertEqual(sender.totalPosts, 2)
+        XCTAssertEqual(sender.selectionPosts, 1)
+        XCTAssertEqual(sender.replacementPosts, 1)
+        XCTAssertEqual(access.axTextWrites, 0)
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+    }
+
+    func testChromePoeKeyboardRouteStopsOnExternalEditOrFocusChangeWithoutResending() async throws {
+        for change in ["external", "focus"] {
+            let access = ReplayAXTextTargetAccess(
+                text: "已有",
+                selection: .init(location: 2, length: 0),
+                application: .init(name: "Chrome", bundleIdentifier: "com.google.Chrome", processIdentifier: 9001)
+            )
+            access.textAttributesAreSettable = true
+            access.configureWebAncestorChain(depth: 11, webURL: URL(string: "https://poe.com/GPT-4o-mini"))
+            let sender = ReplayKeyboardEventSender(access: access)
+            let clock = ManualKeyboardPacingClock()
+            let target = AXTextTarget(
+                access: access,
+                keyboardEventSender: sender,
+                writeTiming: .init(
+                    now: { clock.nowNanoseconds },
+                    sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+                ),
+                acknowledgementTimeoutNanoseconds: 20_000_000
+            )
+            let injector = TextInjector(target: target, pacingClock: clock)
+
+            try injector.begin()
+            injector.apply(projection: projection("语音", revision: 1))
+            await finish(injector, finalText: "语音", advancing: clock)
+            let posts = sender.totalPosts
+            if change == "external" {
+                access.externalEdit("用户编辑")
+            } else {
+                access.focusChanged = true
+            }
+
+            injector.apply(projection: projection("语境", revision: 2))
+            await finish(injector, finalText: "语境", advancing: clock)
+
+            XCTAssertEqual(sender.totalPosts, posts, change)
+            XCTAssertEqual(access.axTextWrites, 0, change)
+            XCTAssertEqual(injector.modeDescription, "disabled_after_error", change)
+            XCTAssertEqual(injector.degradationCode, "text_target_changed", change)
+            if change == "external" {
+                XCTAssertEqual(access.rawText, "用户编辑")
+            } else {
+                XCTAssertEqual(access.rawText, "已有语音")
+            }
+        }
+    }
+
+    func testCodexWithoutReadableAXTextKeepsLegacyKeyboardFallback() throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "草稿",
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.alwaysFailTextReads = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+
+        let snapshot = try target.capture()
+        XCTAssertFalse(snapshot.preferredInputStrategy.prefersAcknowledgedKeyboard)
+        XCTAssertFalse(target.requiresKeyboardAcknowledgement)
+        try target.paste("甲")
+
+        XCTAssertEqual(sender.totalPosts, 1)
+        XCTAssertEqual(access.rawText, "草稿甲")
+    }
+
     func testAXWriteMustWaitForReadbackBeforeAdvancingState() async throws {
         let before = String(repeating: "草", count: 1068)
         let firstDocument = NSMutableString(string: before)
@@ -1830,6 +2286,10 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var permissionError: TextTargetError?
     var selectionRangeIsSettable = false
     var proseMirror = false
+    private var ancestorRoles: [Int: String] = [:]
+    private var ancestorParents: [Int: Int] = [:]
+    private var ancestorWebURL: URL?
+    private var usesAncestorScanner = false
     var textAttributesAreSettable = false
     var selectedTextAttributeIsSettable: Bool?
     var valueAttributeIsSettable: Bool?
@@ -1891,6 +2351,57 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     private let rebuiltElement = AXUIElementCreateApplication(9003)
 
     func processIdentifier(of element: AXUIElement) -> pid_t? { 9001 }
+
+    func textInputContext(for element: AXUIElement) -> AXTextInputTargetContext? {
+        if usesAncestorScanner {
+            let scan = AXTextAncestorScanner.scan(
+                start: 0,
+                role: { ancestorRoles[$0] },
+                parent: { ancestorParents[$0] },
+                equals: ==
+            )
+            return AXTextInputTargetContext(
+                role: ancestorRoles[0],
+                hasWebAreaAncestor: scan.status == .webArea,
+                webURL: scan.status == .webArea ? ancestorWebURL : nil,
+                isReadOnly: false,
+                isSecure: false,
+                ancestorScanStatus: scan.status,
+                webAreaDepth: scan.webAreaDepth
+            )
+        }
+        return nil
+    }
+
+    func configureWebAncestorChain(depth: Int, webURL: URL? = nil, role: String = "AXTextArea") {
+        usesAncestorScanner = true
+        ancestorRoles = [0: role]
+        ancestorParents = [:]
+        guard depth > 0 else {
+            ancestorRoles[0] = "AXWebArea"
+            ancestorWebURL = webURL
+            return
+        }
+        for node in 1...depth {
+            ancestorRoles[node] = node == depth ? "AXWebArea" : "AXGroup"
+            ancestorParents[node - 1] = node
+        }
+        ancestorWebURL = webURL
+    }
+
+    func configureNativeAncestorChain(role: String = "AXTextArea") {
+        usesAncestorScanner = true
+        ancestorRoles = [0: role]
+        ancestorParents = [:]
+        ancestorWebURL = nil
+    }
+
+    func configureCyclicAncestorChain(role: String = "AXTextArea") {
+        usesAncestorScanner = true
+        ancestorRoles = [0: role]
+        ancestorParents = [0: 0]
+        ancestorWebURL = nil
+    }
 
     func text(in element: AXUIElement) throws -> String? {
         textReadCount += 1
