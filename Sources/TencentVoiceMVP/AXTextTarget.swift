@@ -1108,13 +1108,13 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             )
             keyboardOperationGeneration &+= 1
             let operationGeneration = keyboardOperationGeneration
-            let usesAXSelection = targetElement.map {
+            let usesAXSelection = !isCodexTarget && (targetElement.map {
                 selectedTextRangeIsSettable(on: $0)
-            } ?? false
+            } ?? false)
             if usesAXSelection, let targetElement {
-                // AXSelectedTextRange and AXStringForRange use the same
-                // coordinate space. The raw mapping is only for predicting
-                // the AXValue receipt, not for moving the accessibility caret.
+                // Codex exposes AXSelectedTextRange, but replacing through that
+                // range can collapse an adjacent structural paragraph marker.
+                // Its keyboard path preserves the editor's paragraph boundary.
                 try setSelection(replacementRange, on: targetElement)
             } else {
                 try keyboardEventSender.selectTrailingText(previousText, processID: eventProcessID)
