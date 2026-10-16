@@ -5,6 +5,20 @@ import Foundation
 // Explicit diagnostic CLI mode. No microphone, hotkey, window activation, or Return key.
 @MainActor
 enum InputReplay {
+    enum ArgumentError: Error, Equatable {
+        case missingTargetBundle
+    }
+
+    static func targetBundleArgument(from args: [String]) throws -> String? {
+        guard let bundleIndex = args.firstIndex(of: "--target-bundle") else { return nil }
+        guard bundleIndex + 1 < args.count,
+              !args[bundleIndex + 1].hasPrefix("--"),
+              !args[bundleIndex + 1].isEmpty else {
+            throw ArgumentError.missingTargetBundle
+        }
+        return args[bundleIndex + 1]
+    }
+
     static func start() {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
@@ -21,8 +35,26 @@ enum InputReplay {
         guard let index = args.firstIndex(of: "--target-pid"), index + 1 < args.count,
               let pid = Int32(args[index + 1]),
               let app = NSWorkspace.shared.frontmostApplication,
-              app.processIdentifier == pid, app.bundleIdentifier == "com.openai.codex" else {
-            print("Replay refused: specified Codex process must already be frontmost.")
+              app.processIdentifier == pid else {
+            print("Replay refused: specified target process must already be frontmost.")
+            return 2
+        }
+        let expectedBundle: String?
+        do {
+            expectedBundle = try Self.targetBundleArgument(from: args)
+        } catch ArgumentError.missingTargetBundle {
+            print("Replay refused: --target-bundle requires a bundle identifier.")
+            return 2
+        } catch {
+            print("Replay refused: invalid target bundle arguments.")
+            return 2
+        }
+        if args.contains("--allow-test-input"), expectedBundle == nil {
+            print("Replay refused: --allow-test-input requires --target-bundle.")
+            return 2
+        }
+        if let expectedBundle, app.bundleIdentifier != expectedBundle {
+            print("Replay refused: frontmost target bundle does not match --target-bundle.")
             return 2
         }
         guard AXIsProcessTrusted(), CGPreflightPostEventAccess() else {
@@ -93,29 +125,9 @@ enum InputReplay {
             }
             if let current = recorder.stringAttribute(kAXValueAttribute),
                fixtures.contains(current) || (!current.isEmpty && current == ownedRemainder) {
-                guard recorder.selection() == TextRange(location: current.utf16.count, length: 0) else {
-                    recorder.observe("refused_fixture_selection_changed")
-                    return 2
-                }
-                do {
-                    let cleanupTarget = AXTextTarget()
-                    _ = try cleanupTarget.capture()
-                    try cleanupTarget.replaceTrailingText(current, with: "")
-                    try await cleanupTarget.acknowledgeKeyboardWrite()
-                    let deadline = ProcessInfo.processInfo.systemUptime + 10
-                    while ProcessInfo.processInfo.systemUptime < deadline {
-                        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return 2 }
-                        let value = recorder.stringAttribute(kAXValueAttribute)
-                        if (value == "" || value == "\n随心输入"), recorder.selection() == TextRange(location: 0, length: 0) {
-                            recorder.observe("owned_fixture_cleared")
-                            break
-                        }
-                        try await Task.sleep(nanoseconds: 10_000_000)
-                    }
-                } catch {
-                    recorder.emit(["event": "fixture_cleanup_failed", "code": DiagnosticErrorFormatter.code(for: error)])
-                    return 2
-                }
+                recorder.observe("owned_fixture_present_refused")
+                print("Replay refused: an existing fixture is present; it will not be cleared automatically.")
+                return 2
             }
         }
         // Reading an empty field can return its placeholder as the AX value.

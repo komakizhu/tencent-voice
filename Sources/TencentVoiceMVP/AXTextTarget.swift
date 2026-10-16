@@ -247,6 +247,7 @@ protocol AXTextTargetAccess {
     func currentApplication() -> TextTargetApplication?
     func focusedElement() throws -> AXUIElement
     func processIdentifier(of element: AXUIElement) -> pid_t?
+    func textInputContext(for element: AXUIElement) -> AXTextInputTargetContext?
     func text(in element: AXUIElement) throws -> String?
     func selection(in element: AXUIElement) throws -> TextRange?
     func coordinateText(for range: TextRange, in element: AXUIElement) throws -> String?
@@ -260,6 +261,7 @@ protocol AXTextTargetAccess {
 }
 
 extension AXTextTargetAccess {
+    func textInputContext(for element: AXUIElement) -> AXTextInputTargetContext? { nil }
     func isProseMirrorEditor(_ element: AXUIElement) -> Bool { false }
     func drainReadDiagnostics() -> [TextInputDiagnostic] { [] }
 }
@@ -308,6 +310,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     private var targetElement: AXUIElement?
     private var targetProcessID: pid_t?
     private var targetApplicationProcessID: pid_t?
+    private var activeInputStrategy: AXTextInputStrategy = .accessibility
     private var expectedKeyboardSelection: TextRange?
     private let access: any AXTextTargetAccess
     private let keyboardEventSender: any AXTextTargetKeyboardEventSending
@@ -417,6 +420,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         targetElement = nil
         targetProcessID = nil
         expectedKeyboardSelection = nil
+        activeInputStrategy = .accessibility
         let targetApplication = currentApplication()
         targetApplicationProcessID = targetApplication.map { pid_t($0.processIdentifier) }
         isCodexTarget = targetApplication?.bundleIdentifier == "com.openai.codex"
@@ -448,11 +452,26 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         // focused element as a keyboard target instead of falling all the way
         // back to append-only mode. When Codex exposes readable text, however,
         // its AXValue and selection coordinates must be interpreted together.
-        let rawText = try element.flatMap { try captureReadableText(in: $0) }
-        let readableKeyboardSelection = try element.flatMap { try captureReadableSelection(in: $0) }
+        let inputContext = element.flatMap { access.textInputContext(for: $0) }
+        let rawText = try element.flatMap { element in
+            try captureReadableText(in: element, context: inputContext)
+        }
+        let readableKeyboardSelection = try element.flatMap { element in
+            try captureReadableSelection(in: element, context: inputContext)
+        }
+        let hasReadableAXTextState = if let rawText, let readableKeyboardSelection {
+            isValidTextRange(readableKeyboardSelection, in: rawText)
+        } else {
+            false
+        }
         let rawSelection = readableKeyboardSelection
             ?? TextRange(location: rawText?.utf16.count ?? 0, length: 0)
-        let hasReadableAXTextState = rawText != nil && readableKeyboardSelection != nil
+        let inputStrategy = AXTextInputStrategy.select(
+            application: targetApplication,
+            context: inputContext,
+            hasReadableTextState: hasReadableAXTextState
+        )
+        activeInputStrategy = inputStrategy
         var codexState: AXTextDocumentState?
         if isCodexTarget, let element, let rawText, let readableKeyboardSelection {
             let evidence = placeholderEvidence(in: element)
@@ -488,7 +507,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         let text = codexState?.text ?? rawText ?? ""
         let selection = codexState?.selection ?? rawSelection
         expectedKeyboardSelection = selection
-        requiresKeyboardAcknowledgement = hasReadableAXTextState
+        requiresKeyboardAcknowledgement = hasReadableAXTextState || inputStrategy.prefersAcknowledgedKeyboard
         confirmedKeyboardDocument = if let codexState {
             codexState.text
         } else if !isCodexTarget, let rawText {
@@ -518,25 +537,39 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             "axValueLengthUTF16": String(rawText?.utf16.count ?? 0),
             "axCoordinateLengthUTF16": String(codexState?.text.utf16.count ?? text.utf16.count),
             "selectionLocation": String(selection.location), "selectionLength": String(selection.length),
-            "keyboardCompatibility": String(isCodexTarget || isSafariWebEditor),
-            "safariWebEditor": String(isSafariWebEditor)
+            "keyboardCompatibility": String(
+                isCodexTarget || isSafariWebEditor || inputStrategy.prefersAcknowledgedKeyboard
+            ),
+            "safariWebEditor": String(isSafariWebEditor),
+            "inputStrategy": inputStrategy.diagnosticName,
+            "inputStrategyReason": inputStrategy.diagnosticReason,
+            "inputStrategyHasReadableState": String(hasReadableAXTextState),
+            "inputRole": inputContext?.role ?? "unknown",
+            "inputReadOnly": inputContext.flatMap { $0.isReadOnly }.map { String($0) } ?? "unknown",
+            "inputSecure": inputContext.flatMap { $0.isSecure }.map { String($0) } ?? "unknown",
+            "ancestorScanStatus": inputContext.map { $0.ancestorScanStatus.rawValue } ?? "unavailable",
+            "webAreaDepth": inputContext.flatMap { $0.webAreaDepth }.map(String.init) ?? "unknown"
         ])
         return TextSnapshot(
             element: element,
             text: text,
             selection: selection,
-            supportsAXReplacement: !isSafariWebEditor && !isObsidianTarget && hasReadableAXTextState && (element.map {
+            supportsAXReplacement: !inputStrategy.suppressesAXReplacement
+                && !inputStrategy.requiresSafeStop
+                && !isSafariWebEditor && !isObsidianTarget && hasReadableAXTextState && (element.map {
                 selectedTextIsSettable(on: $0) || valueIsSettable(on: $0)
             } ?? false),
             targetApplication: targetApplication,
             rawText: rawText ?? text,
             coordinateText: codexState?.text ?? text,
             placeholderNormalized: codexState?.placeholderNormalized ?? false,
-            coordinateMapping: codexState?.mapping
+            coordinateMapping: codexState?.mapping,
+            preferredInputStrategy: inputStrategy
         )
     }
 
     func replace(snapshot: TextSnapshot, range: TextRange, expectedText: String, with text: String) throws -> TextRange {
+        guard snapshot.supportsAXReplacement else { throw TextTargetError.unsupported }
         guard let expectedElement = snapshot.element else { throw TextTargetError.unsupported }
         let element = try focusedElement()
         guard CFEqual(element, expectedElement) else {
@@ -1897,6 +1930,24 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             recordDiagnostic("keyboard_focus_changed")
             throw TextTargetError.targetChanged
         }
+        try ensureActiveInputStrategyIsStillApplicable(for: currentElement)
+    }
+
+    private func ensureActiveInputStrategyIsStillApplicable(for element: AXUIElement) throws {
+        guard activeInputStrategy.suppressesAXReplacement else { return }
+        let currentStrategy = AXTextInputStrategy.select(
+            application: access.currentApplication(),
+            context: access.textInputContext(for: element)
+        )
+        guard currentStrategy == activeInputStrategy else {
+            recordDiagnostic("input_strategy_changed", [
+                "expectedStrategy": activeInputStrategy.diagnosticName,
+                "expectedReason": activeInputStrategy.diagnosticReason,
+                "actualStrategy": currentStrategy.diagnosticName,
+                "actualReason": currentStrategy.diagnosticReason
+            ])
+            throw TextTargetError.targetChanged
+        }
     }
 
     private func reacquireSafariTarget(_ element: AXUIElement, phase: String) throws {
@@ -2150,10 +2201,16 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         try? access.text(in: element)
     }
 
-    private func captureReadableText(in element: AXUIElement) throws -> String? {
+    private func captureReadableText(
+        in element: AXUIElement,
+        context: AXTextInputTargetContext?
+    ) throws -> String? {
         do {
             return try access.text(in: element)
         } catch KeyboardWriteReadError.retryable, TextTargetError.unsupported {
+            return nil
+        } catch {
+            guard shouldStopBeforeUncertainWebWrite(context) else { throw error }
             return nil
         }
     }
@@ -2236,18 +2293,45 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         try? access.selection(in: element)
     }
 
-    private func captureReadableSelection(in element: AXUIElement) throws -> TextRange? {
+    private func captureReadableSelection(
+        in element: AXUIElement,
+        context: AXTextInputTargetContext?
+    ) throws -> TextRange? {
         do {
             return try access.selection(in: element)
         } catch KeyboardWriteReadError.retryable, TextTargetError.unsupported {
             return nil
+        } catch {
+            guard shouldStopBeforeUncertainWebWrite(context) else { throw error }
+            return nil
         }
+    }
+
+    private func shouldStopBeforeUncertainWebWrite(_ context: AXTextInputTargetContext?) -> Bool {
+        guard let context,
+              context.role == "AXTextArea" || context.role == "AXTextField" else {
+            return false
+        }
+        switch context.ancestorScanStatus {
+        case .webArea, .truncated, .cycle, .readFailure:
+            return true
+        case .completeWithoutWebArea:
+            return false
+        }
+    }
+
+    private func isValidTextRange(_ range: TextRange, in text: String) -> Bool {
+        range.location >= 0
+            && range.length >= 0
+            && range.location <= text.utf16.count
+            && range.length <= text.utf16.count - range.location
     }
 
 }
 
 @MainActor
 final class SystemAXTextTargetAccess: AXTextTargetAccess {
+    private struct AncestorAttributeReadFailure: Error {}
     private var readDiagnostics: [TextInputDiagnostic] = []
 
     func drainReadDiagnostics() -> [TextInputDiagnostic] {
@@ -2301,6 +2385,56 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
             return nil
         }
         return processID
+    }
+
+    func textInputContext(for element: AXUIElement) -> AXTextInputTargetContext? {
+        let role = stringAttribute(kAXRoleAttribute as String, from: element)
+        let subroleState = stringAttributeState(kAXSubroleAttribute as String, from: element)
+        let subrole = subroleState.value
+        let secureAttribute = boolAttribute("AXSecureTextField", from: element)
+        let isSecure: Bool?
+        if subrole == "AXSecureTextField" {
+            isSecure = true
+        } else if !subroleState.known {
+            isSecure = nil
+        } else {
+            isSecure = secureAttribute
+        }
+        let isReadOnly = boolAttribute("AXReadOnly", from: element)
+
+        let deadline = Date().addingTimeInterval(0.25)
+        var webArea: AXUIElement?
+        var parentReadFailure = false
+        let scan = AXTextAncestorScanner.scan(
+            start: element,
+            nodeLimit: 64,
+            deadlineReached: { Date() >= deadline },
+            role: { [weak self] node in
+                self?.stringAttribute(kAXRoleAttribute as String, from: node)
+            },
+            parent: { [weak self] node in
+                do {
+                    return try self?.parentElementAttribute("AXParent", from: node)
+                } catch {
+                    parentReadFailure = true
+                    return nil
+                }
+            },
+            equals: { lhs, rhs in CFEqual(lhs, rhs) },
+            onWebArea: { node, _ in webArea = node }
+        )
+        let resolvedScan = parentReadFailure && scan.status == .completeWithoutWebArea
+            ? AXTextAncestorScanResult(status: .readFailure, webAreaDepth: nil)
+            : scan
+        return AXTextInputTargetContext(
+            role: role,
+            hasWebAreaAncestor: resolvedScan.status == .webArea,
+            webURL: webArea.flatMap { urlAttribute("AXURL", from: $0) },
+            isReadOnly: isReadOnly,
+            isSecure: isSecure,
+            ancestorScanStatus: resolvedScan.status,
+            webAreaDepth: resolvedScan.webAreaDepth
+        )
     }
 
     func text(in element: AXUIElement) throws -> String? {
@@ -2443,6 +2577,23 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
         return nil
     }
 
+    private func stringAttributeState(_ name: String, from element: AXUIElement) -> (value: String?, known: Bool) {
+        var value: CFTypeRef?
+        AXUIElementSetMessagingTimeout(element, 0.03)
+        let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        switch status {
+        case .success:
+            if let text = value as? String { return (text, true) }
+            if let attributedText = value as? NSAttributedString { return (attributedText.string, true) }
+            return (nil, false)
+        case .noValue:
+            return (nil, true)
+        default:
+            recordReadStatus(status, attribute: name)
+            return (nil, false)
+        }
+    }
+
     private func classTokens(in element: AXUIElement) -> Set<String> {
         guard let value = try? attribute("AXDOMClassList", from: element) else { return [] }
         if let values = value as? [String] {
@@ -2461,8 +2612,49 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
         )
     }
 
+    private func boolAttribute(_ name: String, from element: AXUIElement) -> Bool? {
+        var value: CFTypeRef?
+        AXUIElementSetMessagingTimeout(element, 0.03)
+        let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        guard status != .noValue else { return false }
+        guard status == .success, let value else {
+            recordReadStatus(status, attribute: name)
+            return nil
+        }
+        if let boolean = value as? Bool { return boolean }
+        if let number = value as? NSNumber { return number.boolValue }
+        return nil
+    }
+
+    private func urlAttribute(_ name: String, from element: AXUIElement) -> URL? {
+        guard let value = try? attribute(name, from: element) else { return nil }
+        if let url = value as? URL { return url }
+        if let url = value as? NSURL { return url as URL }
+        if let string = value as? String { return URL(string: string) }
+        return nil
+    }
+
+    private func parentElementAttribute(_ name: String, from element: AXUIElement) throws -> AXUIElement? {
+        var value: CFTypeRef?
+        AXUIElementSetMessagingTimeout(element, 0.03)
+        let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        switch status {
+        case .success:
+            guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
+                throw AncestorAttributeReadFailure()
+            }
+            return unsafeBitCast(value, to: AXUIElement.self)
+        case .noValue:
+            return nil
+        default:
+            recordReadStatus(status, attribute: name)
+            throw AncestorAttributeReadFailure()
+        }
+    }
+
     private func attribute(_ name: String, from element: AXUIElement) throws -> CFTypeRef? {
         var value: CFTypeRef?
+        AXUIElementSetMessagingTimeout(element, 0.03)
         let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
         if [kAXFocusedUIElementAttribute, kAXValueAttribute, kAXSelectedTextRangeAttribute].contains(name) {
             recordReadStatus(status, attribute: name)
