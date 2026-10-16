@@ -14,6 +14,7 @@ private enum KeyboardDocumentStateReadError: Error {
 
 private enum KeyboardReceiptRepresentation {
     static let trailingNewlineCollapsed = "trailing_newline_collapsed"
+    static let emptyParagraphMarkerCollapsed = "empty_paragraph_marker_collapsed"
 }
 
 private struct PendingKeyboardReplacement {
@@ -26,6 +27,7 @@ private struct PendingKeyboardReplacement {
 
 private struct PendingKeyboardRepresentationTransition {
     let alternates: [KeyboardDocumentState]
+    let representation: String
     let insertionPositionClass: String
     let sessionGeneration: UInt64
     let operationGeneration: UInt64
@@ -1054,7 +1056,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 "expectedLocation": String(receipt.selection.location),
                 "expectedDocumentLength": String(receipt.text.utf16.count),
                 "receiptRepresentationTransition": pendingKeyboardRepresentationTransition != nil
-                    ? KeyboardReceiptRepresentation.trailingNewlineCollapsed
+                    ? pendingKeyboardRepresentationTransition?.representation ?? "none"
                     : "none"
             ]
             recordDiagnostic("keyboard_write_submitted", fields)
@@ -1370,7 +1372,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 "observedLengthUTF16": String(acknowledgedState.text.utf16.count),
                 "observedAXValueLengthUTF16": String(acknowledgedState.rawText?.utf16.count ?? 0),
                 "receiptRepresentationTransition": usedRepresentationTransition
-                    ? KeyboardReceiptRepresentation.trailingNewlineCollapsed
+                    ? pendingRepresentationTransition?.representation ?? "none"
                     : "none"
             ]
             let acknowledgementEvidence = acknowledgementTrace.fields(
@@ -1396,7 +1398,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 "observedLengthUTF16": String(lastObservedState?.text.utf16.count ?? 0),
                 "observedAXValueLengthUTF16": String(lastObservedState?.rawText?.utf16.count ?? 0),
                 "receiptRepresentationTransition": pendingRepresentationTransition != nil
-                    ? KeyboardReceiptRepresentation.trailingNewlineCollapsed
+                    ? pendingRepresentationTransition?.representation ?? "none"
                     : "none"
             ]
             let failureEvidence = acknowledgementTrace.fields(
@@ -1469,7 +1471,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
            let rawDocumentForTransition,
            let rawRangeForTransition,
            let mappingForTransition {
-            let alternates = trailingNewlineCollapsedReceipts(
+            let alternates = emptyParagraphCollapsedReceipts(
                 document: document,
                 range: range,
                 text: text,
@@ -1480,7 +1482,11 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             if !alternates.isEmpty {
                 pendingKeyboardRepresentationTransition = PendingKeyboardRepresentationTransition(
                     alternates: alternates,
-                    insertionPositionClass: trailingNewlineInsertionPositionClass(
+                    representation: emptyParagraphRepresentation(
+                        document: document,
+                        range: range
+                    ),
+                    insertionPositionClass: emptyParagraphInsertionPositionClass(
                         document: document,
                         range: range
                     ),
@@ -1492,7 +1498,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         return primary
     }
 
-    private func trailingNewlineCollapsedReceipts(
+    private func emptyParagraphCollapsedReceipts(
         document: String,
         range: TextRange,
         text: String,
@@ -1518,12 +1524,12 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             return []
         }
 
-        let documentTrailingNewlineCount = trailingNewlineCount(in: document)
-        let rawTrailingNewlineCount = trailingNewlineCount(in: rawDocument)
-        guard documentTrailingNewlineCount > 0,
-              documentTrailingNewlineCount == rawTrailingNewlineCount,
-              range.location >= document.utf16.count - documentTrailingNewlineCount,
-              rawRange.location >= rawDocument.utf16.count - rawTrailingNewlineCount else {
+        guard let documentRun = newlineRun(containing: range.location, in: document),
+              let rawRun = newlineRun(containing: rawRange.location, in: rawDocument),
+              isEligibleEmptyParagraphRun(documentRun, documentLength: document.utf16.count),
+              isEligibleEmptyParagraphRun(rawRun, documentLength: rawDocument.utf16.count),
+              emptyParagraphRegion(for: documentRun, documentLength: document.utf16.count)
+                == emptyParagraphRegion(for: rawRun, documentLength: rawDocument.utf16.count) else {
             return []
         }
 
@@ -1592,6 +1598,11 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             resolved.text == alternateText,
             resolved.selection == alternateSelection,
             resolved.mapping.source == .axStringForRange,
+            AXTextDocumentResolver.isValidCoordinateMapping(
+                resolved.mapping,
+                rawText: resolved.rawText,
+                coordinateText: resolved.text
+            ),
             resolved.mapping.rawRange(for: alternateSelection) != nil else {
                 continue
             }
@@ -1603,6 +1614,31 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             ))
         }
         return candidates
+    }
+
+    private func emptyParagraphRepresentation(document: String, range: TextRange) -> String {
+        guard let run = newlineRun(containing: range.location, in: document),
+              let region = emptyParagraphRegion(for: run, documentLength: document.utf16.count) else {
+            return KeyboardReceiptRepresentation.emptyParagraphMarkerCollapsed
+        }
+        return region == .trailing
+            ? KeyboardReceiptRepresentation.trailingNewlineCollapsed
+            : KeyboardReceiptRepresentation.emptyParagraphMarkerCollapsed
+    }
+
+    private func emptyParagraphInsertionPositionClass(document: String, range: TextRange) -> String {
+        guard let run = newlineRun(containing: range.location, in: document),
+              let region = emptyParagraphRegion(for: run, documentLength: document.utf16.count) else {
+            return "not_empty_paragraph"
+        }
+        switch region {
+        case .trailing:
+            return trailingNewlineInsertionPositionClass(document: document, range: range)
+        case .leading:
+            return "leading_empty_paragraph"
+        case .interior:
+            return "interior_empty_paragraph"
+        }
     }
 
     private func trailingNewlineInsertionPositionClass(document: String, range: TextRange) -> String {
@@ -1623,6 +1659,64 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         if offset == trailingCount - 1 { return "last_trailing_newline" }
         if offset == trailingCount - 2 { return "second_last_trailing_newline" }
         return "middle_trailing_newline"
+    }
+
+    private enum EmptyParagraphRegion: Equatable {
+        case leading
+        case interior
+        case trailing
+    }
+
+    private struct NewlineRun {
+        let start: Int
+        let end: Int
+
+        var count: Int { end - start }
+    }
+
+    private func newlineRun(containing location: Int, in text: String) -> NewlineRun? {
+        let units = Array(text.utf16)
+        guard location >= 0, location < units.count, units[location] == 0x0A else {
+            return nil
+        }
+        var start = location
+        while start > 0, units[start - 1] == 0x0A {
+            start -= 1
+        }
+        var end = location + 1
+        while end < units.count, units[end] == 0x0A {
+            end += 1
+        }
+        return NewlineRun(start: start, end: end)
+    }
+
+    private func emptyParagraphRegion(
+        for run: NewlineRun,
+        documentLength: Int
+    ) -> EmptyParagraphRegion? {
+        guard run.count > 0 else { return nil }
+        if run.end == documentLength {
+            return .trailing
+        }
+        if run.start == 0 {
+            return .leading
+        }
+        return .interior
+    }
+
+    private func isEligibleEmptyParagraphRun(
+        _ run: NewlineRun,
+        documentLength: Int
+    ) -> Bool {
+        guard let region = emptyParagraphRegion(for: run, documentLength: documentLength) else {
+            return false
+        }
+        switch region {
+        case .leading, .trailing:
+            return run.count >= 1
+        case .interior:
+            return run.count >= 2
+        }
     }
 
     private func matchesKeyboardReceipt(
