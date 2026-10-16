@@ -6,6 +6,251 @@ private typealias ReplayTextRange = TencentVoiceMVP.TextRange
 
 @MainActor
 final class AXTextTargetReplayTests: XCTestCase {
+    func testCodexLeadingAndInteriorEmptyParagraphsAcceptCollapsedMarker() async throws {
+        let cases = [
+            (
+                name: "leading",
+                before: "\n\n甲乙丙",
+                insertionLocation: 0,
+                afterFirst: "今\n甲乙丙",
+                afterAppend: "今天\n甲乙丙",
+                afterRevision: "今明\n甲乙丙",
+                expectedClass: "leading_empty_paragraph"
+            ),
+            (
+                name: "interior",
+                before: "甲\n\n乙🙂丙",
+                insertionLocation: 1,
+                afterFirst: "甲今\n乙🙂丙",
+                afterAppend: "甲今天\n乙🙂丙",
+                afterRevision: "甲今明\n乙🙂丙",
+                expectedClass: "interior_empty_paragraph"
+            )
+        ]
+
+        for testCase in cases {
+            let access = ReplayAXTextTargetAccess(
+                text: testCase.before,
+                selection: .init(location: testCase.insertionLocation, length: 0),
+                application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+            )
+            access.coordinateOverride = testCase.before
+            access.writeSnapshots = [
+                .init(
+                    rawText: testCase.afterFirst,
+                    coordinateText: testCase.afterFirst,
+                    selection: .init(location: testCase.insertionLocation + 1, length: 0)
+                ),
+                .init(
+                    rawText: testCase.afterAppend,
+                    coordinateText: testCase.afterAppend,
+                    selection: .init(location: testCase.insertionLocation + 2, length: 0)
+                ),
+                .init(
+                    rawText: testCase.afterRevision,
+                    coordinateText: testCase.afterRevision,
+                    selection: .init(location: testCase.insertionLocation + 2, length: 0)
+                )
+            ]
+            let sender = ReplayKeyboardEventSender(access: access)
+            let target = AXTextTarget(
+                access: access,
+                keyboardEventSender: sender,
+                acknowledgementTimeoutNanoseconds: 20_000_000
+            )
+
+            _ = try target.capture()
+            try target.paste("今")
+            try await target.acknowledgeKeyboardWrite()
+            try target.paste("天")
+            try await target.acknowledgeKeyboardWrite()
+            try target.replaceTrailingText("今天", with: "今明")
+            try await target.acknowledgeKeyboardWrite()
+
+            XCTAssertEqual(access.rawText, testCase.afterRevision, testCase.name)
+            XCTAssertEqual(access.selection, .init(location: testCase.insertionLocation + 2, length: 0), testCase.name)
+            XCTAssertEqual(sender.appendPosts, 2, testCase.name)
+            XCTAssertEqual(sender.replacementPosts, 1, testCase.name)
+            let diagnostics = target.drainDiagnostics()
+            XCTAssertFalse(diagnostics.contains { $0.event == "keyboard_write_unconfirmed" }, testCase.name)
+            let acknowledgement = try XCTUnwrap(
+                diagnostics.first {
+                    $0.event == "keyboard_write_acknowledged"
+                        && $0.fields["receiptRepresentationTransition"] == "empty_paragraph_marker_collapsed"
+                },
+                testCase.name
+            )
+            XCTAssertEqual(acknowledgement.fields["ackInsertionPositionClass"], testCase.expectedClass, testCase.name)
+        }
+    }
+
+    func testCodexSingleInteriorNewlineUsesPrimaryReceipt() async throws {
+        let before = "甲\n乙"
+        let after = "甲今\n乙"
+        let access = ReplayAXTextTargetAccess(
+            text: before,
+            selection: .init(location: 1, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.coordinateOverride = before
+        access.writeSnapshots = [
+            .init(rawText: after, coordinateText: after, selection: .init(location: 2, length: 0))
+        ]
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+
+        _ = try target.capture()
+        try target.paste("今")
+        try await target.acknowledgeKeyboardWrite()
+
+        XCTAssertEqual(access.rawText, after)
+        XCTAssertEqual(sender.totalPosts, 1)
+        let acknowledgement = try XCTUnwrap(
+            target.drainDiagnostics().first { $0.event == "keyboard_write_acknowledged" }
+        )
+        XCTAssertEqual(acknowledgement.fields["receiptRepresentationTransition"], "none")
+        XCTAssertEqual(acknowledgement.fields["ackInsertionPositionClass"], "not_applicable")
+    }
+
+    func testCodexRevisionUsesKeyboardSelectionToPreserveEmptyParagraph() async throws {
+        let before = "甲甲甲甲甲甲甲甲甲乙丙丁\n\n戊己庚"
+        let after = "甲甲甲甲甲甲甲甲甲辛壬癸\n\n戊己庚"
+        let access = ReplayAXTextTargetAccess(
+            text: before,
+            selection: .init(location: 12, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.coordinateIncludesStructuralSeparators = true
+        access.selectionRangeIsSettable = true
+        access.simulateAccessibilityEmptyParagraphCollapse = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+
+        _ = try target.capture()
+        try target.replaceTrailingText("乙丙丁", with: "辛壬癸")
+        try await target.acknowledgeKeyboardWrite()
+
+        XCTAssertEqual(access.rawText, after)
+        XCTAssertEqual(access.selection, .init(location: 12, length: 0))
+        XCTAssertEqual(sender.selectionPosts, 1)
+        XCTAssertEqual(sender.replacementPosts, 1)
+        XCTAssertEqual(
+            target.drainDiagnostics().last(where: { $0.event == "keyboard_selection_submitted" })?.fields["route"],
+            "keyboard"
+        )
+    }
+
+    func testNonCodexRevisionKeepsAccessibilitySelectionRoute() async throws {
+        let before = "甲甲甲甲甲甲甲甲甲乙丙丁\n\n戊己庚"
+        let after = "甲甲甲甲甲甲甲甲甲辛壬癸\n\n戊己庚"
+        let access = ReplayAXTextTargetAccess(
+            text: before,
+            selection: .init(location: 12, length: 0),
+            application: .init(name: "Editor", bundleIdentifier: "com.example.editor", processIdentifier: 9001)
+        )
+        access.coordinateIncludesStructuralSeparators = true
+        access.selectionRangeIsSettable = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+
+        _ = try target.capture()
+        try target.replaceTrailingText("乙丙丁", with: "辛壬癸")
+        try await target.acknowledgeKeyboardWrite()
+
+        XCTAssertEqual(access.rawText, after)
+        XCTAssertEqual(access.selection, .init(location: 12, length: 0))
+        XCTAssertEqual(sender.selectionPosts, 0)
+        XCTAssertEqual(sender.replacementPosts, 1)
+        XCTAssertEqual(
+            target.drainDiagnostics().last(where: { $0.event == "keyboard_selection_submitted" })?.fields["route"],
+            "ax_range"
+        )
+    }
+
+    func testCodexDeletionUsesKeyboardSelectionWithoutRemovingEmptyParagraph() async throws {
+        let before = "甲甲甲甲甲甲甲甲甲乙丙丁\n\n戊己庚"
+        let after = "甲甲甲甲甲甲甲甲甲\n\n戊己庚"
+        let access = ReplayAXTextTargetAccess(
+            text: before,
+            selection: .init(location: 12, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.coordinateIncludesStructuralSeparators = true
+        access.selectionRangeIsSettable = true
+        access.simulateAccessibilityEmptyParagraphCollapse = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+
+        _ = try target.capture()
+        try target.replaceTrailingText("乙丙丁", with: "")
+        try await target.acknowledgeKeyboardWrite()
+
+        XCTAssertEqual(access.rawText, after)
+        XCTAssertEqual(access.selection, .init(location: 9, length: 0))
+        XCTAssertEqual(sender.selectionPosts, 1)
+        XCTAssertEqual(sender.replacementPosts, 1)
+    }
+
+    func testCodexLeadingEmptyParagraphCandidateAcceptsRetainedRawMarker() async throws {
+        let before = "\n\n甲"
+        let afterFirstRaw = "\n今\n甲"
+        let afterFirstCoordinate = "今\n甲"
+        let afterSecondRaw = "\n今天\n甲"
+        let afterSecondCoordinate = "今天\n甲"
+        let access = ReplayAXTextTargetAccess(
+            text: before,
+            selection: .init(location: 0, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.coordinateOverride = before
+        access.writeSnapshots = [
+            .init(
+                rawText: afterFirstRaw,
+                coordinateText: afterFirstCoordinate,
+                selection: .init(location: 1, length: 0)
+            ),
+            .init(
+                rawText: afterSecondRaw,
+                coordinateText: afterSecondCoordinate,
+                selection: .init(location: 2, length: 0)
+            )
+        ]
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+
+        _ = try target.capture()
+        try target.paste("今")
+        try await target.acknowledgeKeyboardWrite()
+        try target.paste("天")
+        try await target.acknowledgeKeyboardWrite()
+
+        XCTAssertEqual(access.rawText, afterSecondRaw)
+        XCTAssertEqual(access.coordinateText, afterSecondCoordinate)
+        XCTAssertEqual(access.selection, .init(location: 2, length: 0))
+        XCTAssertEqual(sender.appendPosts, 2)
+        XCTAssertFalse(target.drainDiagnostics().contains { $0.event == "keyboard_write_unconfirmed" })
+    }
+
     func testCodexReportShapedEmptyParagraphStatesContinueAfterFirstCharacter() async throws {
         let cases = [
             (prefixLength: 341, emptyParagraphCount: 3),
@@ -1967,7 +2212,7 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
     }
 
-    func testRealAXReplayKeepsAccessibilitySelectionInCoordinateSpace() async throws {
+    func testRealAXReplayUsesKeyboardSelectionInCoordinateSpace() async throws {
         let access = ReplayAXTextTargetAccess(
             text: "第一\n第二",
             selection: .init(location: 4, length: 0),
@@ -1987,7 +2232,7 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertEqual(access.rawText, "第一\n第二世😀")
         XCTAssertEqual(access.coordinateText, "第一第二世😀")
         XCTAssertEqual(access.selection, .init(location: 7, length: 0))
-        XCTAssertEqual(sender.selectionPosts, 0, "AX range route does not add keyboard selection events")
+        XCTAssertEqual(sender.selectionPosts, 1, "Codex revisions use keyboard selection events")
         XCTAssertEqual(sender.replacementPosts, 1)
         XCTAssertEqual(injector.errorCount, 0)
     }
@@ -2260,6 +2505,11 @@ private enum ReplayTargetChange: Equatable {
     case focus
 }
 
+private enum ReplaySelectionRoute {
+    case accessibility
+    case keyboard
+}
+
 private struct ReplayAXSnapshot {
     let rawText: String
     let coordinateText: String
@@ -2308,6 +2558,12 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var writeSnapshots: [ReplayAXSnapshot] = []
     var axWriteNoOp = false
     var axWriteReadSnapshotsByWrite: [[ReplayAXSnapshot]] = []
+    var simulateAccessibilityEmptyParagraphCollapse = false
+    private(set) var lastSelectionRoute: ReplaySelectionRoute?
+
+    func markKeyboardSelectionRoute() {
+        lastSelectionRoute = .keyboard
+    }
     private(set) var textReadCount = 0
     private(set) var coordinateReadCount = 0
 
@@ -2475,6 +2731,7 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     }
 
     func setSelection(_ range: ReplayTextRange, on element: AXUIElement) throws -> Int32 {
+        lastSelectionRoute = .accessibility
         selection = range
         return AXError.success.rawValue
     }
@@ -2546,6 +2803,16 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
         let mutable = NSMutableString(string: rawText)
         mutable.replaceCharacters(in: NSRange(location: rawRange.location, length: rawRange.length), with: text)
         rawText = mutable as String
+        if lastSelectionRoute == .accessibility,
+           simulateAccessibilityEmptyParagraphCollapse {
+            let replacementEnd = rawRange.location + text.utf16.count
+            let units = Array(rawText.utf16)
+            if replacementEnd < units.count, units[replacementEnd] == 0x0A {
+                let collapsed = NSMutableString(string: rawText)
+                collapsed.deleteCharacters(in: NSRange(location: replacementEnd, length: 1))
+                rawText = collapsed as String
+            }
+        }
         if movesInsertionAfterTrailingNewline {
             collapseStructuralSeparatorsAfterNextWrite = false
             coordinateIncludesStructuralSeparators = false
@@ -2626,6 +2893,7 @@ private final class ReplayKeyboardEventSender: AXTextTargetKeyboardEventSending 
 
     func selectTrailingText(_ previousText: String, processID: pid_t?) throws {
         selectionPosts += 1
+        access.markKeyboardSelectionRoute()
         let location = access.selection.location - previousText.utf16.count
         pendingSelection = .init(location: location, length: previousText.utf16.count)
         if dropNextSelection {
