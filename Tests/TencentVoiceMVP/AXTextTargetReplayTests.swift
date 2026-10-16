@@ -1745,6 +1745,43 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertNotNil(operation.fields["feedbackObservedMonotonicMilliseconds"])
     }
 
+    func testRealAXReplayRetriesTransientIdentityFocusReadWithoutDegrading() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "Draft: ",
+            application: .init(name: "Editor", bundleIdentifier: "com.example.editor", processIdentifier: 9001)
+        )
+        let sender = ReplayKeyboardEventSender(access: access)
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            )
+        )
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        access.failFocusedElementReadAtCount = access.focusedElementReadCount + 3
+        injector.apply(projection: projection("voice input", revision: 1))
+        await finish(injector, finalText: "voice input", advancing: clock)
+
+        XCTAssertEqual(access.rawText, "Draft: voice input")
+        XCTAssertEqual(sender.appendPosts, 1)
+        XCTAssertGreaterThanOrEqual(clock.sleepCallCount, 1)
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+        XCTAssertEqual(injector.writeCount, 1)
+        let diagnostics = injector.drainDiagnostics()
+        XCTAssertTrue(
+            diagnostics.contains {
+                $0.event == "keyboard_state_read_retryable"
+                    && $0.fields["phase"] == "identity_check"
+            }
+        )
+    }
+
     func testRealAXReplayDoesNotStallAtFirstCharacterAfterFinalSegmentBoundary() async throws {
         let access = ReplayAXTextTargetAccess(
             text: "草稿\n",
@@ -2549,6 +2586,8 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var focusedElementRebuildsBeforeNextWrite = 0
     var focusedElementRebuildsAfterNextWrite = 0
     private var focusedElementRebuildCount = 0
+    var failFocusedElementReadAtCount: Int?
+    private(set) var focusedElementReadCount = 0
     var readSnapshotsAfterNextWrite: [ReplayAXSnapshot] = []
     var queuedTextReadSnapshots: [ReplayAXSnapshot] = []
     var coordinateIncludesStructuralSeparators = false
@@ -2593,6 +2632,11 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     func currentApplication() -> TextTargetApplication? { currentApplicationOverride ?? application }
 
     func focusedElement() throws -> AXUIElement {
+        focusedElementReadCount += 1
+        if failFocusedElementReadAtCount == focusedElementReadCount {
+            failFocusedElementReadAtCount = nil
+            throw KeyboardWriteReadError.retryable
+        }
         if focusedElementRebuildsBeforeNextWrite > 0 {
             focusedElementRebuildsBeforeNextWrite -= 1
             return rebuiltElement

@@ -1052,7 +1052,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         try await waitForConfirmedKeyboardState(generation: generation)
         try Task.checkCancellation()
         guard generation == keyboardGeneration else { throw CancellationError() }
-        try ensureKeyboardTargetIdentityIsSafe()
+        try await waitForSafeKeyboardTargetIdentity(generation: generation)
         try Task.checkCancellation()
         guard generation == keyboardGeneration else { throw CancellationError() }
         if previousText.isEmpty {
@@ -2041,6 +2041,26 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 "actualReason": currentStrategy.diagnosticReason
             ])
             throw TextTargetError.targetChanged
+        }
+    }
+
+    private func waitForSafeKeyboardTargetIdentity(generation: UInt64) async throws {
+        let start = writeTiming.now()
+        while true {
+            try Task.checkCancellation()
+            guard generation == keyboardGeneration else { throw CancellationError() }
+            do {
+                try ensureKeyboardTargetIdentityIsSafe()
+                return
+            } catch KeyboardWriteReadError.retryable {
+                recordDiagnostic("keyboard_state_read_retryable", ["phase": "identity_check"])
+            }
+
+            let elapsed = writeTiming.now() &- start
+            guard elapsed < preflightTimeoutNanoseconds else {
+                throw TextTargetError.writeFailed
+            }
+            try await writeTiming.sleep(min(10_000_000, preflightTimeoutNanoseconds - elapsed))
         }
     }
 
