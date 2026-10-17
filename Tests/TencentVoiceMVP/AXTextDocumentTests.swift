@@ -187,6 +187,53 @@ final class AXTextDocumentTests: XCTestCase {
         }
     }
 
+    func testValidButDifferentMappingSourceIsNotTheExpectedReceiptMapping() throws {
+        let raw = "A\nB"
+        let coordinateText = "AB"
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: 1, length: 0),
+            placeholderEvidence: AXPlaceholderEvidence(),
+            probe: prefixProbe(coordinateText)
+        )
+        let alternateMapping = AXTextCoordinateMapping(
+            source: .axValueAfterPlaceholderTransition,
+            rawDocumentLength: state.mapping.rawDocumentLength,
+            coordinateDocumentLength: state.mapping.coordinateDocumentLength,
+            omittedStructuralSeparatorCount: state.mapping.omittedStructuralSeparatorCount,
+            rawBoundaryOffsets: state.mapping.rawBoundaryOffsets,
+            rawPlaceholderRange: state.mapping.rawPlaceholderRange
+        )
+
+        XCTAssertTrue(
+            AXTextDocumentResolver.isValidCoordinateMapping(
+                alternateMapping,
+                rawText: raw,
+                coordinateText: coordinateText
+            )
+        )
+        XCTAssertNotEqual(alternateMapping, state.mapping)
+
+        let expected = KeyboardDocumentState(
+            text: state.text,
+            selection: state.selection,
+            rawText: state.rawText,
+            mapping: state.mapping
+        )
+        let observed = KeyboardDocumentState(
+            text: state.text,
+            selection: state.selection,
+            rawText: state.rawText,
+            mapping: alternateMapping
+        )
+        XCTAssertEqual(
+            observed.compare(to: expected, allowingStructuralRawDifference: true),
+            .matched,
+            "validity alone must not make a different mapping an exact receipt"
+        )
+        XCTAssertFalse(observed.matchesExpectedMapping(of: expected))
+    }
+
     func testKeyboardDocumentStateRejectsSurrogateBoundaryMapping() throws {
         let raw = "😀\n好"
         let coordinateText = "😀好"

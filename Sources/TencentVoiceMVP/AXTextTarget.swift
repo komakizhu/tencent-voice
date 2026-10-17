@@ -25,12 +25,64 @@ private struct PendingKeyboardReplacement {
     let operationGeneration: UInt64
 }
 
+private struct KeyboardRawInsertionRegion: Equatable {
+    let sessionGeneration: UInt64
+    let operationGeneration: UInt64
+    let coordinateRange: TextRange
+    let rawRange: TextRange
+    let separatorLength: Int
+}
+
+private struct KeyboardRawInsertionUpdate {
+    let rawRange: TextRange
+    let nextRegion: KeyboardRawInsertionRegion?
+}
+
+private struct KeyboardRepresentationCandidate {
+    let state: KeyboardDocumentState
+    let rawInsertionRegion: KeyboardRawInsertionRegion?
+}
+
 private struct PendingKeyboardRepresentationTransition {
-    let alternates: [KeyboardDocumentState]
+    let alternates: [KeyboardRepresentationCandidate]
     let representation: String
     let insertionPositionClass: String
     let sessionGeneration: UInt64
     let operationGeneration: UInt64
+}
+
+private struct KeyboardDiagnosticDiffRecord {
+    let candidateIndex: Int
+    let candidateMatched: Bool
+    let comparison: KeyboardDocumentComparison
+    let sampleIndex: Int
+    let elapsedMilliseconds: UInt64
+    let phase: String
+    let operationGeneration: UInt64?
+    let summary: KeyboardDiagnosticDiffSummary
+
+    func fields(prefix: String) -> [String: String] {
+        var fields = summary.fields(prefix: prefix)
+        fields["\(prefix)CandidateIndex"] = String(candidateIndex)
+        fields["\(prefix)CandidateMatched"] = String(candidateMatched)
+        fields["\(prefix)Comparison"] = comparison.rawValue
+        fields["\(prefix)SampleIndex"] = String(sampleIndex)
+        fields["\(prefix)ElapsedMilliseconds"] = String(elapsedMilliseconds)
+        fields["\(prefix)Phase"] = phase
+        if let operationGeneration {
+            fields["\(prefix)OperationGeneration"] = String(operationGeneration)
+        }
+        return fields
+    }
+}
+
+private struct KeyboardDiagnosticComparisonSnapshot {
+    let observed: KeyboardDocumentState
+    let expectedCandidates: [KeyboardDocumentState]
+    let candidateMatches: [Bool]
+    let candidateComparisons: [KeyboardDocumentComparison]
+    let sampleIndex: Int
+    let elapsedMilliseconds: UInt64
 }
 
 private struct KeyboardStateEvidence {
@@ -166,9 +218,20 @@ private struct KeyboardAcknowledgementTrace {
     private(set) var lastCandidateMatches: [Bool] = []
     private(set) var firstReadErrorCode: String?
     private(set) var firstReadErrorElapsedMilliseconds: UInt64?
+    private(set) var earlyDiffRecords: [KeyboardDiagnosticDiffRecord] = []
+    private(set) var finalDiffRecords: [KeyboardDiagnosticDiffRecord] = []
+    private(set) var earlyDiffCandidateOmittedCount = 0
+    private(set) var finalDiffCandidateOmittedCount = 0
+    private var comparisonSequence = 0
+    private var lastComparisonSnapshot: KeyboardDiagnosticComparisonSnapshot?
+    private var phase = "pre_dispatch"
 
-    init(insertionPositionClass: String = "not_applicable") {
+    init(
+        insertionPositionClass: String = "not_applicable",
+        phase: String = "post_dispatch"
+    ) {
         self.insertionPositionClass = insertionPositionClass
+        self.phase = phase
     }
 
     mutating func recordRead(_ evidence: KeyboardStateEvidence) {
@@ -184,19 +247,118 @@ private struct KeyboardAcknowledgementTrace {
     }
 
     mutating func beginPostDispatch() {
+        phase = "post_dispatch"
+        comparisonSequence = 0
         lastCandidateMatches.removeAll(keepingCapacity: true)
+        earlyDiffRecords.removeAll(keepingCapacity: true)
+        finalDiffRecords.removeAll(keepingCapacity: true)
+        earlyDiffCandidateOmittedCount = 0
+        finalDiffCandidateOmittedCount = 0
+        lastComparisonSnapshot = nil
     }
 
     mutating func recordComparison(
         evidence: KeyboardStateEvidence,
         comparison: KeyboardDocumentComparison,
-        candidateMatches: [Bool]
+        candidateMatches: [Bool],
+        observed: KeyboardDocumentState,
+        expectedCandidates: [KeyboardDocumentState],
+        candidateComparisons: [KeyboardDocumentComparison],
+        operation: KeyboardDiagnosticDiffOperation?,
+        mappingValid: Bool,
+        elapsedMilliseconds: UInt64
     ) {
         lastCandidateMatches = candidateMatches
+        comparisonSequence += 1
+        let snapshot = KeyboardDiagnosticComparisonSnapshot(
+            observed: observed,
+            expectedCandidates: expectedCandidates,
+            candidateMatches: candidateMatches,
+            candidateComparisons: candidateComparisons,
+            sampleIndex: comparisonSequence,
+            elapsedMilliseconds: elapsedMilliseconds
+        )
+        lastComparisonSnapshot = snapshot
+        if earlyDiffRecords.isEmpty {
+            let earlyIndexes = expectedCandidates.indices.filter { index in
+                guard index < candidateMatches.count,
+                      index < candidateComparisons.count,
+                      !candidateMatches[index],
+                      observed.text == expectedCandidates[index].text,
+                      observed.selection == expectedCandidates[index].selection,
+                      candidateComparisons[index] == .rawTextMismatch
+                        || candidateComparisons[index] == .rawMappingUnavailable else {
+                    return false
+                }
+                return true
+            }
+            if !earlyIndexes.isEmpty {
+                earlyDiffCandidateOmittedCount = max(0, earlyIndexes.count - 8)
+                earlyDiffRecords = makeDiffRecords(
+                    indexes: earlyIndexes,
+                    snapshot: snapshot,
+                    operation: operation,
+                    mappingValid: mappingValid
+                )
+            }
+        }
         guard firstChanged == nil, !candidateMatches.contains(true) else { return }
         firstChanged = evidence
         firstChangedComparison = comparison
         firstChangedCandidateMatches = candidateMatches
+    }
+
+    mutating func finalizeDiff(
+        operation: KeyboardDiagnosticDiffOperation?,
+        mappingValid: Bool
+    ) {
+        guard let snapshot = lastComparisonSnapshot else { return }
+        // Keep the terminal observation for every candidate, including an
+        // accepted primary candidate. This makes a successful write explicit
+        // (`equal`) while preserving the same per-candidate evidence on
+        // failures and representation transitions.
+        let indexes = Array(snapshot.expectedCandidates.indices)
+        finalDiffRecords = makeDiffRecords(
+            indexes: indexes,
+            snapshot: snapshot,
+            operation: operation,
+            mappingValid: mappingValid
+        )
+        finalDiffCandidateOmittedCount = max(0, indexes.count - 8)
+    }
+
+    private func makeDiffRecords(
+        indexes: [Int],
+        snapshot: KeyboardDiagnosticComparisonSnapshot,
+        operation: KeyboardDiagnosticDiffOperation?,
+        mappingValid: Bool
+    ) -> [KeyboardDiagnosticDiffRecord] {
+        let limitedIndexes = Array(indexes.prefix(8))
+        let observedMappingValid = mappingValid
+        return limitedIndexes.map { index in
+            let expected = snapshot.expectedCandidates[index]
+            let comparison = index < snapshot.candidateComparisons.count
+                ? snapshot.candidateComparisons[index]
+                : .documentMismatch
+            let summary = KeyboardDiagnosticDiffCalculator.compare(
+                expected: expected,
+                observed: snapshot.observed,
+                operation: operation,
+                mappingValid: observedMappingValid
+            )
+            return KeyboardDiagnosticDiffRecord(
+                candidateIndex: index,
+                candidateMatched: index < snapshot.candidateMatches.count
+                    ? snapshot.candidateMatches[index]
+                    : false,
+                comparison: comparison,
+                sampleIndex: snapshot.sampleIndex,
+                elapsedMilliseconds: snapshot.elapsedMilliseconds,
+                phase: phase,
+                operationGeneration: operation?.operationGeneration,
+                summary: summary
+            )
+        }
     }
 
     func fields(final: KeyboardStateEvidence?, finalComparison: KeyboardDocumentComparison?, candidateCount: Int) -> [String: String] {
@@ -224,6 +386,55 @@ private struct KeyboardAcknowledgementTrace {
         }
         if let finalComparison {
             result["ackFinalComparison"] = finalComparison.rawValue
+        }
+        let maxBytesPerSample = 8_192
+        func mergeDiffRecords(
+            _ records: [KeyboardDiagnosticDiffRecord],
+            prefix: String,
+            candidateOmittedCount: Int
+        ) -> Int {
+            guard !records.isEmpty else {
+                if candidateOmittedCount > 0 {
+                    result["\(prefix)CandidateOmittedCount"] = String(candidateOmittedCount)
+                }
+                return candidateOmittedCount
+            }
+            var bytes = 0
+            var included = 0
+            var sizeOmittedCount = 0
+            for (index, record) in records.enumerated() {
+                let fields = record.fields(prefix: "\(prefix)\(index)")
+                let recordBytes = fields.reduce(0) { total, field in
+                    total + field.key.utf8.count + field.value.utf8.count + 2
+                }
+                guard bytes + recordBytes <= maxBytesPerSample else {
+                    sizeOmittedCount = records.count - index
+                    break
+                }
+                bytes += recordBytes
+                included += 1
+                result.merge(fields) { _, new in new }
+            }
+            result["\(prefix)CandidateCount"] = String(included)
+            let omitted = candidateOmittedCount + sizeOmittedCount
+            if omitted > 0 {
+                result["\(prefix)CandidateOmittedCount"] = String(omitted)
+            }
+            return omitted
+        }
+        let earlyOmitted = mergeDiffRecords(
+            earlyDiffRecords,
+            prefix: "ackDiffEarly",
+            candidateOmittedCount: earlyDiffCandidateOmittedCount
+        )
+        let finalOmitted = mergeDiffRecords(
+            finalDiffRecords,
+            prefix: "ackDiffFinal",
+            candidateOmittedCount: finalDiffCandidateOmittedCount
+        )
+        let omitted = earlyOmitted + finalOmitted
+        if omitted > 0 {
+            result["ackDiffCandidateOmittedCount"] = String(omitted)
         }
         return result
     }
@@ -295,8 +506,11 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     private var confirmedKeyboardDocument: String?
     private var confirmedKeyboardState: KeyboardDocumentState?
     private var pendingKeyboardWrite: KeyboardDocumentState?
+    private var pendingKeyboardDiagnosticOperation: KeyboardDiagnosticDiffOperation?
     private var pendingKeyboardRepresentationTransition: PendingKeyboardRepresentationTransition?
     private var pendingKeyboardReplacement: PendingKeyboardReplacement?
+    private var confirmedKeyboardRawInsertionRegion: KeyboardRawInsertionRegion?
+    private var pendingKeyboardRawInsertionRegion: KeyboardRawInsertionRegion?
     private var replacementWasSent = false
     private var confirmedKeyboardRawText: String?
     private var confirmedKeyboardMapping: AXTextCoordinateMapping?
@@ -399,8 +613,11 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         keyboardOperationGeneration = 0
         axWriteGeneration &+= 1
         pendingKeyboardWrite = nil
+        pendingKeyboardDiagnosticOperation = nil
         pendingKeyboardRepresentationTransition = nil
         pendingKeyboardReplacement = nil
+        confirmedKeyboardRawInsertionRegion = nil
+        pendingKeyboardRawInsertionRegion = nil
         replacementWasSent = false
         confirmedKeyboardRawText = nil
         confirmedKeyboardMapping = nil
@@ -851,6 +1068,9 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
 
     func cancelAXWrite() {
         axWriteGeneration &+= 1
+        // A cancelled voice operation must never let a later operation reuse
+        // the raw insertion anchor captured for this one.
+        invalidateKeyboardRawInsertionRegion()
     }
 
     private func checkAXWriteIdentity(_ expectedElement: AXUIElement, generation: UInt64) throws {
@@ -1071,20 +1291,38 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     private func submitPaste(_ text: String) throws {
         keyboardOperationGeneration &+= 1
         let operationGeneration = keyboardOperationGeneration
-        let receipt = try keyboardReceipt(
-            replacing: expectedKeyboardSelection,
-            with: text,
-            operationGeneration: operationGeneration
-        )
+        pendingKeyboardDiagnosticOperation = nil
+        let operationRange = expectedKeyboardSelection
+        let receipt: KeyboardDocumentState?
+        do {
+            receipt = try keyboardReceipt(
+                replacing: operationRange,
+                with: text,
+                operationGeneration: operationGeneration
+            )
+        } catch {
+            invalidateKeyboardRawInsertionRegion()
+            throw error
+        }
         do {
             try keyboardEventSender.send(text, processID: eventProcessID)
         } catch {
             pendingKeyboardRepresentationTransition = nil
+            pendingKeyboardDiagnosticOperation = nil
+            pendingKeyboardRawInsertionRegion = nil
+            confirmedKeyboardRawInsertionRegion = nil
             throw error
         }
         lastKeyboardDispatch = writeTiming.now()
         if let receipt {
             pendingKeyboardWrite = receipt
+            if let operationRange {
+                pendingKeyboardDiagnosticOperation = KeyboardDiagnosticDiffOperation(
+                    coordinateRange: operationRange,
+                    insertedLengthUTF16: coordinateText(forKeyboardText: text).utf16.count,
+                    operationGeneration: operationGeneration
+                )
+            }
             let fields = [
                 "expectedLocation": String(receipt.selection.location),
                 "expectedDocumentLength": String(receipt.text.utf16.count),
@@ -1109,6 +1347,12 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     }
 
     private func submitTrailingReplacement(_ previousText: String, with text: String) throws {
+        var completed = false
+        defer {
+            if !completed {
+                invalidateKeyboardRawInsertionRegion()
+            }
+        }
         let previousCoordinateLength = coordinateLength(forKeyboardText: previousText)
         let insertionCoordinateLength = coordinateLength(forKeyboardText: text)
         let updatedSelection: TextRange?
@@ -1127,7 +1371,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         let replacementRange = expectedKeyboardSelection.map {
             TextRange(location: $0.location - previousCoordinateLength, length: previousCoordinateLength)
         }
-        let receipt = try keyboardReceipt(replacing: replacementRange, with: text, previousText: previousText)
+        pendingKeyboardDiagnosticOperation = nil
+        let operationGeneration = keyboardOperationGeneration &+ 1
+        let receipt = try keyboardReceipt(
+            replacing: replacementRange,
+            with: text,
+            previousText: previousText,
+            operationGeneration: operationGeneration
+        )
         if let receipt, let replacementRange, let document = confirmedKeyboardDocument {
             let selected = KeyboardDocumentState(
                 text: document,
@@ -1139,8 +1390,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 location: replacementRange.location + replacementRange.length,
                 length: 0
             )
-            keyboardOperationGeneration &+= 1
-            let operationGeneration = keyboardOperationGeneration
+            keyboardOperationGeneration = operationGeneration
             let usesAXSelection = !isCodexTarget && (targetElement.map {
                 selectedTextRangeIsSettable(on: $0)
             } ?? false)
@@ -1160,11 +1410,17 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 operationGeneration: operationGeneration
             )
             pendingKeyboardWrite = receipt
+            pendingKeyboardDiagnosticOperation = KeyboardDiagnosticDiffOperation(
+                coordinateRange: replacementRange,
+                insertedLengthUTF16: insertionCoordinateLength,
+                operationGeneration: operationGeneration
+            )
             recordDiagnostic("keyboard_selection_submitted", [
                 "route": usesAXSelection ? "ax_range" : "keyboard",
                 "expectedLocation": String(replacementRange.location),
                 "expectedLength": String(replacementRange.length)
             ])
+            completed = true
             return
         }
         try keyboardEventSender.replaceTrailingText(
@@ -1175,11 +1431,20 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         lastKeyboardDispatch = writeTiming.now()
         if let receipt {
             pendingKeyboardWrite = receipt
+            if let replacementRange {
+                pendingKeyboardDiagnosticOperation = KeyboardDiagnosticDiffOperation(
+                    coordinateRange: replacementRange,
+                    insertedLengthUTF16: insertionCoordinateLength,
+                    operationGeneration: keyboardOperationGeneration
+                )
+            }
             recordDiagnostic("keyboard_write_submitted", ["expectedLocation": String(receipt.selection.location),
                 "expectedDocumentLength": String(receipt.text.utf16.count), "replacementCharacters": String(previousText.count)])
+            completed = true
             return
         }
         expectedKeyboardSelection = updatedSelection
+        completed = true
     }
 
     private func waitForConfirmedKeyboardState(generation: UInt64) async throws {
@@ -1204,6 +1469,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                     "expectedSelectionLocation": String(expected.selection.location),
                     "actualSelectionLocation": String(observed.selection.location)
                 ])
+                self.invalidateKeyboardRawInsertionRegion()
                 throw TextTargetError.targetChanged
             }
             return observed
@@ -1218,12 +1484,17 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         try ensureTargetApplicationIsFrontmost()
         let element = try focusedElement()
         if let targetElement, !CFEqual(element, targetElement) {
-            guard isSafariWebEditor else { throw TextTargetError.targetChanged }
+            guard isSafariWebEditor else {
+                invalidateKeyboardRawInsertionRegion()
+                throw TextTargetError.targetChanged
+            }
             try reacquireSafariTarget(element, phase: "\(phase)_before_read")
         } else if targetElement == nil {
+            invalidateKeyboardRawInsertionRegion()
             throw TextTargetError.targetChanged
         }
         guard let targetElement, CFEqual(element, targetElement) else {
+            invalidateKeyboardRawInsertionRegion()
             throw TextTargetError.targetChanged
         }
         do {
@@ -1233,7 +1504,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             try ensureTargetApplicationIsFrontmost()
             let afterElement = try focusedElement()
             guard CFEqual(afterElement, targetElement) else {
-                guard isSafariWebEditor else { throw TextTargetError.targetChanged }
+                guard isSafariWebEditor else {
+                    invalidateKeyboardRawInsertionRegion()
+                    throw TextTargetError.targetChanged
+                }
                 try reacquireSafariTarget(afterElement, phase: "\(phase)_after_read")
                 throw KeyboardWriteReadError.retryable
             }
@@ -1260,12 +1534,16 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         let operationGeneration = keyboardOperationGeneration
         let start = writeTiming.now()
         let pendingRepresentationTransition = pendingKeyboardRepresentationTransition
+        let pendingRawInsertionRegion = pendingKeyboardRawInsertionRegion
+        let diagnosticOperation = pendingKeyboardDiagnosticOperation
         var lastObservedState: KeyboardDocumentState?
         var lastComparison: KeyboardDocumentComparison?
         var usedRepresentationTransition = false
+        var matchedRawInsertionRegion: KeyboardRawInsertionRegion?
         let acknowledgementContext = diagnosticOperationContext ?? previousDiagnosticOperationContext
         var acknowledgementTrace = KeyboardAcknowledgementTrace(
-            insertionPositionClass: pendingRepresentationTransition?.insertionPositionClass ?? "not_applicable"
+            insertionPositionClass: pendingRepresentationTransition?.insertionPositionClass ?? "not_applicable",
+            phase: pendingKeyboardReplacement == nil ? "post_dispatch" : "pre_dispatch"
         )
         let candidateCount = 1 + (pendingRepresentationTransition?.alternates.count ?? 0)
         let read = { () throws -> KeyboardDocumentState in
@@ -1286,26 +1564,28 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             }
         }
         let matches: (KeyboardDocumentState, KeyboardDocumentState) -> Bool = { expected, observed in
+            matchedRawInsertionRegion = nil
             let comparison = observed.compare(
                 to: expected,
                 allowingStructuralRawDifference: self.isCodexTarget
             )
             lastComparison = comparison
             var candidateMatches = [false]
+            var candidateStates = [expected]
+            var candidateComparisons = [comparison]
+            var primaryMatched = false
             if comparison == .matched {
                 if self.matchesKeyboardReceipt(observed: observed, expected: expected) {
                     candidateMatches[0] = true
-                    acknowledgementTrace.recordComparison(
-                        evidence: self.keyboardStateEvidence(observed),
-                        comparison: .matched,
-                        candidateMatches: candidateMatches
-                    )
-                    return true
+                    primaryMatched = true
+                    lastComparison = .matched
                 }
-                if self.isCodexTarget, observed.rawText != expected.rawText {
+                if !primaryMatched, self.isCodexTarget, observed.rawText != expected.rawText {
                     lastComparison = .rawTextMismatch
-                } else {
+                    candidateComparisons[0] = .rawTextMismatch
+                } else if !primaryMatched {
                     lastComparison = .rawMappingUnavailable
+                    candidateComparisons[0] = .rawMappingUnavailable
                 }
             }
             guard let transition = pendingRepresentationTransition,
@@ -1313,43 +1593,65 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                   transition.operationGeneration == operationGeneration else {
                 acknowledgementTrace.recordComparison(
                     evidence: self.keyboardStateEvidence(observed),
-                    comparison: lastComparison ?? comparison,
-                    candidateMatches: candidateMatches
+                    comparison: primaryMatched ? .matched : (lastComparison ?? comparison),
+                    candidateMatches: candidateMatches,
+                    observed: observed,
+                    expectedCandidates: candidateStates,
+                    candidateComparisons: candidateComparisons,
+                    operation: diagnosticOperation,
+                    mappingValid: self.keyboardDiagnosticMappingIsValid(observed),
+                    elapsedMilliseconds: (self.writeTiming.now() - start) / 1_000_000
                 )
-                return false
+                return primaryMatched
             }
-            for alternate in transition.alternates {
+            for alternateCandidate in transition.alternates {
+                let alternate = alternateCandidate.state
+                let alternateIndex = candidateStates.count
+                candidateStates.append(alternate)
                 let alternateComparison = observed.compare(
                     to: alternate,
                     allowingStructuralRawDifference: self.isCodexTarget
                 )
+                candidateComparisons.append(alternateComparison)
                 guard alternateComparison == .matched else {
                     candidateMatches.append(false)
+                    if !primaryMatched {
+                        lastComparison = alternateComparison
+                    }
                     continue
                 }
-                lastComparison = alternateComparison
                 guard self.matchesKeyboardReceipt(observed: observed, expected: alternate) else {
                     candidateMatches.append(false)
-                    lastComparison = observed.rawText == alternate.rawText
+                    let alternateFailure: KeyboardDocumentComparison = observed.rawText == alternate.rawText
                         ? .rawMappingUnavailable
                         : .rawTextMismatch
+                    candidateComparisons[alternateIndex] = alternateFailure
+                    if !primaryMatched {
+                        lastComparison = alternateFailure
+                    }
                     continue
                 }
                 candidateMatches.append(true)
-                usedRepresentationTransition = true
-                acknowledgementTrace.recordComparison(
-                    evidence: self.keyboardStateEvidence(observed),
-                    comparison: .matched,
-                    candidateMatches: candidateMatches
-                )
-                return true
+                if !primaryMatched, !usedRepresentationTransition {
+                    lastComparison = .matched
+                    usedRepresentationTransition = true
+                    matchedRawInsertionRegion = alternateCandidate.rawInsertionRegion
+                }
             }
             acknowledgementTrace.recordComparison(
                 evidence: self.keyboardStateEvidence(observed),
-                comparison: lastComparison ?? comparison,
-                candidateMatches: candidateMatches
+                comparison: primaryMatched || usedRepresentationTransition
+                    ? .matched
+                    : (lastComparison ?? comparison),
+                candidateMatches: candidateMatches,
+                observed: observed,
+                expectedCandidates: candidateStates,
+                candidateComparisons: candidateComparisons,
+                operation: diagnosticOperation,
+                mappingValid: self.keyboardDiagnosticMappingIsValid(observed),
+                elapsedMilliseconds: (self.writeTiming.now() - start) / 1_000_000
             )
-            return false
+            return primaryMatched || usedRepresentationTransition
         }
         do {
             let acknowledgedState: KeyboardDocumentState
@@ -1394,9 +1696,12 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             confirmedKeyboardRawText = acknowledgedState.rawText
             confirmedKeyboardMapping = acknowledgedState.mapping
             confirmedKeyboardState = acknowledgedState
+            confirmedKeyboardRawInsertionRegion = matchedRawInsertionRegion ?? pendingRawInsertionRegion
             pendingKeyboardWrite = nil
+            pendingKeyboardDiagnosticOperation = nil
             pendingKeyboardRepresentationTransition = nil
             pendingKeyboardReplacement = nil
+            pendingKeyboardRawInsertionRegion = nil
             replacementWasSent = false
             let acknowledgementFields = [
                 "elapsedMilliseconds": String((writeTiming.now() - start) / 1_000_000),
@@ -1408,6 +1713,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                     ? pendingRepresentationTransition?.representation ?? "none"
                     : "none"
             ]
+            acknowledgementTrace.finalizeDiff(
+                operation: diagnosticOperation,
+                mappingValid: self.keyboardDiagnosticMappingIsValid(acknowledgedState)
+            )
             let acknowledgementEvidence = acknowledgementTrace.fields(
                 final: self.keyboardStateEvidence(acknowledgedState),
                 finalComparison: lastComparison,
@@ -1434,6 +1743,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                     ? pendingRepresentationTransition?.representation ?? "none"
                     : "none"
             ]
+            acknowledgementTrace.finalizeDiff(
+                operation: diagnosticOperation,
+                mappingValid: lastObservedState.map(self.keyboardDiagnosticMappingIsValid) ?? false
+            )
             let failureEvidence = acknowledgementTrace.fields(
                 final: lastObservedState.map(self.keyboardStateEvidence),
                 finalComparison: lastComparison,
@@ -1443,7 +1756,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 .merging(failureFields) { _, new in new }
                 .merging(failureEvidence) { _, new in new }
             recordDiagnostic("keyboard_write_unconfirmed", mergedFailureFields, context: acknowledgementContext)
+            pendingKeyboardDiagnosticOperation = nil
             pendingKeyboardRepresentationTransition = nil
+            pendingKeyboardRawInsertionRegion = nil
+            confirmedKeyboardRawInsertionRegion = nil
             recoverPendingSelectionIfSafe(generation: generation)
             throw error
         }
@@ -1453,6 +1769,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                                  previousText: String? = nil,
                                  operationGeneration: UInt64? = nil) throws -> KeyboardDocumentState? {
         pendingKeyboardRepresentationTransition = nil
+        pendingKeyboardRawInsertionRegion = nil
         guard requiresKeyboardAcknowledgement else { return nil }
         guard let range, let document = confirmedKeyboardDocument,
               range.location >= 0, range.length >= 0,
@@ -1470,16 +1787,28 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         var rawDocumentForTransition: String?
         var rawRangeForTransition: TextRange?
         var mappingForTransition: AXTextCoordinateMapping?
+        var nextRawInsertionRegion: KeyboardRawInsertionRegion?
+        var anchoredReplacement: KeyboardRawInsertionUpdate?
         if isCodexTarget {
             guard let rawDocument = confirmedKeyboardRawText,
                   let mapping = confirmedKeyboardMapping,
-                  let rawRange = mapping.rawRange(for: range),
-                  rawRange.location >= 0,
+                  let mappedRawRange = mapping.rawRange(for: range) else {
+                throw TextTargetError.targetChanged
+            }
+            anchoredReplacement = anchoredRawReplacement(
+                in: rawDocument,
+                range: range,
+                with: text,
+                operationGeneration: operationGeneration ?? keyboardOperationGeneration
+            )
+            let rawRange = anchoredReplacement?.rawRange ?? mappedRawRange
+            guard rawRange.location >= 0,
                   rawRange.length >= 0,
                   rawRange.location <= rawDocument.utf16.count,
                   rawRange.length <= rawDocument.utf16.count - rawRange.location else {
                 throw TextTargetError.targetChanged
             }
+            nextRawInsertionRegion = anchoredReplacement?.nextRegion
             let raw = NSMutableString(string: rawDocument)
             raw.replaceCharacters(
                 in: NSRange(location: rawRange.location, length: rawRange.length),
@@ -1489,16 +1818,35 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             rawDocumentForTransition = rawDocument
             rawRangeForTransition = rawRange
             mappingForTransition = mapping
+            pendingKeyboardRawInsertionRegion = nextRawInsertionRegion
         } else {
             rawResult = nil
             rawDocumentForTransition = nil
             rawRangeForTransition = nil
             mappingForTransition = nil
         }
+        let primarySelection = TextRange(
+            location: range.location + coordinateText.utf16.count,
+            length: 0
+        )
+        let primaryMapping: AXTextCoordinateMapping?
+        if anchoredReplacement != nil, let rawResult {
+            guard let mapping = expectedKeyboardMapping(
+                rawText: rawResult,
+                coordinateText: result as String,
+                selection: primarySelection
+            ) else {
+                throw TextTargetError.targetChanged
+            }
+            primaryMapping = mapping
+        } else {
+            primaryMapping = nil
+        }
         let primary = KeyboardDocumentState(
             text: result as String,
-            selection: TextRange(location: range.location + coordinateText.utf16.count, length: 0),
-            rawText: rawResult
+            selection: primarySelection,
+            rawText: rawResult,
+            mapping: primaryMapping
         )
         if previousText == nil,
            let rawDocumentForTransition,
@@ -1510,7 +1858,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 text: text,
                 rawDocument: rawDocumentForTransition,
                 rawRange: rawRangeForTransition,
-                mapping: mappingForTransition
+                mapping: mappingForTransition,
+                operationGeneration: operationGeneration ?? keyboardOperationGeneration
             )
             if !alternates.isEmpty {
                 pendingKeyboardRepresentationTransition = PendingKeyboardRepresentationTransition(
@@ -1531,14 +1880,127 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         return primary
     }
 
+    private func expectedKeyboardMapping(
+        rawText: String,
+        coordinateText: String,
+        selection: TextRange
+    ) -> AXTextCoordinateMapping? {
+        let probe = AXTextCoordinateProbe { requestedRange in
+            guard requestedRange.location >= 0,
+                  requestedRange.length >= 0,
+                  requestedRange.location <= coordinateText.utf16.count,
+                  requestedRange.length <= coordinateText.utf16.count - requestedRange.location else {
+                return nil
+            }
+            return (coordinateText as NSString).substring(
+                with: NSRange(
+                    location: requestedRange.location,
+                    length: requestedRange.length
+                )
+            )
+        }
+        guard let resolved = try? AXTextDocumentResolver.resolve(
+            rawText: rawText,
+            selection: selection,
+            placeholderEvidence: .init(),
+            probe: probe
+        ),
+        resolved.text == coordinateText,
+        resolved.selection == selection,
+        AXTextDocumentResolver.isValidCoordinateMapping(
+            resolved.mapping,
+            rawText: rawText,
+            coordinateText: coordinateText
+        ) else {
+            return nil
+        }
+        return resolved.mapping
+    }
+
+    private func anchoredRawReplacement(
+        in rawDocument: String,
+        range: TextRange,
+        with text: String,
+        operationGeneration: UInt64
+    ) -> KeyboardRawInsertionUpdate? {
+        guard let region = confirmedKeyboardRawInsertionRegion,
+              region.sessionGeneration == keyboardGeneration,
+              region.operationGeneration > 0,
+              region.operationGeneration <= keyboardOperationGeneration,
+              !text.unicodeScalars.contains(where: isStructuralSeparator),
+              region.coordinateRange.location >= 0,
+              region.coordinateRange.length >= 0,
+              region.rawRange.location >= 0,
+              region.rawRange.length == region.coordinateRange.length,
+              region.separatorLength == 2,
+              range.location >= region.coordinateRange.location,
+              range.length >= 0,
+              range.location <= region.coordinateRange.location + region.coordinateRange.length,
+              range.length <= region.coordinateRange.location + region.coordinateRange.length - range.location,
+              isUTF16ScalarBoundary(range.location, in: confirmedKeyboardDocument ?? ""),
+              isUTF16ScalarBoundary(range.location + range.length, in: confirmedKeyboardDocument ?? ""),
+              region.rawRange.location + region.rawRange.length + region.separatorLength <= rawDocument.utf16.count else {
+            return nil
+        }
+
+        let separator = (rawDocument as NSString).substring(
+            with: NSRange(
+                location: region.rawRange.location + region.rawRange.length,
+                length: region.separatorLength
+            )
+        )
+        guard separator == "\n\n" else { return nil }
+
+        let relativeLocation = range.location - region.coordinateRange.location
+        let rawRange = TextRange(
+            location: region.rawRange.location + relativeLocation,
+            length: range.length
+        )
+        guard rawRange.location >= region.rawRange.location,
+              rawRange.location + rawRange.length <= region.rawRange.location + region.rawRange.length else {
+            return nil
+        }
+
+        let nextCoordinateLength = region.coordinateRange.length - range.length + text.utf16.count
+        let nextRawLength = region.rawRange.length - range.length + text.utf16.count
+        let nextRegion: KeyboardRawInsertionRegion? = nextRawLength > 0
+            ? KeyboardRawInsertionRegion(
+                sessionGeneration: region.sessionGeneration,
+                operationGeneration: operationGeneration,
+                coordinateRange: TextRange(
+                    location: region.coordinateRange.location,
+                    length: nextCoordinateLength
+                ),
+                rawRange: TextRange(
+                    location: region.rawRange.location,
+                    length: nextRawLength
+                ),
+                separatorLength: region.separatorLength
+            )
+            : nil
+        return KeyboardRawInsertionUpdate(rawRange: rawRange, nextRegion: nextRegion)
+    }
+
     private func emptyParagraphCollapsedReceipts(
         document: String,
         range: TextRange,
         text: String,
         rawDocument: String,
         rawRange: TextRange,
-        mapping: AXTextCoordinateMapping
-    ) -> [KeyboardDocumentState] {
+        mapping: AXTextCoordinateMapping,
+        operationGeneration: UInt64
+    ) -> [KeyboardRepresentationCandidate] {
+        if let candidate = terminalTrailingNewlineCandidate(
+            document: document,
+            range: range,
+            text: text,
+            rawDocument: rawDocument,
+            rawRange: rawRange,
+            mapping: mapping
+        ) {
+            return [candidate]
+        }
+
         guard isCodexTarget,
               !text.isEmpty,
               !text.unicodeScalars.contains(where: isStructuralSeparator),
@@ -1604,9 +2066,9 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             with: text
         )
 
-        var candidates: [KeyboardDocumentState] = []
+        var candidates: [KeyboardRepresentationCandidate] = []
         for rawText in [replacedRaw as String, retainedSeparatorRaw as String] {
-            guard candidates.allSatisfy({ $0.rawText != rawText }) else { continue }
+            guard candidates.allSatisfy({ $0.state.rawText != rawText }) else { continue }
             let probe = AXTextCoordinateProbe { requestedRange in
                 guard requestedRange.location >= 0,
                       requestedRange.length >= 0,
@@ -1639,17 +2101,173 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             resolved.mapping.rawRange(for: alternateSelection) != nil else {
                 continue
             }
-            candidates.append(KeyboardDocumentState(
-                text: resolved.text,
-                selection: resolved.selection,
-                rawText: resolved.rawText,
-                mapping: resolved.mapping
+            candidates.append(KeyboardRepresentationCandidate(
+                state: KeyboardDocumentState(
+                    text: resolved.text,
+                    selection: resolved.selection,
+                    rawText: resolved.rawText,
+                    mapping: resolved.mapping
+                ),
+                rawInsertionRegion: nil
             ))
+        }
+
+        if let candidate = leadingSingleEmptyParagraphCandidate(
+            document: document,
+            range: range,
+            text: text,
+            rawDocument: rawDocument,
+            rawRange: rawRange,
+            mapping: mapping,
+            operationGeneration: operationGeneration
+        ) {
+            candidates.append(candidate)
         }
         return candidates
     }
 
+    private func terminalTrailingNewlineCandidate(
+        document: String,
+        range: TextRange,
+        text: String,
+        rawDocument: String,
+        rawRange: TextRange,
+        mapping: AXTextCoordinateMapping
+    ) -> KeyboardRepresentationCandidate? {
+        let trailingCount = trailingNewlineCount(in: document)
+        guard isCodexTarget,
+              !text.isEmpty,
+              !text.unicodeScalars.contains(where: isStructuralSeparator),
+              range.length == 0,
+              rawRange.length == 0,
+              range.location == document.utf16.count,
+              rawRange.location == rawDocument.utf16.count,
+              !document.isEmpty,
+              document == rawDocument,
+              mapping.source == .axStringForRange,
+              mapping.omittedStructuralSeparatorCount == 0,
+              mapping.coordinateDocumentLength == document.utf16.count,
+              mapping.rawDocumentLength == rawDocument.utf16.count,
+              trailingCount > 0,
+              document.utf16.count > trailingCount,
+              utf16Unit(at: document.utf16.count - 1, in: document) == 0x0A,
+              utf16Unit(at: document.utf16.count - trailingCount - 1, in: document)
+                .map({ !isStructuralSeparatorCodeUnit($0) }) == true else {
+            return nil
+        }
+
+        let prefix = (document as NSString).substring(
+            with: NSRange(location: 0, length: document.utf16.count - 1)
+        )
+        let expectedText = prefix + text
+        let selection = TextRange(location: expectedText.utf16.count, length: 0)
+        guard let expectedMapping = expectedKeyboardMapping(
+            rawText: expectedText,
+            coordinateText: expectedText,
+            selection: selection
+        ),
+        expectedMapping.rawRange(for: selection) != nil else {
+            return nil
+        }
+
+        return KeyboardRepresentationCandidate(
+            state: KeyboardDocumentState(
+                text: expectedText,
+                selection: selection,
+                rawText: expectedText,
+                mapping: expectedMapping
+            ),
+            rawInsertionRegion: nil
+        )
+    }
+
+    private func leadingSingleEmptyParagraphCandidate(
+        document: String,
+        range: TextRange,
+        text: String,
+        rawDocument: String,
+        rawRange: TextRange,
+        mapping: AXTextCoordinateMapping,
+        operationGeneration: UInt64
+    ) -> KeyboardRepresentationCandidate? {
+        guard isCodexTarget,
+              range == TextRange(location: 0, length: 0),
+              rawRange == TextRange(location: 0, length: 0),
+              rawDocument == document,
+              mapping.source == .axStringForRange,
+              mapping.omittedStructuralSeparatorCount == 0,
+              mapping.coordinateDocumentLength == document.utf16.count,
+              mapping.rawDocumentLength == rawDocument.utf16.count,
+              document.utf16.count > 1,
+              utf16Unit(at: 0, in: document) == 0x0A,
+              utf16Unit(at: 1, in: document).map({ !isStructuralSeparatorCodeUnit($0) }) == true,
+              !text.isEmpty,
+              !text.unicodeScalars.contains(where: isStructuralSeparator) else {
+            return nil
+        }
+
+        let suffix = (document as NSString).substring(
+            with: NSRange(location: 1, length: document.utf16.count - 1)
+        )
+        let coordinateText = text + suffix
+        let rawText = text + "\n\n" + suffix
+        let selection = TextRange(location: text.utf16.count, length: 0)
+        let probe = AXTextCoordinateProbe { requestedRange in
+            guard requestedRange.location >= 0,
+                  requestedRange.length >= 0,
+                  requestedRange.location <= coordinateText.utf16.count,
+                  requestedRange.length <= coordinateText.utf16.count - requestedRange.location else {
+                return nil
+            }
+            return (coordinateText as NSString).substring(
+                with: NSRange(
+                    location: requestedRange.location,
+                    length: requestedRange.length
+                )
+            )
+        }
+        guard let resolved = try? AXTextDocumentResolver.resolve(
+            rawText: rawText,
+            selection: selection,
+            placeholderEvidence: .init(),
+            probe: probe
+        ),
+        resolved.rawText == rawText,
+        resolved.text == coordinateText,
+        resolved.selection == selection,
+        resolved.mapping.source == .axStringForRange,
+        AXTextDocumentResolver.isValidCoordinateMapping(
+            resolved.mapping,
+            rawText: resolved.rawText,
+            coordinateText: resolved.text
+        ),
+        resolved.mapping.rawRange(for: selection) != nil else {
+            return nil
+        }
+
+        return KeyboardRepresentationCandidate(
+            state: KeyboardDocumentState(
+                text: resolved.text,
+                selection: resolved.selection,
+                rawText: resolved.rawText,
+                mapping: resolved.mapping
+            ),
+            rawInsertionRegion: KeyboardRawInsertionRegion(
+                sessionGeneration: keyboardGeneration,
+                operationGeneration: operationGeneration,
+                coordinateRange: TextRange(location: 0, length: text.utf16.count),
+                rawRange: TextRange(location: 0, length: text.utf16.count),
+                separatorLength: 2
+            )
+        )
+    }
+
     private func emptyParagraphRepresentation(document: String, range: TextRange) -> String {
+        if range.length == 0,
+           range.location == document.utf16.count,
+           trailingNewlineCount(in: document) > 0 {
+            return KeyboardReceiptRepresentation.trailingNewlineCollapsed
+        }
         guard let run = newlineRun(containing: range.location, in: document),
               let region = emptyParagraphRegion(for: run, documentLength: document.utf16.count) else {
             return KeyboardReceiptRepresentation.emptyParagraphMarkerCollapsed
@@ -1660,6 +2278,11 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     }
 
     private func emptyParagraphInsertionPositionClass(document: String, range: TextRange) -> String {
+        if range.length == 0,
+           range.location == document.utf16.count,
+           trailingNewlineCount(in: document) > 0 {
+            return "terminal_after_trailing_newline"
+        }
         guard let run = newlineRun(containing: range.location, in: document),
               let region = emptyParagraphRegion(for: run, documentLength: document.utf16.count) else {
             return "not_empty_paragraph"
@@ -1772,8 +2395,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                   ) else {
                 return false
             }
-            if let expectedMapping = expected.mapping,
-               observedMapping != expectedMapping {
+            if !observed.matchesExpectedMapping(of: expected) {
                 return false
             }
             return true
@@ -1805,6 +2427,17 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         )
     }
 
+    private func keyboardDiagnosticMappingIsValid(_ state: KeyboardDocumentState) -> Bool {
+        guard isCodexTarget else { return true }
+        guard let rawText = state.rawText,
+              let mapping = state.mapping else { return false }
+        return AXTextDocumentResolver.isValidCoordinateMapping(
+            mapping,
+            rawText: rawText,
+            coordinateText: state.text
+        )
+    }
+
     private func utf16Unit(at offset: Int, in text: String) -> UInt16? {
         guard offset >= 0 else { return nil }
         let units = Array(text.utf16)
@@ -1824,6 +2457,21 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
 
     private func isStructuralSeparator(_ scalar: UnicodeScalar) -> Bool {
         scalar == "\n" || scalar == "\r" || scalar == "\u{2028}" || scalar == "\u{2029}"
+    }
+
+    private func isStructuralSeparatorCodeUnit(_ unit: UInt16) -> Bool {
+        unit == 0x0A || unit == 0x0D || unit == 0x2028 || unit == 0x2029
+    }
+
+    private func isUTF16ScalarBoundary(_ offset: Int, in text: String) -> Bool {
+        guard offset >= 0, offset <= text.utf16.count else { return false }
+        guard offset > 0, offset < text.utf16.count else { return true }
+        let units = Array(text.utf16)
+        let previous = units[offset - 1]
+        let current = units[offset]
+        let isHighSurrogate = (0xD800...0xDBFF).contains(previous)
+        let isLowSurrogate = (0xDC00...0xDFFF).contains(current)
+        return !(isHighSurrogate && isLowSurrogate)
     }
 
     private func coordinateLength(forKeyboardText text: String) -> Int {
@@ -2022,6 +2670,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 return
             }
             recordDiagnostic("keyboard_focus_changed")
+            invalidateKeyboardRawInsertionRegion()
             throw TextTargetError.targetChanged
         }
         try ensureActiveInputStrategyIsStillApplicable(for: currentElement)
@@ -2040,6 +2689,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 "actualStrategy": currentStrategy.diagnosticName,
                 "actualReason": currentStrategy.diagnosticReason
             ])
+            invalidateKeyboardRawInsertionRegion()
             throw TextTargetError.targetChanged
         }
     }
@@ -2094,6 +2744,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             }
             let comparison = keyboardStateComparison(currentState, expected: expectedState)
             guard comparison == .matched else {
+                invalidateKeyboardRawInsertionRegion()
                 recordDiagnostic(
                     "keyboard_confirmed_state_changed",
                     [
@@ -2106,6 +2757,15 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                         "currentSelectionLength": String(currentState.selection.length)
                     ]
                 )
+                throw TextTargetError.targetChanged
+            }
+            guard confirmedRawInsertionRegionMatches(currentState) else {
+                invalidateKeyboardRawInsertionRegion()
+                recordDiagnostic("keyboard_confirmed_state_changed", [
+                    "comparison": "raw_text_changed",
+                    "expectedDocumentLengthUTF16": String(expectedState.text.utf16.count),
+                    "currentDocumentLengthUTF16": String(currentState.text.utf16.count)
+                ])
                 throw TextTargetError.targetChanged
             }
             commitConfirmedKeyboardState(currentState)
@@ -2151,6 +2811,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         guard let targetElement else { return .matched }
         let currentElement = try focusedElement()
         guard CFEqual(currentElement, targetElement) else {
+            invalidateKeyboardRawInsertionRegion()
             recordDiagnostic("keyboard_focus_changed")
             throw TextTargetError.targetChanged
         }
@@ -2174,22 +2835,42 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             recordDiagnostic("keyboard_state_read_retryable", ["phase": "reconciliation"])
             return .matched
         } catch {
+            invalidateKeyboardRawInsertionRegion()
             recordDiagnostic("keyboard_user_edit_read_failed")
             throw TextTargetError.targetChanged
         }
         guard let expectedState = currentConfirmedKeyboardState() else {
+            invalidateKeyboardRawInsertionRegion()
             recordDiagnostic("keyboard_user_edit_read_failed")
             throw TextTargetError.targetChanged
         }
         let comparison = keyboardStateComparison(currentState, expected: expectedState)
         guard comparison != .rawMappingUnavailable else {
+            invalidateKeyboardRawInsertionRegion()
             recordDiagnostic("keyboard_user_edit_ambiguous", ["reason": "mapping_unavailable"])
             throw TextTargetError.targetChanged
         }
-        guard comparison != .matched else {
+        if comparison == .matched {
+            guard confirmedRawInsertionRegionMatches(currentState) else {
+                invalidateKeyboardRawInsertionRegion()
+                recordDiagnostic("keyboard_user_edit_detected", [
+                    "comparison": "raw_text_changed",
+                    "previousDocumentLengthUTF16": String(expectedState.text.utf16.count),
+                    "currentDocumentLengthUTF16": String(currentState.text.utf16.count)
+                ])
+                commitConfirmedKeyboardState(currentState)
+                recordDiagnostic("keyboard_state_rebased_after_user_edit", [
+                    "documentLengthUTF16": String(currentState.text.utf16.count),
+                    "selectionLocation": String(currentState.selection.location),
+                    "selectionLength": String(currentState.selection.length)
+                ])
+                return .externalEdit
+            }
             commitConfirmedKeyboardState(currentState)
             return .matched
         }
+
+        invalidateKeyboardRawInsertionRegion()
 
         recordDiagnostic("keyboard_user_edit_detected", [
             "comparison": comparison.rawValue,
@@ -2273,6 +2954,21 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         )
     }
 
+    private func invalidateKeyboardRawInsertionRegion() {
+        confirmedKeyboardRawInsertionRegion = nil
+        pendingKeyboardRawInsertionRegion = nil
+    }
+
+    private func confirmedRawInsertionRegionMatches(_ state: KeyboardDocumentState) -> Bool {
+        guard confirmedKeyboardRawInsertionRegion != nil else { return true }
+        guard let confirmedKeyboardRawText,
+              let confirmedKeyboardMapping else {
+            return false
+        }
+        return state.rawText == confirmedKeyboardRawText
+            && state.mapping == confirmedKeyboardMapping
+    }
+
     private func keyboardStateComparison(
         _ current: KeyboardDocumentState,
         expected: KeyboardDocumentState
@@ -2295,6 +2991,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         guard let targetApplicationProcessID else { return }
         guard access.currentApplication()?.processIdentifier == Int32(targetApplicationProcessID) else {
             recordDiagnostic("input_application_changed")
+            invalidateKeyboardRawInsertionRegion()
             throw TextTargetError.targetChanged
         }
     }
