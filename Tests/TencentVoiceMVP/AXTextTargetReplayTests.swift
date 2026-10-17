@@ -699,6 +699,133 @@ final class AXTextTargetReplayTests: XCTestCase {
         }
     }
 
+    func testCodexTrailingEmptyParagraphAtDocumentEndAcceptsCollapsedTerminalMarker() async throws {
+        let prefix = "草稿"
+        let before = prefix + "\n\n\n"
+        let afterFirst = prefix + "\n\n甲"
+        let afterAppend = prefix + "\n\n甲乙"
+        let afterRevision = prefix + "\n\n甲丁"
+        let access = ReplayAXTextTargetAccess(
+            text: before,
+            selection: .init(location: before.utf16.count, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.coordinateOverride = before
+        access.writeSnapshots = [
+            .init(
+                rawText: afterFirst,
+                coordinateText: afterFirst,
+                selection: .init(location: afterFirst.utf16.count, length: 0)
+            ),
+            .init(
+                rawText: afterAppend,
+                coordinateText: afterAppend,
+                selection: .init(location: afterAppend.utf16.count, length: 0)
+            ),
+            .init(
+                rawText: afterRevision,
+                coordinateText: afterRevision,
+                selection: .init(location: afterRevision.utf16.count, length: 0)
+            )
+        ]
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+
+        _ = try target.capture()
+        try target.paste("甲")
+        try await target.acknowledgeKeyboardWrite()
+        try target.paste("乙")
+        try await target.acknowledgeKeyboardWrite()
+        try target.replaceTrailingText("甲乙", with: "甲丁")
+        try await target.acknowledgeKeyboardWrite()
+
+        XCTAssertEqual(access.rawText, afterRevision)
+        XCTAssertEqual(access.coordinateText, afterRevision)
+        XCTAssertEqual(access.selection, .init(location: afterRevision.utf16.count, length: 0))
+        XCTAssertEqual(sender.appendPosts, 2)
+        XCTAssertEqual(sender.replacementPosts, 1)
+        let acknowledgements = target.drainDiagnostics().filter { $0.event == "keyboard_write_acknowledged" }
+        XCTAssertEqual(acknowledgements.count, 3)
+        XCTAssertEqual(acknowledgements[0].fields["ackCandidateCount"], "2")
+        XCTAssertEqual(acknowledgements[0].fields["receiptRepresentationTransition"], "trailing_newline_collapsed")
+        XCTAssertEqual(acknowledgements[0].fields["ackInsertionPositionClass"], "terminal_after_trailing_newline")
+        XCTAssertEqual(acknowledgements[1].fields["receiptRepresentationTransition"], "none")
+        XCTAssertEqual(acknowledgements[2].fields["receiptRepresentationTransition"], "none")
+    }
+
+    func testCodexTerminalTrailingNewlineCandidateRejectsOutsideStructureChange() async throws {
+        let before = "草稿\n\n\n"
+        let observed = "草稿\n甲"
+        let access = ReplayAXTextTargetAccess(
+            text: before,
+            selection: .init(location: before.utf16.count, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.coordinateOverride = before
+        access.writeSnapshots = [
+            .init(
+                rawText: observed,
+                coordinateText: observed,
+                selection: .init(location: observed.utf16.count, length: 0)
+            )
+        ]
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+
+        _ = try target.capture()
+        try target.paste("甲")
+        do {
+            try await target.acknowledgeKeyboardWrite()
+            XCTFail("an outside structural change must remain unconfirmed")
+        } catch { }
+
+        XCTAssertEqual(sender.totalPosts, 1)
+        let failure = try XCTUnwrap(target.drainDiagnostics().last { $0.event == "keyboard_write_unconfirmed" })
+        XCTAssertEqual(failure.fields["comparison"], "documentMismatch")
+    }
+
+    func testCodexTerminalTrailingNewlineCandidateDoesNotCollapseCRLF() async throws {
+        let before = "草稿\r\n"
+        let observed = "草稿\r甲"
+        let access = ReplayAXTextTargetAccess(
+            text: before,
+            selection: .init(location: before.utf16.count, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.coordinateOverride = before
+        access.writeSnapshots = [
+            .init(
+                rawText: observed,
+                coordinateText: observed,
+                selection: .init(location: observed.utf16.count, length: 0)
+            )
+        ]
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+
+        _ = try target.capture()
+        try target.paste("甲")
+        do {
+            try await target.acknowledgeKeyboardWrite()
+            XCTFail("CRLF must not use the LF-only terminal candidate")
+        } catch { }
+
+        XCTAssertEqual(sender.totalPosts, 1)
+        XCTAssertTrue(target.drainDiagnostics().contains { $0.event == "keyboard_write_unconfirmed" })
+    }
+
     func testCodexReport81To82CanComeFromEitherWrongEditorOrStaleAXState() async throws {
         var failures: [[String: String]] = []
         for capturedWrongEditor in [true, false] {

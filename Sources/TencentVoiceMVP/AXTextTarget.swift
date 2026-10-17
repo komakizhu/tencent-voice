@@ -1990,6 +1990,17 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         mapping: AXTextCoordinateMapping,
         operationGeneration: UInt64
     ) -> [KeyboardRepresentationCandidate] {
+        if let candidate = terminalTrailingNewlineCandidate(
+            document: document,
+            range: range,
+            text: text,
+            rawDocument: rawDocument,
+            rawRange: rawRange,
+            mapping: mapping
+        ) {
+            return [candidate]
+        }
+
         guard isCodexTarget,
               !text.isEmpty,
               !text.unicodeScalars.contains(where: isStructuralSeparator),
@@ -2115,6 +2126,61 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         return candidates
     }
 
+    private func terminalTrailingNewlineCandidate(
+        document: String,
+        range: TextRange,
+        text: String,
+        rawDocument: String,
+        rawRange: TextRange,
+        mapping: AXTextCoordinateMapping
+    ) -> KeyboardRepresentationCandidate? {
+        let trailingCount = trailingNewlineCount(in: document)
+        guard isCodexTarget,
+              !text.isEmpty,
+              !text.unicodeScalars.contains(where: isStructuralSeparator),
+              range.length == 0,
+              rawRange.length == 0,
+              range.location == document.utf16.count,
+              rawRange.location == rawDocument.utf16.count,
+              !document.isEmpty,
+              document == rawDocument,
+              mapping.source == .axStringForRange,
+              mapping.omittedStructuralSeparatorCount == 0,
+              mapping.coordinateDocumentLength == document.utf16.count,
+              mapping.rawDocumentLength == rawDocument.utf16.count,
+              trailingCount > 0,
+              document.utf16.count > trailingCount,
+              utf16Unit(at: document.utf16.count - 1, in: document) == 0x0A,
+              utf16Unit(at: document.utf16.count - trailingCount - 1, in: document)
+                .map({ !isStructuralSeparatorCodeUnit($0) }) == true else {
+            return nil
+        }
+
+        let prefix = (document as NSString).substring(
+            with: NSRange(location: 0, length: document.utf16.count - 1)
+        )
+        let expectedText = prefix + text
+        let selection = TextRange(location: expectedText.utf16.count, length: 0)
+        guard let expectedMapping = expectedKeyboardMapping(
+            rawText: expectedText,
+            coordinateText: expectedText,
+            selection: selection
+        ),
+        expectedMapping.rawRange(for: selection) != nil else {
+            return nil
+        }
+
+        return KeyboardRepresentationCandidate(
+            state: KeyboardDocumentState(
+                text: expectedText,
+                selection: selection,
+                rawText: expectedText,
+                mapping: expectedMapping
+            ),
+            rawInsertionRegion: nil
+        )
+    }
+
     private func leadingSingleEmptyParagraphCandidate(
         document: String,
         range: TextRange,
@@ -2197,6 +2263,11 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     }
 
     private func emptyParagraphRepresentation(document: String, range: TextRange) -> String {
+        if range.length == 0,
+           range.location == document.utf16.count,
+           trailingNewlineCount(in: document) > 0 {
+            return KeyboardReceiptRepresentation.trailingNewlineCollapsed
+        }
         guard let run = newlineRun(containing: range.location, in: document),
               let region = emptyParagraphRegion(for: run, documentLength: document.utf16.count) else {
             return KeyboardReceiptRepresentation.emptyParagraphMarkerCollapsed
@@ -2207,6 +2278,11 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     }
 
     private func emptyParagraphInsertionPositionClass(document: String, range: TextRange) -> String {
+        if range.length == 0,
+           range.location == document.utf16.count,
+           trailingNewlineCount(in: document) > 0 {
+            return "terminal_after_trailing_newline"
+        }
         guard let run = newlineRun(containing: range.location, in: document),
               let region = emptyParagraphRegion(for: run, documentLength: document.utf16.count) else {
             return "not_empty_paragraph"
