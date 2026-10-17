@@ -52,6 +52,15 @@ struct KeyboardDocumentState: Equatable {
         self.mapping = mapping
     }
 
+    // A structurally valid mapping can still describe a different AX
+    // representation. When a receipt carries an expected mapping, the
+    // observed mapping must be the same one; validity is checked separately
+    // by the target before this comparison.
+    func matchesExpectedMapping(of expected: KeyboardDocumentState) -> Bool {
+        guard let expectedMapping = expected.mapping else { return true }
+        return mapping == expectedMapping
+    }
+
     func compare(
         to expected: KeyboardDocumentState,
         allowingStructuralRawDifference: Bool = false

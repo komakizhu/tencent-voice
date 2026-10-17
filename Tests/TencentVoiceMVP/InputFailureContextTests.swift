@@ -74,6 +74,61 @@ final class InputFailureContextTests: XCTestCase {
         XCTAssertEqual(decoded.desktopContext.collectionStatus["failureProbeStatus"], "pending")
     }
 
+    func testKeyboardDiagnosticDiffFieldsRoundTripWithoutContent() throws {
+        let now = Date(timeIntervalSince1970: 1000)
+        let expected = KeyboardDocumentState(
+            text: "甲乙",
+            selection: .init(location: 2, length: 0),
+            rawText: "甲\n乙"
+        )
+        let observed = KeyboardDocumentState(
+            text: "甲乙",
+            selection: .init(location: 2, length: 0),
+            rawText: "甲乙\n"
+        )
+        let summary = KeyboardDiagnosticDiffCalculator.compare(
+            expected: expected,
+            observed: observed,
+            operation: .init(
+                coordinateRange: .init(location: 1, length: 0),
+                insertedLengthUTF16: 1,
+                operationGeneration: 7
+            ),
+            mappingValid: true
+        )
+        var buffer = InputContextBuffer()
+        buffer.start(at: now)
+        buffer.append(
+            .init(
+                timestamp: now,
+                event: "keyboard_write_unconfirmed",
+                fields: DiagnosticLogSanitizer.fields(
+                    summary.fields(prefix: "ackDiffFinal0")
+                )
+            ),
+            now: now
+        )
+        buffer.freezeFailure(at: now)
+        let evidence = InputFailureEvidence(
+            desktopContext: try XCTUnwrap(buffer.latestFailure),
+            diagnosticEvents: [],
+            diagnosticEventsTruncated: false
+        )
+        let data = try DiagnosticJSON.encoder().encode(evidence)
+        let encoded = String(decoding: data, as: UTF8.self)
+        XCTAssertTrue(encoded.contains("structural_local"))
+        XCTAssertFalse(encoded.contains("私密正文"))
+        let decoded = try DiagnosticJSON.decoder().decode(InputFailureEvidence.self, from: data)
+        XCTAssertEqual(
+            decoded.desktopContext.events.first?.fields["ackDiffFinal0Classification"],
+            "structural_local"
+        )
+        XCTAssertEqual(
+            decoded.desktopContext.events.first?.fields["ackDiffFinal0SeparatorDifferenceBoundaryCount"],
+            "2"
+        )
+    }
+
     @MainActor
     func testAXWriteUnconfirmedFreezesTheEarliestDiagnosticEvidence() throws {
         let recorder = InputFailureContextRecorder()
