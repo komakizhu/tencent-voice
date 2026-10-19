@@ -58,7 +58,12 @@ struct KeyboardDocumentState: Equatable {
     // by the target before this comparison.
     func matchesExpectedMapping(of expected: KeyboardDocumentState) -> Bool {
         guard let expectedMapping = expected.mapping else { return true }
-        return mapping == expectedMapping
+        guard let mapping else { return false }
+        if mapping == expectedMapping {
+            return true
+        }
+        return (mapping.isPendingReceiptFallback || expectedMapping.isPendingReceiptFallback)
+            && mapping.isEquivalentIgnoringSource(to: expectedMapping)
     }
 
     func compare(
@@ -101,6 +106,7 @@ struct KeyboardDocumentState: Equatable {
 
 enum KeyboardDocumentComparison: String, Equatable {
     case matched
+    case ambiguousReceipt
     case documentMismatch
     case selectionMismatch
     case rawTextMismatch

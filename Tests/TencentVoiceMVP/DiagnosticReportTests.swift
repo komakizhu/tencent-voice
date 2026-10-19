@@ -172,6 +172,17 @@ final class DiagnosticReportTests: XCTestCase {
                         "axValueLengthUTF16": "7",
                         "selectionLocation": "6"
                     ]
+                ),
+                SessionLogEntry(
+                    sessionID: session,
+                    event: "keyboard_selection_stabilization_failed",
+                    metadata: [
+                        "phase": "after_set",
+                        "comparison": "selection_mismatch",
+                        "selectedRangeSettable": "true",
+                        "selectionLocation": "3",
+                        "selectionLength": "0"
+                    ]
                 )
             ],
             logDirectoryPath: "/tmp/logs"
@@ -187,6 +198,8 @@ final class DiagnosticReportTests: XCTestCase {
         let rendered = report.renderedText()
         XCTAssertTrue(rendered.contains("axValueLengthUTF16=7"))
         XCTAssertTrue(rendered.contains("coordinate_text_mismatch"))
+        XCTAssertTrue(rendered.contains("comparison=selection_mismatch"))
+        XCTAssertTrue(rendered.contains("selectedRangeSettable=true"))
         XCTAssertFalse(rendered.contains("添加可选评论"))
     }
 

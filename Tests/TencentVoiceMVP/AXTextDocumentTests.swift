@@ -94,6 +94,276 @@ final class AXTextDocumentTests: XCTestCase {
         XCTAssertEqual(state.mapping.coordinateDocumentLength, coordinateText.utf16.count)
     }
 
+    func testCoordinateMappingRetainsEveryCompatibleRawCaretBoundary() throws {
+        let raw = "甲\n\n乙"
+        let coordinateText = "甲乙"
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: 1, length: 0),
+            placeholderEvidence: .init(),
+            probe: prefixProbe(coordinateText)
+        )
+
+        XCTAssertEqual(
+            state.mapping.rawRangeCandidates(for: .init(location: 1, length: 0)),
+            [
+                .init(location: 1, length: 0),
+                .init(location: 2, length: 0),
+                .init(location: 3, length: 0)
+            ]
+        )
+        XCTAssertNil(
+            state.mapping.rawRange(for: .init(location: 1, length: 0)),
+            "an ambiguous boundary must not be collapsed to the rightmost candidate"
+        )
+        XCTAssertEqual(state.mapping.rawBoundaryCandidates[1], [1, 2, 3])
+        XCTAssertEqual(
+            state.mapping.rawRangeCandidates(for: .init(location: 1, length: 1)),
+            [
+                .init(location: 1, length: 3),
+                .init(location: 2, length: 2),
+                .init(location: 3, length: 1)
+            ]
+        )
+        for range in [
+            TextRange(location: 0, length: 0),
+            TextRange(location: 1, length: 0),
+            TextRange(location: 1, length: 1),
+            TextRange(location: 2, length: 0)
+        ] {
+            let candidates = state.mapping.rawRangeCandidates(for: range)
+            if candidates.count == 1 {
+                XCTAssertEqual(state.mapping.rawRange(for: range), candidates.first)
+            } else {
+                XCTAssertNil(
+                    state.mapping.rawRange(for: range),
+                    "ambiguous range must remain unresolved: \(range) -> \(candidates)"
+                )
+            }
+        }
+    }
+
+    func testStructuralTransitionKeepsEveryCompatibleRawBoundaryHypothesis() throws {
+        let raw = "甲\n\n\n乙"
+        let coordinateText = "甲\n乙"
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: 1, length: 0),
+            placeholderEvidence: .init(),
+            probe: prefixProbe(coordinateText)
+        )
+        let range = TextRange(location: 1, length: 0)
+        let rawRanges = state.mapping.rawRangeCandidates(for: range)
+        XCTAssertGreaterThanOrEqual(rawRanges.count, 2)
+
+        let candidates = AXTextStructuralTransitionModel.candidates(
+            document: coordinateText,
+            range: range,
+            text: "今",
+            rawDocument: raw,
+            rawRanges: rawRanges,
+            mapping: state.mapping
+        )
+        XCTAssertEqual(candidates.count, rawRanges.count * 4)
+        for rawRange in rawRanges {
+            XCTAssertEqual(
+                candidates.filter { $0.rawOperationRange == rawRange }.count,
+                4,
+                "missing structural hypotheses for raw boundary (rawRange)"
+            )
+        }
+        XCTAssertTrue(
+            candidates.contains {
+                $0.rawOperationRange == rawRanges[0]
+                    && $0.rawInsertionSeparatorLength == 3
+            }
+        )
+    }
+
+    func testCoordinateMappingRejectsSameLengthStaleAlignment() throws {
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: "甲\n乙",
+            selection: .init(location: 1, length: 0),
+            placeholderEvidence: .init(),
+            probe: prefixProbe("甲乙")
+        )
+
+        XCTAssertFalse(
+            AXTextDocumentResolver.isValidCoordinateMapping(
+                state.mapping,
+                rawText: "丁\n乙",
+                coordinateText: "丁乙"
+            )
+        )
+    }
+
+    func testCoordinateMappingKeepsCRLFAndUnicodeSeparatorsAsDistinctCandidates() throws {
+        let raw = "甲\r\n\u{2028}\u{2029}乙"
+        let coordinateText = "甲乙"
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: 1, length: 0),
+            placeholderEvidence: .init(),
+            probe: prefixProbe(coordinateText)
+        )
+
+        XCTAssertEqual(
+            state.mapping.rawRangeCandidates(for: .init(location: 1, length: 0)).map(\.location),
+            [1, 3, 4, 5]
+        )
+        XCTAssertEqual(state.mapping.rawBoundaryCandidates[1], [1, 3, 4, 5])
+        XCTAssertEqual(state.mapping.rawBoundaryCandidates[2], [6])
+    }
+
+    func testStandaloneCRRemains正文AndCannotBeSilentlyOmitted() throws {
+        let raw = "甲\r乙"
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: raw.utf16.count, length: 0),
+            placeholderEvidence: .init(),
+            probe: prefixProbe(raw)
+        )
+
+        XCTAssertEqual(state.text, raw)
+        XCTAssertEqual(state.mapping.omittedStructuralSeparatorCount, 0)
+        XCTAssertEqual(
+            state.mapping.rawRangeCandidates(
+                for: .init(location: raw.utf16.count, length: 0)
+            ),
+            [.init(location: raw.utf16.count, length: 0)]
+        )
+
+        XCTAssertThrowsError(
+            try AXTextDocumentResolver.resolve(
+                rawText: raw,
+                selection: .init(location: 2, length: 0),
+                placeholderEvidence: .init(),
+                probe: prefixProbe("甲乙")
+            )
+        ) { error in
+            XCTAssertEqual(error as? AXTextDocumentResolutionError, .coordinateReadUnavailable)
+        }
+    }
+
+    func testCRLFInteriorBoundaryIsNotAWritableCaret() throws {
+        let raw = "甲\r\n乙"
+        let coordinateText = "甲乙"
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: coordinateText.utf16.count, length: 0),
+            placeholderEvidence: .init(),
+            probe: prefixProbe(coordinateText)
+        )
+
+        XCTAssertEqual(
+            state.mapping.rawRangeCandidates(for: .init(location: 1, length: 0)),
+            [.init(location: 1, length: 0), .init(location: 3, length: 0)]
+        )
+        XCTAssertFalse(
+            state.mapping.rawBoundaryCandidates[1].contains(2),
+            "the boundary between CR and LF is not a writable caret"
+        )
+    }
+
+    func testCRLFIsOneStructuralUnitAndLFIsNotOmittableAlone() throws {
+        let scalars = Array("\r\n".unicodeScalars)
+        XCTAssertTrue(AXTextStructural.isStructuralSeparator(at: 0, in: scalars))
+        XCTAssertTrue(AXTextStructural.isStructuralSeparator(at: 1, in: scalars))
+        XCTAssertEqual(
+            AXTextStructural.structuralUnitRange(startingAt: 0, in: "\r\n"),
+            .init(location: 0, length: 2)
+        )
+        XCTAssertNil(AXTextStructural.structuralUnitRange(startingAt: 1, in: "\r\n"))
+
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: "甲\r\n乙",
+            selection: .init(location: 2, length: 0),
+            placeholderEvidence: .init(),
+            probe: prefixProbe("甲\n乙")
+        )
+
+        XCTAssertEqual(state.mapping.omittedStructuralSeparatorCount, 1)
+        XCTAssertEqual(state.mapping.rawBoundaryCandidates[1], [1])
+        XCTAssertEqual(state.mapping.rawBoundaryCandidates[2], [3])
+    }
+
+    func testCRLFNormalizationFiltersTheRawInteriorCaret() throws {
+        let raw = "甲\r\n乙"
+        let exact = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: 3, length: 0),
+            placeholderEvidence: .init(),
+            probe: prefixProbe(raw)
+        )
+
+        XCTAssertEqual(exact.text, raw)
+        XCTAssertEqual(
+            exact.mapping.rawRangeCandidates(for: .init(location: 3, length: 0)),
+            [.init(location: 3, length: 0)]
+        )
+
+        let normalized = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: 3, length: 0),
+            placeholderEvidence: .init(),
+            probe: prefixProbe("甲\n乙")
+        )
+        XCTAssertEqual(normalized.text, "甲\n乙")
+        XCTAssertFalse(normalized.mapping.rawBoundaryCandidates[2].contains(2))
+
+        let bodyCR = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: 3, length: 0),
+            placeholderEvidence: .init(),
+            probe: prefixProbe("甲\r乙")
+        )
+        XCTAssertEqual(bodyCR.text, "甲\r乙")
+        XCTAssertFalse(bodyCR.mapping.rawBoundaryCandidates[2].contains(2))
+    }
+
+    func testCoordinateReaderSkipsAValidLengthButIncompleteCRLFSnapshot() throws {
+        let raw = "甲\r\n乙"
+        let coordinate = "甲乙"
+        let probe = AXTextCoordinateProbe { range in
+            guard range.location == 0 else { return nil }
+            switch range.length {
+            case 0: return ""
+            case 3: return "甲\r\n"
+            case 2: return coordinate
+            default: return nil
+            }
+        }
+
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: coordinate.utf16.count, length: 0),
+            placeholderEvidence: .init(),
+            probe: probe
+        )
+
+        XCTAssertEqual(state.text, coordinate)
+        XCTAssertEqual(state.mapping.rawDocumentLength, raw.utf16.count)
+        XCTAssertEqual(state.mapping.coordinateDocumentLength, coordinate.utf16.count)
+    }
+
+    func testCoordinateMappingDoesNotTreatZeroWidthTextAsASeparator() throws {
+        let zeroWidth = "\u{200B}"
+        let raw = "甲\(zeroWidth)\n乙"
+        let coordinateText = "甲\(zeroWidth)乙"
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: 2, length: 0),
+            placeholderEvidence: .init(),
+            probe: prefixProbe(coordinateText)
+        )
+
+        XCTAssertEqual(state.text, coordinateText)
+        XCTAssertEqual(state.mapping.rawRangeCandidates(for: .init(location: 2, length: 0)), [
+            .init(location: 2, length: 0),
+            .init(location: 3, length: 0)
+        ])
+    }
+
     func testKeyboardDocumentStateAcceptsLeadingStructuralSeparatorMapping() throws {
         let raw = "\n" + String(repeating: "字", count: 13)
         let coordinateText = String(repeating: "字", count: 13)
@@ -114,12 +384,15 @@ final class AXTextDocumentTests: XCTestCase {
             observed.compare(to: observed, allowingStructuralRawDifference: true),
             .matched
         )
-        XCTAssertEqual(state.mapping.rawRange(for: .init(location: 0, length: 0)), .init(location: 1, length: 0))
+        XCTAssertNil(
+            state.mapping.rawRange(for: .init(location: 0, length: 0)),
+            "the leading omitted separator leaves the document-start boundary ambiguous"
+        )
         XCTAssertEqual(state.mapping.rawRange(for: .init(location: 13, length: 0)), .init(location: 14, length: 0))
     }
 
     func testKeyboardDocumentStateAcceptsMultipleLeadingStructuralSeparators() throws {
-        for prefix in ["\n\n", "\n\r\u{2028}"] {
+        for prefix in ["\n\n", "\n\r\n\u{2028}"] {
             let coordinateText = "保留草稿😀"
             let state = try AXTextDocumentResolver.resolve(
                 rawText: prefix + coordinateText,
@@ -201,7 +474,7 @@ final class AXTextDocumentTests: XCTestCase {
             rawDocumentLength: state.mapping.rawDocumentLength,
             coordinateDocumentLength: state.mapping.coordinateDocumentLength,
             omittedStructuralSeparatorCount: state.mapping.omittedStructuralSeparatorCount,
-            rawBoundaryOffsets: state.mapping.rawBoundaryOffsets,
+            rawBoundaryCandidates: state.mapping.rawBoundaryCandidates,
             rawPlaceholderRange: state.mapping.rawPlaceholderRange
         )
 
@@ -232,6 +505,92 @@ final class AXTextDocumentTests: XCTestCase {
             "validity alone must not make a different mapping an exact receipt"
         )
         XCTAssertFalse(observed.matchesExpectedMapping(of: expected))
+    }
+
+    func testMultipleEquivalentReceiptMappingsStayUnconfirmed() throws {
+        let raw = "A\nB"
+        let coordinateText = "AB"
+        let resolved = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: 1, length: 0),
+            placeholderEvidence: AXPlaceholderEvidence(),
+            probe: prefixProbe(coordinateText)
+        )
+        let exactMapping = resolved.mapping.withSource(.pendingReceiptExactAXValue)
+        let structuralMapping = resolved.mapping.withSource(.pendingReceiptStructuralAugmentation)
+        let exactState = KeyboardDocumentState(
+            text: coordinateText,
+            selection: resolved.selection,
+            rawText: raw,
+            mapping: exactMapping
+        )
+        let structuralState = KeyboardDocumentState(
+            text: coordinateText,
+            selection: resolved.selection,
+            rawText: raw,
+            mapping: structuralMapping
+        )
+
+        let result = KeyboardWriteConfirmation.evaluateCandidates(
+            expectedCandidates: [exactState, structuralState],
+            observed: exactState,
+            operation: nil,
+            isCodexTarget: true
+        )
+
+        XCTAssertFalse(result.matched)
+        XCTAssertNil(result.matchedIndex)
+        XCTAssertEqual(result.matchedIndexes, [0, 1])
+        XCTAssertEqual(result.comparison, .ambiguousReceipt)
+        XCTAssertEqual(result.comparisons, [.matched, .matched])
+    }
+
+    func testExactReceiptTakesPriorityOverStructuralFallbackCandidate() throws {
+        let coordinateText = "A新B"
+        let selection = TextRange(location: 2, length: 0)
+        let exactRaw = "A\n\n新B"
+        let fallbackRaw = "A\n新B"
+        let exact = try AXTextDocumentResolver.resolve(
+            rawText: exactRaw,
+            selection: selection,
+            placeholderEvidence: .init(),
+            probe: prefixProbe(coordinateText)
+        )
+        let fallback = try AXTextDocumentResolver.resolve(
+            rawText: fallbackRaw,
+            selection: selection,
+            placeholderEvidence: .init(),
+            probe: prefixProbe(coordinateText)
+        )
+        let exactState = KeyboardDocumentState(
+            text: coordinateText,
+            selection: selection,
+            rawText: exactRaw,
+            mapping: exact.mapping
+        )
+        let fallbackState = KeyboardDocumentState(
+            text: coordinateText,
+            selection: selection,
+            rawText: fallbackRaw,
+            mapping: fallback.mapping
+        )
+        let result = KeyboardWriteConfirmation.evaluateCandidates(
+            expectedCandidates: [exactState, fallbackState],
+            observed: exactState,
+            operation: .init(
+                coordinateRange: .init(location: 1, length: 0),
+                insertedLengthUTF16: 1,
+                inputText: "新",
+                operationGeneration: 1
+            ),
+            isCodexTarget: true
+        )
+
+        XCTAssertTrue(result.matched)
+        XCTAssertEqual(result.matchedIndex, 0)
+        XCTAssertEqual(result.matchedIndexes, [0])
+        XCTAssertEqual(result.comparison, .matched)
+        XCTAssertEqual(result.comparisons, [.matched, .rawTextMismatch])
     }
 
     func testKeyboardDocumentStateRejectsSurrogateBoundaryMapping() throws {
@@ -319,6 +678,33 @@ final class AXTextDocumentTests: XCTestCase {
         XCTAssertEqual(state.text, coordinateText)
         XCTAssertEqual(state.mapping.coordinateDocumentLength, 3)
         XCTAssertEqual(state.mapping.rawBoundaryOffsets[3], raw.utf16.count)
+    }
+
+    func testResolverRejectsIllegalUTF16SelectionBoundariesInCoordinateSpace() {
+        XCTAssertThrowsError(
+            try AXTextDocumentResolver.resolve(
+                rawText: "a😀",
+                selection: .init(location: 2, length: 0),
+                placeholderEvidence: .init(),
+                probe: prefixProbe("a😀")
+            )
+        ) { error in
+            XCTAssertEqual(error as? AXTextDocumentResolutionError, .selectionOutOfBounds)
+        }
+
+        // The AX selection is expressed in coordinate text. Offset 2 is a
+        // valid raw AXValue boundary before the emoji, but becomes the middle
+        // of the emoji after the structural newline is omitted.
+        XCTAssertThrowsError(
+            try AXTextDocumentResolver.resolve(
+                rawText: "a\n😀",
+                selection: .init(location: 2, length: 0),
+                placeholderEvidence: .init(),
+                probe: prefixProbe("a😀")
+            )
+        ) { error in
+            XCTAssertEqual(error as? AXTextDocumentResolutionError, .selectionOutOfBounds)
+        }
     }
 
     func testUnexpectedCoordinateTextIsRejected() {

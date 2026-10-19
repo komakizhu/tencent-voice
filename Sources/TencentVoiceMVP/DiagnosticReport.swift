@@ -470,6 +470,8 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
             "axCoordinateLengthUTF16", "omittedStructuralSeparatorCount", "placeholderAttributePresent",
             "placeholderMarkedNodeCount", "placeholderOtherNodeCount",
             "expectedLocation", "expectedLength", "initialLocation", "actualLocation", "actualLength",
+            "selectedSettable", "selectedRangeSettable", "valueSettable",
+            "selectionLocation", "selectionLength", "route", "comparison",
             "desiredLengthCharacters", "desiredLengthUTF16", "submittedLengthCharacters",
             "submittedLengthUTF16", "observedLengthCharacters", "observedLengthUTF16",
             "commonPrefixLengthCharacters", "commonPrefixLengthUTF16", "previousTailLengthCharacters",

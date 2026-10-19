@@ -191,6 +191,8 @@ final class InputFailureContextTests: XCTestCase {
         XCTAssertEqual(sample["targetMatchesSystemFocus"], "true")
         XCTAssertEqual(sample["target.axValueLengthUTF16"], "81")
         XCTAssertEqual(sample["target.AXFocused"], "0")
+        XCTAssertEqual(sample["structure.ancestorRoles"], "AXTextArea")
+        XCTAssertEqual(sample["structure.evidence"], "unknown")
         XCTAssertEqual(sample["editorCount"], "2")
         XCTAssertEqual(sample["editor0.AXFocused"], "1")
         XCTAssertEqual(sample["editor0.axValueLengthUTF16"], "1")

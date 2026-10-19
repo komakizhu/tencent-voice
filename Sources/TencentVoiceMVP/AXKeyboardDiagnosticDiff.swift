@@ -12,7 +12,23 @@ enum KeyboardDiagnosticDiffClassification: String, Equatable, Sendable {
 struct KeyboardDiagnosticDiffOperation: Equatable, Sendable {
     let coordinateRange: TextRange
     let insertedLengthUTF16: Int
+    /// Exact text submitted for this operation. It is kept out of diagnostic
+    /// fields so normal reports never copy user正文, but the confirmation
+    /// model can distinguish a structural marker from a user line break.
+    let inputText: String?
     let operationGeneration: UInt64
+
+    init(
+        coordinateRange: TextRange,
+        insertedLengthUTF16: Int,
+        inputText: String? = nil,
+        operationGeneration: UInt64
+    ) {
+        self.coordinateRange = coordinateRange
+        self.insertedLengthUTF16 = insertedLengthUTF16
+        self.inputText = inputText
+        self.operationGeneration = operationGeneration
+    }
 }
 
 struct KeyboardDiagnosticDiffSummary: Equatable, Sendable {
@@ -219,6 +235,19 @@ enum KeyboardDiagnosticDiffCalculator {
               operation.insertedLengthUTF16 >= 0 else {
             return .unavailable(expected: expected, observed: observed, mappingValid: mappingValid)
         }
+        guard operation.coordinateRange.location >= 0,
+              operation.coordinateRange.length >= 0,
+              operation.coordinateRange.location <= expectedCoordinateLength,
+              isUTF16ScalarBoundary(
+                  operation.coordinateRange.location,
+                  in: expected.text
+              ),
+              !AXTextStructural.isCRLFInteriorBoundary(
+                  operation.coordinateRange.location,
+                  in: expected.text
+              ) else {
+            return .unavailable(expected: expected, observed: observed, mappingValid: mappingValid)
+        }
 
         let expectedUnits = scalarUnits(expectedAXValue)
         let observedUnits = scalarUnits(observedAXValue)
@@ -227,6 +256,39 @@ enum KeyboardDiagnosticDiffCalculator {
         let observedContent = observedUnits.filter { $0.separator == nil }.map(\.value)
         let coordinateUnits = scalarUnits(expected.text)
         let coordinateContent = coordinateUnits.filter { $0.separator == nil }.map(\.value)
+        if expectedAXValue == observedAXValue,
+           expected.text == observed.text,
+           expected.selection == observed.selection,
+           coordinateContent == expectedContent {
+            let operationStart = min(
+                max(operation.coordinateRange.location, 0),
+                expectedCoordinateLength
+            )
+            let operationEnd = min(
+                operationStart + max(
+                    operation.coordinateRange.length,
+                    operation.insertedLengthUTF16
+                ),
+                expectedCoordinateLength
+            )
+            return makeSummary(
+                classification: .equal,
+                expected: expected,
+                observed: observed,
+                change: change,
+                operationStart: operationStart,
+                operationEnd: operationEnd,
+                separatorBoundaryCount: 0,
+                separatorUnitCount: 0,
+                separatorDeltas: [:],
+                separatorPositions: [],
+                outsideCount: 0,
+                mappingValid: mappingValid
+            )
+        }
+        let observedCoordinateContent = scalarUnits(observed.text)
+            .filter { $0.separator == nil }
+            .map(\.value)
         let operationStart = operation.coordinateRange.location
         // Cover both the consumed range and the inserted content. This keeps
         // the two boundaries of an insertion local while retaining the full
@@ -263,6 +325,23 @@ enum KeyboardDiagnosticDiffCalculator {
         let operationEndCoordinate = coordinateBoundaryOffsets[operationEndBoundary]
 
         guard expectedContent == observedContent else {
+            return makeSummary(
+                classification: .contentChanged,
+                expected: expected,
+                observed: observed,
+                change: change,
+                operationStart: operationStartCoordinate,
+                operationEnd: operationEndCoordinate,
+                separatorBoundaryCount: 0,
+                separatorUnitCount: 0,
+                separatorDeltas: [:],
+                separatorPositions: [],
+                outsideCount: 0,
+                mappingValid: mappingValid
+            )
+        }
+
+        guard observedCoordinateContent == coordinateContent else {
             return makeSummary(
                 classification: .contentChanged,
                 expected: expected,
@@ -345,6 +424,153 @@ enum KeyboardDiagnosticDiffCalculator {
         )
     }
 
+    /// Accept only a structural representation transition that adds
+    /// separators at the operation's existing content boundary. A moved
+    /// separator, an outside change, or a changed content sequence remains
+    /// unconfirmed.
+    static func allowsLocalStructuralAugmentation(
+        expected: KeyboardDocumentState,
+        observed: KeyboardDocumentState,
+        operation: KeyboardDiagnosticDiffOperation?,
+        mappingValid: Bool,
+        allowNewStructuralBoundary: Bool = false
+    ) -> Bool {
+        guard let operation,
+              expected.selection == observed.selection,
+              expected.rawText != observed.rawText,
+              mappingValid,
+              operation.coordinateRange.location >= 0,
+              let expectedRawText = expected.rawText,
+              let observedRawText = observed.rawText else {
+            return false
+        }
+        // A line break supplied by the caller is body input, not a free
+        // structural marker. Without an independently calibrated node
+        // boundary, accepting an extra separator for such an operation would
+        // turn a user payload into an unverified representation transition.
+        if let inputText = operation.inputText,
+           AXTextStructural.containsStructuralSeparator(in: inputText) {
+            return false
+        }
+        guard allowNewStructuralBoundary || operation.coordinateRange.location > 0 else {
+            return false
+        }
+
+        let summary = compare(
+            expected: expected,
+            observed: observed,
+            operation: operation,
+            mappingValid: mappingValid
+        )
+        guard summary.classification == .structuralLocal,
+              summary.separatorOutsideOperationCount == 0 else {
+            return false
+        }
+
+        let coordinateUnits = scalarUnits(expected.text)
+        guard let operationStartBoundary = contentBoundaryIndex(
+            utf16Offset: operation.coordinateRange.location,
+            in: coordinateUnits
+        ),
+        let operationEndBoundary = contentBoundaryIndex(
+            utf16Offset: operation.coordinateRange.location + min(
+                max(operation.coordinateRange.length, operation.insertedLengthUTF16),
+                expected.text.utf16.count - operation.coordinateRange.location
+            ),
+            in: coordinateUnits
+        ) else {
+            return false
+        }
+
+        let expectedByBoundary = groupedSeparators(separatorEvents(scalarUnits(expectedRawText)))
+        let observedByBoundary = groupedSeparators(separatorEvents(scalarUnits(observedRawText)))
+        let expectedContentCount = coordinateUnits.filter { $0.separator == nil }.count
+        let maximumBoundary = max(
+            expectedByBoundary.keys.max() ?? 0,
+            observedByBoundary.keys.max() ?? 0
+        )
+        var addedSeparator = false
+
+        for boundary in 0...maximumBoundary {
+            let expectedKinds = (expectedByBoundary[boundary] ?? []).map(\.kind)
+            let observedKinds = (observedByBoundary[boundary] ?? []).map(\.kind)
+            guard observedKinds.count >= expectedKinds.count,
+                  Array(observedKinds.prefix(expectedKinds.count)) == expectedKinds else {
+                return false
+            }
+            if observedKinds.count > expectedKinds.count {
+                let isSingleLogicalSeparator = expectedKinds.count == 1
+                    || expectedKinds == [.cr, .lf]
+                let isNewStructuralBoundary = allowNewStructuralBoundary
+                    && expectedKinds.isEmpty
+                    && boundary >= operationStartBoundary
+                    && boundary <= operationEndBoundary
+                    && boundary <= expectedContentCount
+                guard (isNewStructuralBoundary || (
+                    !expectedKinds.isEmpty
+                        && isSingleLogicalSeparator
+                        && boundary > 0
+                        && boundary < expectedContentCount
+                )) else {
+                    return false
+                }
+                let additions = observedKinds.dropFirst(expectedKinds.count)
+                let repeatingPattern: Bool
+                if expectedKinds.isEmpty {
+                    // When the pre-write representation had no separator at
+                    // this content boundary, the AXValue may publish a new
+                    // empty-paragraph marker after the keyboard event. The
+                    // coordinate text and full mapping have already proved
+                    // that these units are omitted structural evidence; keep
+                    // the remaining check explicit so a CRLF can never be
+                    // accepted as a lone CR structural unit.
+                    repeatingPattern = isCompleteStructuralSeparatorRun(Array(additions)) != nil
+                } else {
+                    repeatingPattern = observedKinds.count % expectedKinds.count == 0
+                        && additions.enumerated().allSatisfy { index, kind in
+                            kind == expectedKinds[index % expectedKinds.count]
+                        }
+                }
+                guard repeatingPattern else { return false }
+                let logicalCopyCount: Int
+                if expectedKinds.isEmpty {
+                    logicalCopyCount = isCompleteStructuralSeparatorRun(observedKinds) ?? 0
+                } else {
+                    logicalCopyCount = observedKinds.count / expectedKinds.count
+                }
+                guard logicalCopyCount <= AXTextStructural.maxLocalMarkerCopies else {
+                    return false
+                }
+                addedSeparator = true
+            }
+        }
+
+        return addedSeparator
+    }
+
+    private static func isCompleteStructuralSeparatorRun(
+        _ kinds: [SeparatorKind]
+    ) -> Int? {
+        guard !kinds.isEmpty else { return nil }
+        let values = Array(kinds)
+        var index = 0
+        var unitCount = 0
+        while index < values.count {
+            switch values[index] {
+            case .cr:
+                guard index + 1 < values.count, values[index + 1] == .lf else {
+                    return nil
+                }
+                index += 2
+                unitCount += 1
+            case .lf, .ls, .ps:
+                index += 1
+                unitCount += 1
+            }
+        }
+        return unitCount
+    }
+
     private static func makeSummary(
         classification: KeyboardDiagnosticDiffClassification,
         expected: KeyboardDocumentState,
@@ -395,15 +621,19 @@ enum KeyboardDiagnosticDiffCalculator {
     }
 
     private static func scalarUnits(_ value: String) -> [ScalarUnit] {
+        let scalars = Array(value.unicodeScalars)
         var offset = 0
-        return value.unicodeScalars.map { scalar in
+        return scalars.enumerated().map { index, scalar in
             let length = scalar.utf16.count
             defer { offset += length }
             return ScalarUnit(
                 value: scalar.value,
                 offsetUTF16: offset,
                 lengthUTF16: length,
-                separator: SeparatorKind(scalar: scalar)
+                separator: AXTextStructural.isStructuralSeparator(
+                    at: index,
+                    in: scalars
+                ) ? SeparatorKind(scalar: scalar) : nil
             )
         }
     }
@@ -484,6 +714,17 @@ enum KeyboardDiagnosticDiffCalculator {
             if unit.separator == nil { boundary += 1 }
         }
         return documentOffset == utf16Offset ? boundary : nil
+    }
+
+    private static func isUTF16ScalarBoundary(_ offset: Int, in text: String) -> Bool {
+        guard offset >= 0, offset <= text.utf16.count else { return false }
+        guard offset > 0, offset < text.utf16.count else { return true }
+        let units = Array(text.utf16)
+        let previous = units[offset - 1]
+        let current = units[offset]
+        let isHighSurrogate = (0xD800...0xDBFF).contains(previous)
+        let isLowSurrogate = (0xDC00...0xDFFF).contains(current)
+        return !(isHighSurrogate && isLowSurrogate)
     }
 
     private static func contentBoundaryUTF16Offsets(in units: [ScalarUnit]) -> [Int] {
