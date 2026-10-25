@@ -17,14 +17,59 @@ struct InputContextWindow: Codable, Sendable {
     let droppedEventCount: Int
     let events: [InputContextEvent]
     var collectionStatus: [String: String] = [:]
+    var droppedEventTimestamps: [Date]? = nil
+    var droppedEventTimestampOverflowRange: [Date]? = nil
+
+    func restricted(to start: Date, through end: Date) -> Self {
+        var status = collectionStatus
+        status["reportWindowStart"] = DiagnosticReportTime.format(start)
+        status["reportWindowEnd"] = DiagnosticReportTime.format(end)
+        status["outOfWindowEventsExcluded"] = "true"
+        let windowDropTimestamps = droppedEventTimestamps?.filter { $0 >= start && $0 <= end }
+        let overflowRange = droppedEventTimestampOverflowRange
+        let overflowIntersectsWindow: Bool = {
+            guard let overflowRange, overflowRange.count == 2,
+                  let earliest = overflowRange.min(), let latest = overflowRange.max() else { return false }
+            return latest >= start && earliest <= end
+        }()
+        let windowDropCount: Int
+        if let windowDropTimestamps {
+            windowDropCount = windowDropTimestamps.count
+            status["droppedEventCountScope"] = overflowIntersectsWindow
+                ? "report_window_lower_bound_capacity_overflow"
+                : "report_window"
+        } else if droppedEventCount == 0 {
+            windowDropCount = 0
+            status["droppedEventCountScope"] = "report_window"
+        } else {
+            windowDropCount = droppedEventCount
+            status["droppedEventCountScope"] = "legacy_recording_total_window_unknown"
+        }
+        return Self(
+            requestedStart: max(requestedStart, start),
+            recordingStartedAt: recordingStartedAt,
+            capturedAt: min(capturedAt, end),
+            enabled: enabled,
+            droppedEventCount: windowDropCount,
+            events: events.filter { $0.timestamp >= start && $0.timestamp <= end },
+            collectionStatus: status,
+            droppedEventTimestamps: nil,
+            droppedEventTimestampOverflowRange: nil
+        )
+    }
 }
 
-// The buffer never stores ordinary key codes, typed characters, titles or AXValue.
+// The buffer stores bounded interaction metadata. Full text is stored separately in typed session evidence.
 struct InputContextBuffer {
     private(set) var events: [InputContextEvent] = []
     private(set) var latestFailure: InputContextWindow?
+    private(set) var firstFailure: InputContextWindow?
     private(set) var startedAt: Date?
-    private var dropped: [Date] = []
+    private var dropped = 0
+    private var droppedEventTimestamps: [Date] = []
+    private var droppedEventTimestampHead = 0
+    private var droppedEventTimestampOverflowRange: [Date]?
+    private let droppedEventTimestampLimit = 200_000
     let capacity: Int
 
     init(capacity: Int = 2000) { self.capacity = max(1, capacity) }
@@ -32,55 +77,83 @@ struct InputContextBuffer {
     mutating func start(at date: Date) {
         events = []
         latestFailure = nil
-        dropped = []
+        firstFailure = nil
+        dropped = 0
+        droppedEventTimestamps = []
+        droppedEventTimestampHead = 0
+        droppedEventTimestampOverflowRange = nil
         startedAt = date
     }
 
     mutating func stop() {
         events = []
         latestFailure = nil
-        dropped = []
+        firstFailure = nil
+        dropped = 0
+        droppedEventTimestamps = []
+        droppedEventTimestampHead = 0
+        droppedEventTimestampOverflowRange = nil
         startedAt = nil
     }
 
     mutating func append(_ event: InputContextEvent, now: Date) {
         guard startedAt != nil else { return }
-        prune(at: now)
-        guard event.timestamp >= now.addingTimeInterval(-60) else { return }
         events.append(event)
         if events.count > capacity {
-            dropped.append(contentsOf: events.prefix(events.count - capacity).map(\.timestamp))
-            events.removeFirst(events.count - capacity)
+            let overflow = events.count - capacity
+            dropped += overflow
+            for removedEvent in events.prefix(overflow) {
+                droppedEventTimestamps.append(removedEvent.timestamp)
+            }
+            events.removeFirst(overflow)
+            while droppedEventTimestamps.count - droppedEventTimestampHead > droppedEventTimestampLimit {
+                let omittedTimestamp = droppedEventTimestamps[droppedEventTimestampHead]
+                let previous = droppedEventTimestampOverflowRange ?? [omittedTimestamp, omittedTimestamp]
+                droppedEventTimestampOverflowRange = [min(previous.min() ?? omittedTimestamp, omittedTimestamp), max(previous.max() ?? omittedTimestamp, omittedTimestamp)]
+                droppedEventTimestampHead += 1
+            }
+            if droppedEventTimestampHead >= 1024 && droppedEventTimestampHead * 2 >= droppedEventTimestamps.count {
+                droppedEventTimestamps.removeFirst(droppedEventTimestampHead)
+                droppedEventTimestampHead = 0
+            }
         }
     }
 
     mutating func snapshot(at now: Date) -> InputContextWindow {
-        prune(at: now)
-        return InputContextWindow(requestedStart: now.addingTimeInterval(-60),
+        return InputContextWindow(requestedStart: startedAt ?? now,
             recordingStartedAt: startedAt, capturedAt: now, enabled: startedAt != nil,
-            droppedEventCount: dropped.count, events: events.filter { $0.timestamp <= now })
+            droppedEventCount: dropped, events: events.filter { $0.timestamp <= now },
+            droppedEventTimestamps: droppedEventTimestamps[droppedEventTimestampHead...].filter { $0 <= now },
+            droppedEventTimestampOverflowRange: droppedEventTimestampOverflowRange)
     }
 
-    mutating func freezeFailure(at date: Date) {
+    mutating func freezeFailure(at date: Date, probeStatus: String = "pending") {
         guard startedAt != nil else { return }
         latestFailure = snapshot(at: date)
-        latestFailure?.collectionStatus["failureProbeStatus"] = "pending"
+        latestFailure?.collectionStatus["failureProbeStatus"] = probeStatus
+        if date < (firstFailure?.capturedAt ?? .distantFuture) { firstFailure = latestFailure }
     }
 
     mutating func appendFailureProbe(_ event: InputContextEvent, failureAt: Date) {
+        if let first = firstFailure, first.capturedAt == failureAt {
+            firstFailure = InputContextWindow(requestedStart: first.requestedStart,
+                recordingStartedAt: first.recordingStartedAt, capturedAt: first.capturedAt,
+                enabled: first.enabled, droppedEventCount: first.droppedEventCount,
+                events: first.events + [event], collectionStatus: first.collectionStatus,
+                droppedEventTimestamps: first.droppedEventTimestamps,
+                droppedEventTimestampOverflowRange: first.droppedEventTimestampOverflowRange)
+            firstFailure?.collectionStatus["failureProbeStatus"] = "completed"
+        }
         guard let window = latestFailure, window.capturedAt == failureAt else { return }
         latestFailure = InputContextWindow(requestedStart: window.requestedStart,
             recordingStartedAt: window.recordingStartedAt, capturedAt: window.capturedAt,
             enabled: window.enabled, droppedEventCount: window.droppedEventCount,
-            events: window.events + [event], collectionStatus: window.collectionStatus)
+            events: window.events + [event], collectionStatus: window.collectionStatus,
+            droppedEventTimestamps: window.droppedEventTimestamps,
+            droppedEventTimestampOverflowRange: window.droppedEventTimestampOverflowRange)
         latestFailure?.collectionStatus["failureProbeStatus"] = "completed"
     }
 
-    private mutating func prune(at now: Date) {
-        let start = now.addingTimeInterval(-60)
-        events.removeAll { $0.timestamp < start }
-        dropped.removeAll { $0 < start }
-    }
 }
 
 enum InputContextKeyFilter {
@@ -109,6 +182,8 @@ final class InputFailureContextRecorder {
     private var generation = 0
     private var latestFailureDiagnostics: [SessionLogEntry] = []
     private var latestFailureDiagnosticsTruncated = false
+    private var firstFailureDiagnostics: [SessionLogEntry] = []
+    private var firstFailureDiagnosticsTruncated = false
     private var lastOperationProbe: Date = .distantPast
 
     var latestFailure: InputFailureEvidence? {
@@ -117,9 +192,35 @@ final class InputFailureContextRecorder {
             diagnosticEventsTruncated: latestFailureDiagnosticsTruncated)
     }
 
+    var firstFailure: InputFailureEvidence? {
+        guard let context = buffer.firstFailure else { return nil }
+        return InputFailureEvidence(desktopContext: context, diagnosticEvents: firstFailureDiagnostics,
+            diagnosticEventsTruncated: firstFailureDiagnosticsTruncated)
+    }
+
+    private func retainFirstFailureDiagnostics(at date: Date) {
+        if buffer.firstFailure?.capturedAt == date {
+            firstFailureDiagnostics = latestFailureDiagnostics
+            firstFailureDiagnosticsTruncated = latestFailureDiagnosticsTruncated
+        }
+    }
+
+    func observeSessionEntry(_ entry: SessionLogEntry, logger: SessionLogger) {
+        guard isEnabled, DiagnosticAnomaly.events.contains(entry.event) else { return }
+        // Target observations can precede the unified log. Preserve their pending
+        // probe; injector/session-only failures have no safe editor handle to probe.
+        if buffer.latestFailure?.capturedAt != entry.timestamp {
+            record(entry.event, fields: entry.metadata, at: entry.timestamp)
+            buffer.freezeFailure(at: entry.timestamp, probeStatus: "not_requested_no_target_handle")
+        }
+        latestFailureDiagnostics = logger.failureEvents(at: entry.timestamp, recoverPersisted: false)
+        latestFailureDiagnosticsTruncated = logger.failureContextEvidenceTruncated(at: entry.timestamp)
+        retainFirstFailureDiagnostics(at: entry.timestamp)
+    }
+
     func observeTarget(_ diagnostic: TextInputDiagnostic, element: AXUIElement?, pid: pid_t?, logger: SessionLogger) {
         guard isEnabled else { return }
-        let failure = ["keyboard_write_unconfirmed", "ax_write_unconfirmed"].contains(diagnostic.event)
+        let failure = DiagnosticAnomaly.events.contains(diagnostic.event)
         let capture = diagnostic.event == "input_target_captured"
         let dispatch = ["keyboard_write_submitted", "ax_write_submitted"].contains(diagnostic.event)
         let acknowledged = ["keyboard_write_acknowledged", "ax_write_acknowledged"].contains(diagnostic.event)
@@ -127,9 +228,10 @@ final class InputFailureContextRecorder {
         let now = diagnostic.timestamp
         if failure {
             record(diagnostic.event, fields: DiagnosticLogSanitizer.fields(diagnostic.fields), at: now)
-            buffer.freezeFailure(at: now)
-            latestFailureDiagnostics = logger.failureEvents(at: now)
-            latestFailureDiagnosticsTruncated = logger.failureContextEventsTruncated
+            buffer.freezeFailure(at: now, probeStatus: pid == nil ? "not_requested_no_target_pid" : "pending")
+            latestFailureDiagnostics = logger.failureEvents(at: now, recoverPersisted: false)
+            latestFailureDiagnosticsTruncated = logger.failureContextEvidenceTruncated(at: now)
+            retainFirstFailureDiagnostics(at: now)
         }
         guard failure || capture || now.timeIntervalSince(lastOperationProbe) >= 1 else { return }
         lastOperationProbe = now
@@ -205,6 +307,8 @@ final class InputFailureContextRecorder {
         buffer.stop()
         latestFailureDiagnostics = []
         latestFailureDiagnosticsTruncated = false
+        firstFailureDiagnostics = []
+        firstFailureDiagnosticsTruncated = false
         lastOperationProbe = .distantPast
     }
 
@@ -282,6 +386,14 @@ struct InputFailureEvidence: Codable, Sendable {
     let desktopContext: InputContextWindow
     let diagnosticEvents: [SessionLogEntry]
     let diagnosticEventsTruncated: Bool
+
+    func restricted(to start: Date, through end: Date) -> Self {
+        Self(
+            desktopContext: desktopContext.restricted(to: start, through: end),
+            diagnosticEvents: diagnosticEvents.filter { $0.timestamp >= start && $0.timestamp <= end },
+            diagnosticEventsTruncated: diagnosticEventsTruncated
+        )
+    }
 }
 
 struct InputFailureReport: Codable, Sendable {
@@ -292,4 +404,22 @@ struct InputFailureReport: Codable, Sendable {
     let diagnosticReport: DiagnosticReport
     let diagnosticEventsTruncated: Bool
     var latestFailure: InputFailureEvidence? = nil
+    var sessionEvidenceSummaries: [DiagnosticSessionSummary]? = nil
+    var firstFailure: InputFailureEvidence? = nil
+    let evidenceScopeNote: String?
+
+    func replacingDiagnosticReport(_ diagnosticReport: DiagnosticReport) -> Self {
+        Self(
+            schemaVersion: schemaVersion,
+            id: id,
+            generatedAt: generatedAt,
+            desktopContext: desktopContext,
+            diagnosticReport: diagnosticReport,
+            diagnosticEventsTruncated: diagnosticEventsTruncated,
+            latestFailure: latestFailure,
+            sessionEvidenceSummaries: sessionEvidenceSummaries,
+            firstFailure: firstFailure,
+            evidenceScopeNote: evidenceScopeNote
+        )
+    }
 }

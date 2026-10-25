@@ -443,7 +443,7 @@ final class AppSmokeTests: XCTestCase {
         let nextButton = try XCTUnwrap(
             flatten(guide.window?.contentView)
                 .compactMap { $0 as? NSButton }
-                .first { $0.title == "我已开启，检查下一步" }
+                .first { $0.title == "刷新授权状态" }
         )
         openButton.performClick(nil)
         XCTAssertEqual(openedPermissions, [.microphone])
@@ -492,6 +492,61 @@ final class AppSmokeTests: XCTestCase {
                 .compactMap { $0 as? NSTextField }
                 .contains { $0.stringValue == "权限已全部开启" }
         )
+    }
+
+    func testPermissionGuideNamesTheCurrentAppEntryAndOffersRefresh() throws {
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .authorized },
+            accessibilityStatus: { false },
+            postEventStatus: { false },
+            inputMonitoringStatus: { false },
+            openSettings: { _ in true },
+            requestPermission: { _, completion in completion(false) },
+            resetPermissions: { true }
+        )
+        let guide = PermissionSetupGuideWindowController(
+            permissionChecker: checker,
+            currentAppName: "Rime Voice Build196"
+        )
+        let nextButton = try XCTUnwrap(
+            flatten(guide.window?.contentView)
+                .compactMap { $0 as? NSButton }
+                .first { $0.title == "进入下一步" }
+        )
+        nextButton.performClick(nil)
+
+        let labels = flatten(guide.window?.contentView)
+            .compactMap { $0 as? NSTextField }
+            .map(\.stringValue)
+        XCTAssertTrue(labels.contains { $0.contains("Rime Voice Build196") })
+        XCTAssertTrue(labels.contains {
+            $0.contains("只操作这一项：Rime Voice Build196")
+        })
+        XCTAssertFalse(labels.contains { $0.contains("拖动") })
+        XCTAssertTrue(
+            flatten(guide.window?.contentView)
+                .compactMap { $0 as? NSButton }
+                .contains { $0.title == "刷新授权状态" }
+        )
+    }
+
+    func testKeyboardPermissionRequestsUseNativeHIDApprovalPrompt() {
+        var requested: [PrivacyPermission] = []
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .authorized },
+            accessibilityStatus: { true },
+            postEventStatus: { false },
+            inputMonitoringStatus: { false },
+            requestHIDAccess: { permission in
+                requested.append(permission)
+                return false
+            }
+        )
+
+        checker.requestPermission(for: .postEvent) { XCTAssertFalse($0) }
+        checker.requestPermission(for: .inputMonitoring) { XCTAssertFalse($0) }
+
+        XCTAssertEqual(requested, [.postEvent, .inputMonitoring])
     }
 
     func testSettingsWindowOpensConfiguredLogDirectory() throws {
@@ -631,7 +686,7 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertTrue(savedSettings?.hideMenuBarIcon == true)
     }
 
-    func testSettingsDiagnosticLogCanBeExportedWithoutTogglingRecording() throws {
+    func testSettingsDiagnosticLogCanBeExportedWithoutTogglingRecording() async throws {
         let checker = SystemPrivacyPermissionChecker(
             microphoneStatus: { .authorized },
             accessibilityStatus: { true },
@@ -643,7 +698,7 @@ final class AppSmokeTests: XCTestCase {
             settings: AppSettings(),
             credentials: nil,
             onSave: { _, _ in },
-            onExportDiagnosticLog: {
+            onExportDiagnosticLog: { _ in
                 exportCount += 1
                 return URL(fileURLWithPath: "/tmp/TencentVoiceMVP-Diagnostic.json")
             },
@@ -656,6 +711,7 @@ final class AppSmokeTests: XCTestCase {
         )
 
         button.performClick(nil)
+        try await Task.sleep(for: .milliseconds(20))
 
         XCTAssertEqual(exportCount, 1)
     }

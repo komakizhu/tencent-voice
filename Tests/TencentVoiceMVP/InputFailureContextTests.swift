@@ -4,15 +4,27 @@ import XCTest
 @testable import TencentVoiceMVP
 
 final class InputFailureContextTests: XCTestCase {
-    func testBufferRetainsOnlyMinuteBeforeReportAndClearsWhenDisabled() {
+    func testLaterFailureDoesNotDiscardFirstFailureProbe() {
+        var buffer = InputContextBuffer()
+        let start = Date(timeIntervalSince1970: 1000)
+        buffer.start(at: start)
+        buffer.freezeFailure(at: start)
+        buffer.freezeFailure(at: start.addingTimeInterval(0.1), probeStatus: "not_requested_no_target_handle")
+        buffer.appendFailureProbe(.init(timestamp: start.addingTimeInterval(0.2), event: "input_editor_probe", fields: [:]), failureAt: start)
+        XCTAssertEqual(buffer.firstFailure?.collectionStatus["failureProbeStatus"], "completed")
+        XCTAssertEqual(buffer.firstFailure?.events.last?.event, "input_editor_probe")
+        XCTAssertEqual(buffer.latestFailure?.collectionStatus["failureProbeStatus"], "not_requested_no_target_handle")
+    }
+
+    func testBufferRetainsFullEnabledWindowAndClearsWhenDisabled() {
         let start = Date(timeIntervalSince1970: 1000)
         var buffer = InputContextBuffer()
         buffer.start(at: start)
         buffer.append(.init(timestamp: start, event: "old", fields: [:]), now: start)
         buffer.append(.init(timestamp: start.addingTimeInterval(61), event: "fork", fields: [:]), now: start.addingTimeInterval(61))
         let report = buffer.snapshot(at: start.addingTimeInterval(62))
-        XCTAssertEqual(report.events.map(\.event), ["fork"])
-        XCTAssertEqual(report.requestedStart, start.addingTimeInterval(2))
+        XCTAssertEqual(report.events.map(\.event), ["old", "fork"])
+        XCTAssertEqual(report.requestedStart, start)
         buffer.stop()
         buffer.append(.init(timestamp: start.addingTimeInterval(63), event: "ignored", fields: [:]), now: start.addingTimeInterval(63))
         XCTAssertFalse(buffer.snapshot(at: start.addingTimeInterval(63)).enabled)
@@ -30,7 +42,7 @@ final class InputFailureContextTests: XCTestCase {
         XCTAssertEqual(buffer.latestFailure?.collectionStatus["failureProbeStatus"], "pending")
         buffer.appendFailureProbe(.init(timestamp: failure.addingTimeInterval(1), event: "input_editor_probe", fields: ["targetID": "2"]), failureAt: failure)
         XCTAssertEqual(buffer.latestFailure?.collectionStatus["failureProbeStatus"], "completed")
-        XCTAssertTrue(buffer.snapshot(at: start.addingTimeInterval(600)).events.isEmpty)
+        XCTAssertEqual(buffer.snapshot(at: start.addingTimeInterval(600)).events.map(\.event), ["capture", "keyboard_write_unconfirmed"])
         XCTAssertEqual(buffer.latestFailure?.events.map(\.event), ["capture", "keyboard_write_unconfirmed", "input_editor_probe"])
         let nextFailure = start.addingTimeInterval(601)
         buffer.freezeFailure(at: nextFailure)
@@ -42,7 +54,7 @@ final class InputFailureContextTests: XCTestCase {
         XCTAssertNil(buffer.latestFailure)
     }
 
-    func testOverflowAndShortCoverageAreVisibleAndExpire() {
+    func testOverflowAndFullCoverageRemainVisible() {
         let start = Date(timeIntervalSince1970: 1000)
         var buffer = InputContextBuffer(capacity: 2)
         buffer.start(at: start)
@@ -54,11 +66,28 @@ final class InputFailureContextTests: XCTestCase {
         XCTAssertEqual(report.recordingStartedAt, start)
         XCTAssertEqual(report.droppedEventCount, 1)
         XCTAssertEqual(report.events.map(\.event), ["1", "2"])
-        XCTAssertEqual(buffer.snapshot(at: start.addingTimeInterval(63)).droppedEventCount, 0)
-        XCTAssertTrue(buffer.events.isEmpty)
+        XCTAssertEqual(buffer.snapshot(at: start.addingTimeInterval(63)).droppedEventCount, 1)
+        XCTAssertEqual(buffer.events.map(\.event), ["1", "2"])
     }
 
-    func testFrozenEvidenceRoundTripsWithoutPersistingText() throws {
+    func testRestrictedContextCountsDroppedEventsOnlyInsideTheReportWindow() {
+        let start = Date(timeIntervalSince1970: 1000)
+        var buffer = InputContextBuffer(capacity: 2)
+        buffer.start(at: start)
+        for (offset, name) in [(0.0, "old"), (70.0, "recent_drop"), (80.0, "keep_a"), (100.0, "keep_b")] {
+            let timestamp = start.addingTimeInterval(offset)
+            buffer.append(.init(timestamp: timestamp, event: name, fields: [:]), now: timestamp)
+        }
+
+        let report = buffer.snapshot(at: start.addingTimeInterval(100))
+            .restricted(to: start.addingTimeInterval(40), through: start.addingTimeInterval(100))
+
+        XCTAssertEqual(report.droppedEventCount, 1)
+        XCTAssertEqual(report.collectionStatus["droppedEventCountScope"], "report_window")
+        XCTAssertEqual(report.events.map(\.event), ["keep_a", "keep_b"])
+    }
+
+    func testFrozenEvidenceRoundTripsWithAuthorizedFullText() throws {
         let now = Date(timeIntervalSince1970: 1000)
         var buffer = InputContextBuffer()
         buffer.start(at: now)
@@ -68,7 +97,7 @@ final class InputFailureContextTests: XCTestCase {
         let evidence = InputFailureEvidence(desktopContext: try XCTUnwrap(buffer.latestFailure),
             diagnosticEvents: [], diagnosticEventsTruncated: false)
         let data = try DiagnosticJSON.encoder().encode(evidence)
-        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("私密草稿"))
+        XCTAssertTrue(String(decoding: data, as: UTF8.self).contains("私密草稿"))
         let decoded = try DiagnosticJSON.decoder().decode(InputFailureEvidence.self, from: data)
         XCTAssertEqual(decoded.desktopContext.events.first?.fields["documentLength"], "81")
         XCTAssertEqual(decoded.desktopContext.collectionStatus["failureProbeStatus"], "pending")
@@ -163,7 +192,7 @@ final class InputFailureContextTests: XCTestCase {
         let evidence = try XCTUnwrap(recorder.latestFailure)
         XCTAssertEqual(evidence.desktopContext.events.last?.event, "ax_write_unconfirmed")
         XCTAssertEqual(evidence.desktopContext.events.last?.fields["axFinalAXValueLengthUTF16"], "1068")
-        XCTAssertFalse(evidence.desktopContext.events.last?.fields.values.contains("private draft") ?? true)
+        XCTAssertTrue(evidence.desktopContext.events.last?.fields.values.contains("private draft") ?? false)
         XCTAssertEqual(evidence.diagnosticEvents.first?.event, "ax_write_submitted")
     }
 
@@ -191,6 +220,8 @@ final class InputFailureContextTests: XCTestCase {
         XCTAssertEqual(sample["targetMatchesSystemFocus"], "true")
         XCTAssertEqual(sample["target.axValueLengthUTF16"], "81")
         XCTAssertEqual(sample["target.AXFocused"], "0")
+        XCTAssertEqual(sample["structure.ancestorRoles"], "AXTextArea")
+        XCTAssertEqual(sample["structure.evidence"], "unknown")
         XCTAssertEqual(sample["editorCount"], "2")
         XCTAssertEqual(sample["editor0.AXFocused"], "1")
         XCTAssertEqual(sample["editor0.axValueLengthUTF16"], "1")
@@ -277,9 +308,33 @@ final class InputFailureContextTests: XCTestCase {
         let events = logger.failureEvents(at: now)
         XCTAssertEqual(events.count, 400)
         XCTAssertEqual(logger.recentEntries(limit: 400).count, 300)
-        XCTAssertFalse(String(decoding: try DiagnosticJSON.encoder().encode(events), as: UTF8.self).contains("private draft"))
+        XCTAssertTrue(String(decoding: try DiagnosticJSON.encoder().encode(events), as: UTF8.self).contains("private draft"))
         logger.setFailureContextEnabled(false)
         XCTAssertTrue(logger.failureEvents(at: now).isEmpty)
+    }
+
+    func testReportDesktopContextExcludesEventsOutsideTheClickWindow() {
+        let end = Date()
+        let start = end.addingTimeInterval(-60)
+        let context = InputContextWindow(
+            requestedStart: start.addingTimeInterval(-100),
+            recordingStartedAt: start.addingTimeInterval(-100),
+            capturedAt: end.addingTimeInterval(10),
+            enabled: true,
+            droppedEventCount: 0,
+            events: [
+                InputContextEvent(timestamp: start.addingTimeInterval(-0.01), event: "before", fields: [:]),
+                InputContextEvent(timestamp: start, event: "boundary", fields: [:]),
+                InputContextEvent(timestamp: end, event: "at_click", fields: [:]),
+                InputContextEvent(timestamp: end.addingTimeInterval(0.01), event: "after", fields: [:])
+            ]
+        )
+
+        let restricted = context.restricted(to: start, through: end)
+        XCTAssertEqual(restricted.events.map(\.event), ["boundary", "at_click"])
+        XCTAssertEqual(restricted.requestedStart, start)
+        XCTAssertEqual(restricted.capturedAt, end)
+        XCTAssertEqual(restricted.collectionStatus["outOfWindowEventsExcluded"], "true")
     }
 
     @MainActor

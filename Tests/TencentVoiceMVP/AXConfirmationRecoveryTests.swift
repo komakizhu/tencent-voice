@@ -100,7 +100,7 @@ final class AXConfirmationRecoveryTests: XCTestCase {
             rawDocumentLength: 4,
             coordinateDocumentLength: 3,
             omittedStructuralSeparatorCount: 1,
-            rawBoundaryOffsets: [0, -1, 3, 4],
+            rawBoundaryCandidates: [[0], [], [2, 3], [4]],
             rawPlaceholderRange: nil
         )
         let expected = KeyboardDocumentState(

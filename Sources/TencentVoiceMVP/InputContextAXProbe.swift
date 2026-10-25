@@ -73,6 +73,9 @@ final class InputContextAXProbe: @unchecked Sendable {
             result["focusID"] = String(identity(focus))
             result.merge(metadata(focus)) { _, new in new }
         }
+        if let structureNode = target ?? focus {
+            result.merge(structureMetadata(structureNode).mapKeys { "structure." + $0 }) { _, new in new }
+        }
         if let systemFocus {
             result["systemFocusID"] = String(identity(systemFocus))
             result.merge(metadata(systemFocus).mapKeys { "systemFocus." + $0 }) { _, new in new }
@@ -153,6 +156,50 @@ final class InputContextAXProbe: @unchecked Sendable {
             }
         }
         return result
+    }
+
+    /// Collect only bounded AX role/identity evidence around the focused
+    /// editor. The inventory intentionally excludes AXValue and selected text:
+    /// it is useful for later paragraph/node calibration without recording
+    /// user正文. A role path is evidence about the accessibility tree, not a
+    /// paragraph model; callers must keep `structureEvidence` unknown until a
+    /// real editor observation establishes that mapping.
+    private func structureMetadata(_ start: AXUIElement) -> [String: String] {
+        let limit = 32
+        var current = start
+        var visited: [AXUIElement] = []
+        var roles: [String] = []
+        var subroles: [String] = []
+        var status = "complete"
+
+        while roles.count < limit, Date() < deadline {
+            if visited.contains(where: { CFEqual($0, current) }) {
+                status = "cycle"
+                break
+            }
+            visited.append(current)
+            guard let role = attribute("AXRole", in: current) as? String else {
+                status = "read_failure"
+                break
+            }
+            roles.append(role)
+            subroles.append(attribute("AXSubrole", in: current) as? String ?? "unknown")
+            guard let parent = element("AXParent", in: current) else {
+                break
+            }
+            current = parent
+        }
+
+        if roles.count >= limit || Date() >= deadline {
+            status = "truncated"
+        }
+        return [
+            "ancestorCount": String(roles.count),
+            "ancestorRoles": roles.joined(separator: ">"),
+            "ancestorSubroles": subroles.joined(separator: ">"),
+            "traversalStatus": status,
+            "evidence": "unknown"
+        ]
     }
 
     private func identity(_ node: AXUIElement) -> Int {

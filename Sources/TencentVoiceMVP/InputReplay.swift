@@ -69,7 +69,11 @@ enum InputReplay {
             return 2
         }
         let element = focused as! AXUIElement
-        let recorder = InputReplayRecorder(element: element, pid: pid)
+        let recorder = InputReplayRecorder(
+            element: element,
+            pid: pid,
+            allowsSafariEditorReacquisition: app.bundleIdentifier == "com.apple.Safari"
+        )
         recorder.observe("preflight")
         if args.contains("--inspect-target") {
             var attributes: [String: Any] = [:]
@@ -206,25 +210,110 @@ enum InputReplay {
 
 // Called only from the main actor or a synchronous keyboard queue operation.
 private final class InputReplayRecorder {
-    let element: AXUIElement
+    private var element: AXUIElement
     let pid: Int32
     let session = UUID().uuidString
     let start = ProcessInfo.processInfo.systemUptime
     var operation = 0
     var expected = ""
+    private let allowsSafariEditorReacquisition: Bool
+    private let initialRole: String?
+    private let initialDescription: String?
+    private let initialTitle: String?
+    private let initialPlaceholder: String?
+    private let safariKnownTrailingAXMarker: String
 
-    init(element: AXUIElement, pid: Int32) {
+    init(element: AXUIElement, pid: Int32, allowsSafariEditorReacquisition: Bool) {
         self.element = element
         self.pid = pid
+        self.initialRole = Self.stringAttribute(kAXRoleAttribute as String, from: element)
+        self.initialDescription = Self.stringAttribute(kAXDescriptionAttribute as String, from: element)
+        self.initialTitle = Self.stringAttribute(kAXTitleAttribute as String, from: element)
+        self.initialPlaceholder = Self.stringAttribute(kAXPlaceholderValueAttribute as String, from: element)
+        self.allowsSafariEditorReacquisition = allowsSafariEditorReacquisition
+            && Self.isProseMirrorEditor(element)
+        let initialAXValue = Self.stringAttribute(kAXValueAttribute as String, from: element) ?? ""
+        self.safariKnownTrailingAXMarker = self.allowsSafariEditorReacquisition
+            && initialAXValue == "\n"
+            ? "\n"
+            : ""
+    }
+
+    private static func stringAttribute(_ name: String, from element: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+        if let text = value as? String { return text }
+        if let attributedText = value as? NSAttributedString { return attributedText.string }
+        return nil
+    }
+
+    private static func isProseMirrorEditor(_ element: AXUIElement) -> Bool {
+        guard stringAttribute(kAXRoleAttribute as String, from: element) == "AXTextArea" else { return false }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, "AXDOMClassList" as CFString, &value) == .success else {
+            return false
+        }
+        let values: [String]
+        if let classList = value as? [String] {
+            values = classList
+        } else if let className = value as? String {
+            values = [className]
+        } else {
+            values = [String(describing: value)]
+        }
+        return values
+            .joined(separator: " ")
+            .split { !$0.isLetter && !$0.isNumber }
+            .contains { String($0).caseInsensitiveCompare("prosemirror") == .orderedSame }
+    }
+
+    private func isSameSafariEditor(_ candidate: AXUIElement) -> Bool {
+        guard Self.isProseMirrorEditor(candidate),
+              Self.stringAttribute(kAXRoleAttribute as String, from: candidate) == initialRole,
+              Self.stringAttribute(kAXDescriptionAttribute as String, from: candidate) == initialDescription,
+              Self.stringAttribute(kAXTitleAttribute as String, from: candidate) == initialTitle,
+              Self.stringAttribute(kAXPlaceholderValueAttribute as String, from: candidate) == initialPlaceholder else {
+            return false
+        }
+        return true
+    }
+
+    /// Safari may replace the focused ProseMirror AX node after a DOM edit.
+    /// Refresh only for the same editor identity; a different focused control
+    /// remains a hard failure so the replay cannot confirm the wrong target.
+    @discardableResult
+    private func refreshFocusedEditorIfNeeded() -> Bool {
+        var current: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            AXUIElementCreateSystemWide(),
+            kAXFocusedUIElementAttribute as CFString,
+            &current
+        ) == .success,
+              let current,
+              CFGetTypeID(current) == AXUIElementGetTypeID() else {
+            return false
+        }
+        let focused = current as! AXUIElement
+        guard !CFEqual(focused, element) else { return true }
+        guard allowsSafariEditorReacquisition,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+              isSameSafariEditor(focused) else {
+            return false
+        }
+        element = focused
+        emit(["event": "target_reacquired", "reason": "safari_editor_rebuild"])
+        return true
     }
 
     func stringAttribute(_ name: String) -> String? {
+        guard refreshFocusedEditorIfNeeded() else { return nil }
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
         return value as? String
     }
 
     func selection() -> TextRange? {
+        guard refreshFocusedEditorIfNeeded() else { return nil }
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &value) == .success,
               let value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
@@ -234,6 +323,7 @@ private final class InputReplayRecorder {
     }
 
     func setSelection(_ selection: TextRange) -> Int32 {
+        guard refreshFocusedEditorIfNeeded() else { return AXError.invalidUIElement.rawValue }
         var current: CFTypeRef?
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
               AXUIElementCopyAttributeValue(AXUIElementCreateSystemWide(), kAXFocusedUIElementAttribute as CFString,
@@ -244,7 +334,11 @@ private final class InputReplayRecorder {
         return AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, value).rawValue
     }
 
-    func matchesExpected() -> Bool { stringAttribute(kAXValueAttribute) == expected }
+    func matchesExpected() -> Bool {
+        guard let actual = stringAttribute(kAXValueAttribute) else { return false }
+        return actual == expected
+            || (!safariKnownTrailingAXMarker.isEmpty && actual == expected + safariKnownTrailingAXMarker)
+    }
 
     func observe(_ event: String) {
         let range = selection()

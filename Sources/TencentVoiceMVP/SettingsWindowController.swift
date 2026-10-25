@@ -161,7 +161,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let onOpenDirectory: ((URL) -> Bool)?
     private let onSave: (AppSettings, TencentCredentials) throws -> Void
     private let onTestConnection: ((TencentCredentials, String) async throws -> Void)?
-    private let onExportDiagnosticLog: (() throws -> URL?)?
+    private let onExportDiagnosticLog: ((@MainActor (String) -> Void) async throws -> URL?)?
     private let onRecordDiagnosticAction: ((String, [String: String]) -> Void)?
     private let permissionChecker: PrivacyPermissionChecking
     private let onClose: () -> Void
@@ -171,6 +171,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var storedCredentials: TencentCredentials?
     private var localMonitor: Any?
     private var testTask: Task<Void, Never>?
+    private var diagnosticExportTask: Task<Void, Never>?
     private var permissionStateLabels: [PrivacyPermission: NSTextField] = [:]
     private var permissionRefreshPending = false
     private var permissionGuideWindowController: PermissionSetupGuideWindowController?
@@ -181,7 +182,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         credentials: TencentCredentials?,
         onSave: @escaping (AppSettings, TencentCredentials) throws -> Void,
         onTestConnection: ((TencentCredentials, String) async throws -> Void)? = nil,
-        onExportDiagnosticLog: (() throws -> URL?)? = nil,
+        onExportDiagnosticLog: ((@MainActor (String) -> Void) async throws -> URL?)? = nil,
         onRecordDiagnosticAction: ((String, [String: String]) -> Void)? = nil,
         permissionChecker: PrivacyPermissionChecking? = nil,
         logDirectoryURL: URL? = nil,
@@ -346,9 +347,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         exportDiagnosticLogButton.target = self
         exportDiagnosticLogButton.action = #selector(exportDiagnosticLogPressed)
         exportDiagnosticLogButton.isEnabled = onExportDiagnosticLog != nil
-        exportDiagnosticLogButton.toolTip = "将自动保存的会话与诊断事件导出为诊断报告 JSON；不会导出密钥、录音或识别正文。"
+        exportDiagnosticLogButton.toolTip = "导出点击前最近一分钟的诊断；可能包含完整语音识别文字和目标输入框正文，不包含录音或凭据。"
         safeCopyCheckbox.toolTip = "开启后在会话结束时复制一次完整识别结果；取消或异常中断时保存最新已识别文字。"
-        logCheckbox.toolTip = "开启后自动保存会话状态、错误代码和操作上下文；点击右侧“导出诊断报告”导出已保存内容。"
+        logCheckbox.toolTip = "开启后保存本次会话的识别修订、输入框正文和诊断事件；点击右侧“导出诊断报告”导出。"
         hideMenuBarIconCheckbox.toolTip = "隐藏状态栏图标；隐藏后可从 Dock 中 Rime Voice 的应用菜单重新打开设置。"
         saveButton.toolTip = "保存腾讯云凭证和设置；日志开关、Safe Copy 与快捷键也在此生效。"
         shortcutPresetPopup.toolTip = "选择常用快捷键预设；F5 会在 Rime Voice 运行期间屏蔽 macOS 原生听写。"
@@ -797,16 +798,31 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             statusLabel.stringValue = "当前版本不支持导出诊断报告"
             return
         }
+        guard diagnosticExportTask == nil else {
+            statusLabel.stringValue = "诊断报告正在处理中"
+            return
+        }
 
-        onRecordDiagnosticAction?("diagnostic_log_export_requested", [:])
-        do {
-            if let url = try onExportDiagnosticLog() {
-                statusLabel.stringValue = "诊断报告已导出：\(url.lastPathComponent)"
-            } else {
-                statusLabel.stringValue = "已取消导出"
+        statusLabel.stringValue = "正在整理点击前最近一分钟的诊断…"
+        exportDiagnosticLogButton.isEnabled = false
+        diagnosticExportTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.exportDiagnosticLogButton.isEnabled = true
+                self.diagnosticExportTask = nil
             }
-        } catch {
-            statusLabel.stringValue = "诊断报告导出失败：\(error.localizedDescription)"
+            do {
+                let updateProgress: @MainActor (String) -> Void = { [weak self] message in
+                    self?.statusLabel.stringValue = message
+                }
+                if let url = try await onExportDiagnosticLog(updateProgress) {
+                statusLabel.stringValue = "诊断报告已导出：\(url.lastPathComponent)"
+                } else {
+                    statusLabel.stringValue = "已取消导出"
+                }
+            } catch {
+                statusLabel.stringValue = "诊断报告导出失败：\(error.localizedDescription)"
+            }
         }
     }
 

@@ -89,7 +89,7 @@ final class StatusMenuController: NSObject {
         menu.addItem(.separator())
         let context = NSMenuItem(title: "记录 Codex 故障前一分钟操作", action: #selector(toggleFailureContextPressed), keyEquivalent: "")
         context.target = self
-        context.toolTip = "仅在内存保留最近一分钟；记录应用、焦点、点击和关键快捷键，不记录正文、录音或截图。点击报告才保存。"
+        context.toolTip = "保留开启期间的语音识别、目标输入框完整文字及操作证据；容量不足会明确报告遗漏。持久化由设置页日志开关控制；不录音、不截图、不自动上传。"
         menu.addItem(context)
         let failure = NSMenuItem(title: "报告输入失效", action: #selector(reportInputFailurePressed), keyEquivalent: "")
         failure.target = self

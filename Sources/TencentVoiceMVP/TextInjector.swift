@@ -83,6 +83,7 @@ final class TextInjector {
     private(set) var degradationOccurredMonotonicMilliseconds: UInt64?
     private var nextOperationID = 0
     private var diagnostics: [TextInputDiagnostic] = []
+    private var diagnosticBytes = 0
     private var droppedDiagnosticCount = 0
     private let diagnosticLimit = 128
     private var currentProjectionDiagnosticFields: [String: String] = [:]
@@ -119,6 +120,7 @@ final class TextInjector {
     func drainDiagnostics() -> [TextInputDiagnostic] {
         var result = diagnostics
         diagnostics.removeAll(keepingCapacity: true)
+        diagnosticBytes = 0
         result.append(contentsOf: target.drainDiagnostics())
         if droppedDiagnosticCount > 0 {
             result.append(TextInputDiagnostic(
@@ -154,6 +156,7 @@ final class TextInjector {
             degradationOccurredMonotonicMilliseconds = nil
             nextOperationID = 0
             diagnostics.removeAll(keepingCapacity: true)
+            diagnosticBytes = 0
             droppedDiagnosticCount = 0
             currentProjectionDiagnosticFields = [:]
             previousProjectionSegmentID = nil
@@ -339,9 +342,22 @@ final class TextInjector {
 
     private func copyIfNeeded(_ text: String) throws {
         guard !text.isEmpty, text != lastCopiedText else { return }
+        recordDiagnostic("safe_copy_prepared", ["copiedLengthCharacters": String(text.count)], textEvidence: [
+            DiagnosticTextEvidence(kind: .safeCopyPrepared, source: .expected, text: text,
+                revision: UInt64(currentProjectionDiagnosticFields["revision"] ?? ""),
+                targetApplicationBundleIdentifier: targetApplication?.bundleIdentifier,
+                targetApplicationProcessID: targetApplication?.processIdentifier,
+                monotonicMilliseconds: TextInputDiagnosticClock.milliseconds())
+        ])
         try target.copyToClipboard(text)
         lastCopiedText = text
-        recordDiagnostic("safe_copy_updated", ["copiedLengthCharacters": String(text.count)])
+        recordDiagnostic("safe_copy_updated", ["copiedLengthCharacters": String(text.count)], textEvidence: [
+            DiagnosticTextEvidence(kind: .safeCopySucceeded, source: .observed, text: text,
+                revision: UInt64(currentProjectionDiagnosticFields["revision"] ?? ""),
+                targetApplicationBundleIdentifier: targetApplication?.bundleIdentifier,
+                targetApplicationProcessID: targetApplication?.processIdentifier,
+                monotonicMilliseconds: TextInputDiagnosticClock.milliseconds())
+        ])
     }
 
     private func copyOnFinishIfNeeded(_ text: String) throws {
@@ -480,6 +496,13 @@ final class TextInjector {
                 "segmentID": projection?.activeSegmentID.map(String.init) ?? "final",
                 "revision": projection.map { String($0.revision) } ?? "final",
                 "reason": "recognition_prefix_changed"
+            ], textEvidence: [
+                DiagnosticTextEvidence(kind: .processedRecognition, source: .observed, text: candidateText,
+                    revision: projection?.revision, observedAt: Date(),
+                    monotonicMilliseconds: TextInputDiagnosticClock.milliseconds()),
+                DiagnosticTextEvidence(kind: .expectedProjection, source: .expected, text: frozenPrefix,
+                    revision: projection?.revision, observedAt: Date(),
+                    monotonicMilliseconds: TextInputDiagnosticClock.milliseconds())
             ])
             throw TextTargetError.targetChanged
         }
@@ -691,7 +714,18 @@ final class TextInjector {
             onDispatch: { [state] in state.markDispatch() },
             onFinish: { [weak self, state] status, error in
                 guard let self else { return }
-                self.recordDiagnostic("input_operation", state.finish(status: status, error: error))
+                self.recordDiagnostic("input_operation", state.finish(status: status, error: error), textEvidence: [
+                    DiagnosticTextEvidence(kind: .plannedText, source: .expected, text: submittedProjection,
+                        revision: UInt64(fields["revision"] ?? ""), operationID: String(operationID),
+                        targetApplicationBundleIdentifier: self.targetApplication?.bundleIdentifier,
+                        targetApplicationProcessID: self.targetApplication?.processIdentifier,
+                        monotonicMilliseconds: TextInputDiagnosticClock.milliseconds()),
+                    DiagnosticTextEvidence(kind: .expectedDocument, source: .expected, text: expectedDocumentText,
+                        revision: UInt64(fields["revision"] ?? ""), operationID: String(operationID),
+                        targetApplicationBundleIdentifier: self.targetApplication?.bundleIdentifier,
+                        targetApplicationProcessID: self.targetApplication?.processIdentifier,
+                        monotonicMilliseconds: TextInputDiagnosticClock.milliseconds())
+                ])
             }
         )
     }
@@ -751,10 +785,18 @@ final class TextInjector {
             },
             onFinish: { [weak self, state] status, error in
                 guard let self else { return }
-                self.recordDiagnostic(
-                    "input_operation",
-                    state.finish(status: status, error: error)
-                )
+                self.recordDiagnostic("input_operation", state.finish(status: status, error: error), textEvidence: [
+                    DiagnosticTextEvidence(kind: .plannedText, source: .expected, text: replacementTail,
+                        revision: UInt64(fields["revision"] ?? ""), operationID: String(operationID),
+                        targetApplicationBundleIdentifier: self.targetApplication?.bundleIdentifier,
+                        targetApplicationProcessID: self.targetApplication?.processIdentifier,
+                        monotonicMilliseconds: TextInputDiagnosticClock.milliseconds()),
+                    DiagnosticTextEvidence(kind: .expectedProjection, source: .expected, text: desiredText,
+                        revision: UInt64(fields["revision"] ?? ""), operationID: String(operationID),
+                        targetApplicationBundleIdentifier: self.targetApplication?.bundleIdentifier,
+                        targetApplicationProcessID: self.targetApplication?.processIdentifier,
+                        monotonicMilliseconds: TextInputDiagnosticClock.milliseconds())
+                ])
             }
         )
     }
@@ -904,12 +946,20 @@ final class TextInjector {
         }
     }
 
-    private func recordDiagnostic(_ event: String, _ fields: [String: String]) {
-        guard diagnostics.count < diagnosticLimit else {
+    private func recordDiagnostic(
+        _ event: String,
+        _ fields: [String: String],
+        textEvidence: [DiagnosticTextEvidence] = []
+    ) {
+        let diagnostic = TextInputDiagnostic(
+            timestamp: Date(), event: event, fields: fields, textEvidence: textEvidence
+        )
+        diagnostics.append(diagnostic)
+        diagnosticBytes += diagnostic.estimatedDiagnosticBytes
+        while diagnostics.count > diagnosticLimit || diagnosticBytes > 8 * 1024 * 1024 {
+            diagnosticBytes -= diagnostics.removeFirst().estimatedDiagnosticBytes
             droppedDiagnosticCount += 1
-            return
         }
-        diagnostics.append(TextInputDiagnostic(timestamp: Date(), event: event, fields: fields))
     }
 
     private func enterSafeCopy(after error: Error) {
@@ -961,6 +1011,7 @@ final class TextInjector {
         degradationOccurredMonotonicMilliseconds = nil
         nextOperationID = 0
         diagnostics.removeAll(keepingCapacity: true)
+        diagnosticBytes = 0
         droppedDiagnosticCount = 0
         currentProjectionDiagnosticFields = [:]
         previousProjectionSegmentID = nil
@@ -993,6 +1044,7 @@ final class TextInjector {
         degradationOccurredMonotonicMilliseconds = nil
         nextOperationID = 0
         diagnostics.removeAll(keepingCapacity: true)
+        diagnosticBytes = 0
         droppedDiagnosticCount = 0
         currentProjectionDiagnosticFields = [:]
         previousProjectionSegmentID = nil

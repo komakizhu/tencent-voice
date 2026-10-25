@@ -21,10 +21,19 @@ enum DiagnosticErrorFormatter {
     }
 
     static func message(for error: Error) -> String {
+        if case let AudioCaptureError.engineStartFailed(underlying) = error {
+            return DiagnosticLogSanitizer.failureMessage("麦克风启动失败：\(underlying.localizedDescription)")
+        }
+        if case let AudioCaptureError.tapInstallationFailed(detail) = error {
+            return DiagnosticLogSanitizer.failureMessage("麦克风音频采集安装失败：\(detail)")
+        }
+        if case let TencentASRError.server(code, message) = error {
+            return DiagnosticLogSanitizer.failureMessage("腾讯 ASR 错误（\(code)）：\(message)")
+        }
         if let message = canonicalMessage(for: code(for: error)) {
             return message
         }
-        return "错误类型：\(String(describing: type(of: error)))"
+        return DiagnosticLogSanitizer.failureMessage(error.localizedDescription)
     }
 
     static func canonicalMessage(for code: String) -> String? {
@@ -61,7 +70,7 @@ enum DiagnosticErrorFormatter {
         case "microphone_tap_installation_failed":
             return "麦克风音频采集安装失败"
         case "microphone_engine_start_failed":
-            return "麦克风启动失败（系统错误详情已隐藏）"
+            return "麦克风启动失败"
         case "microphone_conversion_failed":
             return "麦克风音频转换失败"
         case "microphone_recovery_timed_out":
@@ -86,9 +95,9 @@ enum DiagnosticErrorFormatter {
             guard code.hasPrefix(prefix) else { return nil }
             let status = code.dropFirst(prefix.count)
             guard !status.isEmpty, status.allSatisfy(\.isNumber) else {
-                return "腾讯 ASR 服务端返回错误，详情已隐藏"
+                return "腾讯 ASR 服务端返回错误"
             }
-            return "腾讯 ASR 返回错误（\(status)），服务端详情已隐藏"
+            return "腾讯 ASR 返回错误（\(status)）"
         }
     }
 }

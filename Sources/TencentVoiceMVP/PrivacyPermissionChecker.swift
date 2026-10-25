@@ -3,6 +3,7 @@ import ApplicationServices
 import AppKit
 import CoreGraphics
 import Foundation
+import IOKit.hidsystem
 
 enum PrivacyPermission: Int, CaseIterable, Codable, Equatable, Hashable, Sendable {
     case microphone
@@ -113,6 +114,7 @@ final class SystemPrivacyPermissionChecker: PrivacyPermissionChecking {
         },
         openSettings: ((PrivacyPermission) -> Bool)? = nil,
         requestPermission: ((PrivacyPermission, @escaping (Bool) -> Void) -> Void)? = nil,
+        requestHIDAccess: ((PrivacyPermission) -> Bool)? = nil,
         resetPermissions: (() -> Bool)? = nil
     ) {
         self.microphoneStatus = microphoneStatus
@@ -122,6 +124,7 @@ final class SystemPrivacyPermissionChecker: PrivacyPermissionChecking {
         openSettingsAction = openSettings ?? { permission in
             Self.openSystemSettings(for: permission)
         }
+        let requestHIDAccessAction = requestHIDAccess ?? Self.requestHIDAccess
         requestPermissionAction = requestPermission ?? { permission, completion in
             switch permission {
             case .microphone:
@@ -130,9 +133,9 @@ final class SystemPrivacyPermissionChecker: PrivacyPermissionChecking {
                 let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
                 completion(AXIsProcessTrustedWithOptions(options))
             case .postEvent:
-                completion(CGRequestPostEventAccess())
+                completion(requestHIDAccessAction(permission))
             case .inputMonitoring:
-                completion(CGRequestListenEventAccess())
+                completion(requestHIDAccessAction(permission))
             }
         }
         resetPermissionsAction = resetPermissions ?? Self.resetSystemPermissions
@@ -189,6 +192,17 @@ final class SystemPrivacyPermissionChecker: PrivacyPermissionChecking {
             return false
         }
         return NSWorkspace.shared.open(url)
+    }
+
+    private static func requestHIDAccess(_ permission: PrivacyPermission) -> Bool {
+        switch permission {
+        case .postEvent:
+            return IOHIDRequestAccess(kIOHIDRequestTypePostEvent)
+        case .inputMonitoring:
+            return IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+        case .microphone, .accessibility:
+            return false
+        }
     }
 
     private static func resetSystemPermissions() -> Bool {
