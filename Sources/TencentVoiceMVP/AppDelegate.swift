@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let sessionLogger: SessionLogger
     private let failureContext: InputFailureContextRecorder
     private var failureReportTasks: [UUID: Task<Void, Never>] = [:]
+    private var diagnosticReportInProgress = false
     private var failureContextMainMenuItem: NSMenuItem?
     private let failureContextDefaults = UserDefaults(suiteName: "local.tencent.voice.mvp") ?? .standard
     private let localUsageStore: LocalUsageStore
@@ -98,6 +99,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.rimeLocalDirectory = localRimeDirectory
         self.sessionLogger = sessionLogger
         self.failureContext = failureContext
+        sessionLogger.evidenceObserver = { [weak failureContext, weak sessionLogger] entry in
+            guard let sessionLogger else { return }
+            failureContext?.observeSessionEntry(entry, logger: sessionLogger)
+        }
         coordinator = SessionCoordinator(
             asr: TencentASRClient(),
             audio: SystemAudioCapture(),
@@ -389,9 +394,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
                 try await TencentASRClient().testConnection(configuration: configuration)
             },
-            onExportDiagnosticLog: { [weak self] in
+            onExportDiagnosticLog: { [weak self] updateProgress in
                 guard let self else { throw DiagnosticLogExportError.unavailable }
-                return try self.exportDiagnosticLog()
+                return try await self.exportDiagnosticLog(progress: updateProgress)
             },
             onRecordDiagnosticAction: { [weak self] name, fields in
                 self?.sessionLogger.recordDiagnosticAction(name, fields: fields)
@@ -447,25 +452,107 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func exportDiagnosticLog() throws -> URL? {
-        let report = DiagnosticReportBuilder(
+    private func exportDiagnosticLog(progress: @MainActor (String) -> Void) async throws -> URL? {
+        guard !diagnosticReportInProgress else { throw DiagnosticLogExportError.reportAlreadyInProgress }
+        diagnosticReportInProgress = true
+        defer { diagnosticReportInProgress = false }
+
+        let requestID = UUID()
+        let requestedAt = Date()
+        let requestedAtMonotonicNanoseconds = DispatchTime.now().uptimeNanoseconds
+        let snapshotStarted = requestedAtMonotonicNanoseconds
+        let captureStartedAt = sessionLogger.reportCaptureStartedAt
+        let snapshot = sessionLogger.reportEventSnapshot(at: requestedAt, captureStartedAt: captureStartedAt)
+        let captureEnabledAtRequest = failureContext.isEnabled || settingsStore.load().saveTextLogs
+        let snapshotMilliseconds = elapsedMilliseconds(since: snapshotStarted)
+        sessionLogger.recordDiagnosticAction("diagnostic_log_export_requested", fields: [
+            "reportID": requestID.uuidString,
+            "requestedAt": DiagnosticReportTime.format(requestedAt),
+            "requestedAtMonotonicNanoseconds": String(requestedAtMonotonicNanoseconds),
+            "captureEnabled": String(captureEnabledAtRequest),
+            "persistentLoggingEnabledAtRequest": String(settingsStore.load().saveTextLogs)
+        ])
+        let panel = NSSavePanel()
+        panel.title = "导出诊断报告"
+        panel.message = "导出点击前最近一分钟的诊断；可能包含完整语音识别文字和目标输入框正文，不包含录音或凭据。"
+        panel.nameFieldStringValue = defaultDiagnosticLogFilename()
+        panel.allowedContentTypes = [.json]
+        panel.canCreateDirectories = true
+        progress("请选择报告保存位置；数据范围已固定为点击前一分钟")
+        guard let url = await presentDiagnosticSavePanel(panel) else { return nil }
+
+        progress("正在恢复一分钟内未留在内存中的记录…")
+        let recoveryStarted = DispatchTime.now().uptimeNanoseconds
+        let recovery = await Task.detached(priority: .utility) {
+            snapshot.recoverPersistedEvents()
+        }.value
+        let recoveryMilliseconds = elapsedMilliseconds(since: recoveryStarted)
+        let builder = DiagnosticReportBuilder(
             permissionChecker: permissionChecker,
             credentialStore: credentialStore,
             settingsStore: settingsStore,
             logger: sessionLogger
-        ).build()
-
-        let panel = NSSavePanel()
-        panel.title = "导出诊断报告"
-        panel.message = "导出会话状态、错误代码和操作上下文；不会导出密钥、录音或识别文字。"
-        panel.nameFieldStringValue = defaultDiagnosticLogFilename()
-        panel.allowedContentTypes = [.json]
-        panel.canCreateDirectories = true
-        guard panel.runModal() == .OK, let url = panel.url else { return nil }
-
-        let data = try DiagnosticJSON.encoder().encode(report)
-        try data.write(to: url, options: .atomic)
+        )
+        progress("正在组装报告并检查 App 签名…")
+        let report = await builder.buildAsync(
+            events: recovery.events,
+            requestedAt: requestedAt,
+            captureStartedAt: captureStartedAt,
+            captureEnabled: captureEnabledAtRequest,
+            recoveryMetrics: recovery.metrics,
+            stageTimings: DiagnosticReportStageTimings(
+                snapshotMilliseconds: snapshotMilliseconds,
+                recoveryMilliseconds: recoveryMilliseconds,
+                assemblyMilliseconds: nil,
+                encodingMilliseconds: nil,
+                writingMilliseconds: nil,
+                measurementPass: "精确编码/写入耗时记入同 requestID 的保存事件；它在本报告快照之后，且仅在保存时日志开关开启时落盘。requestID=\(requestID.uuidString)"
+            ),
+            omittedRecordCount: recovery.metrics.missingRecordCount,
+            requestID: requestID,
+            requestedAtMonotonicNanoseconds: requestedAtMonotonicNanoseconds
+        )
+        progress("正在编码完整正文证据…")
+        let encodingStarted = DispatchTime.now().uptimeNanoseconds
+        let data = try await Task.detached(priority: .utility) {
+            try DiagnosticJSON.encoder().encode(report)
+        }.value
+        let encodingMilliseconds = elapsedMilliseconds(since: encodingStarted)
+        progress("正在写入报告文件…")
+        let writingStarted = DispatchTime.now().uptimeNanoseconds
+        try await Task.detached(priority: .utility) {
+            try data.write(to: url, options: .atomic)
+        }.value
+        let writingMilliseconds = elapsedMilliseconds(since: writingStarted)
+        sessionLogger.recordDiagnosticAction("diagnostic_log_export_saved", fields: [
+            "reportID": requestID.uuidString,
+            "requestedAt": DiagnosticReportTime.format(requestedAt),
+            "requestedAtMonotonicNanoseconds": String(requestedAtMonotonicNanoseconds),
+            "persistentLoggingEnabledAtSave": String(settingsStore.load().saveTextLogs),
+            "snapshotMilliseconds": String(snapshotMilliseconds),
+            "recoveryMilliseconds": String(recoveryMilliseconds),
+            "assemblyMilliseconds": String(report.stageTimings?.assemblyMilliseconds ?? 0),
+            "encodingMilliseconds": String(encodingMilliseconds),
+            "writingMilliseconds": String(writingMilliseconds),
+            "filesRead": String(recovery.metrics.filesRead),
+            "bytesRead": String(recovery.metrics.bytesRead),
+            "recordsDecoded": String(recovery.metrics.recordsDecoded),
+            "recordsRecovered": String(recovery.metrics.recordsRecovered),
+            "missingRecordCount": recovery.metrics.missingRecordCount.map(String.init) ?? "unknown"
+        ])
         return url
+    }
+
+    private func presentDiagnosticSavePanel(_ panel: NSSavePanel) async -> URL? {
+        await withCheckedContinuation { continuation in
+            panel.begin { response in
+                continuation.resume(returning: response == .OK ? panel.url : nil)
+            }
+        }
+    }
+
+    private func elapsedMilliseconds(since start: UInt64) -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
     }
 
     private func applyFailureContextSetting() {
@@ -482,34 +569,139 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func reportInputFailure() {
+        guard !diagnosticReportInProgress else {
+            menu.update(failureReportResult: "诊断报告正在处理中")
+            return
+        }
+        diagnosticReportInProgress = true
+        let reportID = UUID()
         let now = Date()
-        let context = failureContext.snapshot(at: now)
+        let requestedAtMonotonicNanoseconds = DispatchTime.now().uptimeNanoseconds
+        menu.update(failureReportResult: "正在整理最近一分钟的完整诊断…")
+        let snapshotStarted = requestedAtMonotonicNanoseconds
+        let windowStart = now.addingTimeInterval(-60)
+        let context = failureContext.snapshot(at: now).restricted(to: windowStart, through: now)
+        let captureStartedAt = sessionLogger.reportCaptureStartedAt
+        let eventSnapshot = sessionLogger.reportEventSnapshot(at: now, captureStartedAt: captureStartedAt)
+        let captureEnabledAtRequest = context.enabled || settingsStore.load().saveTextLogs
+        let snapshotMilliseconds = elapsedMilliseconds(since: snapshotStarted)
+        let latestFailureSnapshot = failureContext.latestFailure
+        let firstFailureSnapshot = failureContext.firstFailure
         sessionLogger.recordDiagnosticAction("input_failure_report_requested", fields: [
-            "contextEnabled": String(context.enabled)
+            "reportID": reportID.uuidString,
+            "contextEnabled": String(context.enabled),
+            "persistentLoggingEnabledAtRequest": String(settingsStore.load().saveTextLogs),
+            "requestedAt": DiagnosticReportTime.format(now),
+            "requestedAtMonotonicNanoseconds": String(requestedAtMonotonicNanoseconds)
         ])
-        let events = context.enabled ? sessionLogger.failureEvents(at: now) : sessionLogger.recentEntries(limit: 300)
-            .filter { $0.timestamp >= now.addingTimeInterval(-60) && $0.timestamp <= now }
-        let report = InputFailureReport(schemaVersion: 1, id: UUID(), generatedAt: now, desktopContext: context,
-            diagnosticReport: DiagnosticReportBuilder(permissionChecker: permissionChecker,
-                credentialStore: credentialStore, settingsStore: settingsStore, logger: sessionLogger).build(events: events),
-            diagnosticEventsTruncated: !context.enabled || sessionLogger.failureContextEventsTruncated,
-            latestFailure: failureContext.latestFailure)
         let directory = sessionLogger.persistenceDirectoryURL.deletingLastPathComponent()
             .appendingPathComponent("input-failure-reports", isDirectory: true)
-        let destination = directory.appendingPathComponent("InputFailure-\(report.id.uuidString).json")
-        menu.update(failureReportResult: "正在保存失效报告…")
-        failureReportTasks[report.id] = Task { @MainActor [weak self] in
-            defer { self?.failureReportTasks.removeValue(forKey: report.id) }
+        let destination = directory.appendingPathComponent("InputFailure-\(reportID.uuidString).json")
+        failureReportTasks[reportID] = Task { @MainActor [weak self] in
+            defer {
+                self?.failureReportTasks.removeValue(forKey: reportID)
+                self?.diagnosticReportInProgress = false
+            }
             do {
+                let recoveryStarted = DispatchTime.now().uptimeNanoseconds
+                let recovery = await Task.detached(priority: .utility) {
+                    eventSnapshot.recoverPersistedEvents()
+                }.value
+                let recoveryMilliseconds = self?.elapsedMilliseconds(since: recoveryStarted) ?? 0
+                guard let self else { return }
+                let builder = DiagnosticReportBuilder(
+                    permissionChecker: permissionChecker,
+                    credentialStore: credentialStore,
+                    settingsStore: settingsStore,
+                    logger: sessionLogger
+                )
+                let assemblyStarted = DispatchTime.now().uptimeNanoseconds
+                let reportOmittedCount: Int? = context.droppedEventCount > 0
+                    || context.collectionStatus["droppedEventCountScope"]?.contains("unknown") == true
+                    || eventSnapshot.failureContextEvidenceTruncated
+                    || eventSnapshot.pinnedEvidenceTruncated
+                    ? nil : recovery.metrics.missingRecordCount
+                let diagnosticReport = await builder.buildAsync(
+                    events: recovery.events,
+                    requestedAt: now,
+                    captureStartedAt: captureStartedAt,
+                    captureEnabled: captureEnabledAtRequest,
+                    recoveryMetrics: recovery.metrics,
+                    stageTimings: DiagnosticReportStageTimings(
+                        snapshotMilliseconds: snapshotMilliseconds,
+                        recoveryMilliseconds: recoveryMilliseconds,
+                        assemblyMilliseconds: nil,
+                        encodingMilliseconds: nil,
+                        writingMilliseconds: nil,
+                        measurementPass: "精确编码/写入耗时记入同 reportID 的保存事件；它在本报告快照之后，且仅在保存时日志开关开启时落盘。reportID=\(reportID.uuidString)"
+                    ),
+                    omittedRecordCount: reportOmittedCount,
+                    requestID: reportID,
+                    requestedAtMonotonicNanoseconds: requestedAtMonotonicNanoseconds
+                )
+                let assemblyMilliseconds = diagnosticReport.stageTimings?.assemblyMilliseconds ?? elapsedMilliseconds(since: assemblyStarted)
+                let scopedFailureEvidence = await Task.detached(priority: .utility) {
+                    let latest = latestFailureSnapshot.flatMap {
+                        $0.desktopContext.capturedAt >= windowStart && $0.desktopContext.capturedAt <= now
+                            ? $0.restricted(to: windowStart, through: now) : nil
+                    }
+                    let first = firstFailureSnapshot.flatMap {
+                        $0.desktopContext.capturedAt >= windowStart && $0.desktopContext.capturedAt <= now
+                            ? $0.restricted(to: windowStart, through: now) : nil
+                    }
+                    return (latest, first, DiagnosticSessionSummary.make(from: recovery.events))
+                }.value
+                let preliminaryReport = InputFailureReport(
+                    schemaVersion: 3,
+                    id: reportID,
+                    generatedAt: now,
+                    desktopContext: context,
+                    diagnosticReport: diagnosticReport,
+                    diagnosticEventsTruncated: !context.enabled
+                        || eventSnapshot.failureContextEvidenceTruncated
+                        || eventSnapshot.pinnedEvidenceTruncated
+                        || context.droppedEventCount > 0
+                        || context.collectionStatus["droppedEventCountScope"]?.contains("unknown") == true
+                        || scopedFailureEvidence.0?.diagnosticEventsTruncated == true
+                        || scopedFailureEvidence.1?.diagnosticEventsTruncated == true
+                        || recovery.metrics.missingRecordCount.map { $0 > 0 } != false,
+                    latestFailure: scopedFailureEvidence.0,
+                    sessionEvidenceSummaries: scopedFailureEvidence.2,
+                    firstFailure: scopedFailureEvidence.1,
+                    evidenceScopeNote: "严格限定为点击前60秒。未出现在窗口内的首条识别、最后成功写入或最终 Safe Copy，表示本窗口没有取得；无法据此区分它发生在窗口外还是截止点击时尚未发生。"
+                )
+                menu.update(failureReportResult: "正在编码并保存报告…")
                 try await Task.detached(priority: .utility) {
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                    try DiagnosticJSON.encoder().encode(report).write(to: destination, options: .atomic)
                 }.value
-                let title = context.enabled ? "失效报告已保存" : "已保存诊断；操作记录未开启"
-                self?.menu.update(failureReportResult: title, path: destination.path)
-                self?.sessionLogger.recordDiagnosticAction("input_failure_report_saved", fields: [
-                    "reportID": report.id.uuidString, "contextEnabled": String(context.enabled),
-                    "desktopEventCount": String(context.events.count), "diagnosticEventCount": String(events.count)
+                let encodingStarted = DispatchTime.now().uptimeNanoseconds
+                let data = try await Task.detached(priority: .utility) {
+                    try DiagnosticJSON.encoder().encode(preliminaryReport)
+                }.value
+                let encodingMilliseconds = elapsedMilliseconds(since: encodingStarted)
+                let writingStarted = DispatchTime.now().uptimeNanoseconds
+                try await Task.detached(priority: .utility) {
+                    try data.write(to: destination, options: .atomic)
+                }.value
+                let writingMilliseconds = elapsedMilliseconds(since: writingStarted)
+                let title = captureEnabledAtRequest ? "失效报告已保存" : "已保存诊断；采集未开启"
+                menu.update(failureReportResult: title, path: destination.path)
+                sessionLogger.recordDiagnosticAction("input_failure_report_saved", fields: [
+                    "reportID": reportID.uuidString,
+                    "contextEnabled": String(context.enabled),
+                    "persistentLoggingEnabledAtSave": String(settingsStore.load().saveTextLogs),
+                    "desktopEventCount": String(context.events.count),
+                    "diagnosticEventCount": String(recovery.events.count),
+                    "snapshotMilliseconds": String(snapshotMilliseconds),
+                    "recoveryMilliseconds": String(recoveryMilliseconds),
+                    "assemblyMilliseconds": String(assemblyMilliseconds),
+                    "encodingMilliseconds": String(encodingMilliseconds),
+                    "writingMilliseconds": String(writingMilliseconds),
+                    "filesRead": String(recovery.metrics.filesRead),
+                    "bytesRead": String(recovery.metrics.bytesRead),
+                    "recordsDecoded": String(recovery.metrics.recordsDecoded),
+                    "recordsRecovered": String(recovery.metrics.recordsRecovered),
+                    "missingRecordCount": recovery.metrics.missingRecordCount.map(String.init) ?? "unknown"
                 ])
             } catch {
                 self?.menu.update(failureReportResult: "失效报告保存失败", path: error.localizedDescription)

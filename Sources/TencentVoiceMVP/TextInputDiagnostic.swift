@@ -4,6 +4,19 @@ struct TextInputDiagnostic {
     let timestamp: Date
     let event: String
     let fields: [String: String]
+    let textEvidence: [DiagnosticTextEvidence]
+
+    var estimatedDiagnosticBytes: Int {
+        256 + fields.reduce(0) { $0 + $1.key.utf8.count + $1.value.utf8.count }
+            + textEvidence.reduce(0) { $0 + 256 + $1.text.utf8.count }
+    }
+
+    init(timestamp: Date, event: String, fields: [String: String], textEvidence: [DiagnosticTextEvidence] = []) {
+        self.timestamp = timestamp
+        self.event = event
+        self.fields = fields
+        self.textEvidence = textEvidence
+    }
 }
 
 struct TextInputDiagnosticContext {

@@ -130,15 +130,23 @@ enum AXTextInputStrategy: Equatable {
             return .safeStop(reason: "web_control_not_editable")
         }
 
-        // Codex, Safari, and Obsidian have existing application-specific
-        // handling below this strategy layer. Preserve those routes when the
-        // web ancestry or editability metadata is temporarily unavailable;
-        // an explicit secure/read-only signal above still wins.
+        // Codex and Obsidian have existing application-specific handling
+        // below this strategy layer.
         let usesSpecializedLegacyRoute = application?.bundleIdentifier == "com.openai.codex"
-            || application?.bundleIdentifier == "com.apple.Safari"
             || application?.bundleIdentifier == "md.obsidian"
         if usesSpecializedLegacyRoute {
             return .accessibility
+        }
+
+        if application?.bundleIdentifier == "com.apple.Safari" {
+            switch context.ancestorScanStatus {
+            case .webArea:
+                break
+            case .completeWithoutWebArea:
+                return .accessibility
+            case .truncated, .cycle, .readFailure:
+                return .safeStop(reason: "web_ancestor_unclassified")
+            }
         }
 
         switch context.ancestorScanStatus {

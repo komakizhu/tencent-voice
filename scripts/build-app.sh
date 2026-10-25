@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PRODUCT_NAME="TencentVoiceMVP"
-SIGNING_IDENTITY="${CODESIGN_IDENTITY:-OneKeyIFlyVoice Local Code Signing v4}"
+SIGNING_IDENTITY="${CODESIGN_IDENTITY:-Rime Voice Local Code Signing v1}"
 ALLOW_ADHOC_SIGNING="${TVMVP_ALLOW_ADHOC_SIGNING:-0}"
 PACING_PRESET="${TVMVP_PACING_PRESET:-balanced}"
 INFO_PLIST="$PROJECT_DIR/Resources/Info.plist"

@@ -543,9 +543,16 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     private var isCodexTarget = false
     private var isObsidianTarget = false
     private var isSafariWebEditor = false
+    private var usesKeyboardOwnedSelection: Bool {
+        activeInputStrategy.prefersAcknowledgedKeyboard
+            || (isSafariWebEditor && requiresKeyboardAcknowledgement)
+    }
     private var targetElement: AXUIElement?
     private var targetProcessID: pid_t?
     private var targetApplicationProcessID: pid_t?
+    private var targetApplicationBundleIdentifier: String?
+    private var targetElementObservationID: String?
+    private var lastKeyboardObservationTiming: (requested: Date, started: Date, finished: Date, monotonicMilliseconds: UInt64)?
     private var activeInputStrategy: AXTextInputStrategy = .accessibility
     private var expectedKeyboardSelection: TextRange?
     private let access: any AXTextTargetAccess
@@ -555,6 +562,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     private let acknowledgementTimeoutNanoseconds: UInt64
     private let evidenceObserver: ((TextInputDiagnostic, AXUIElement?, pid_t?) -> Void)?
     private var diagnostics: [TextInputDiagnostic] = []
+    private var diagnosticBytes = 0
     private var droppedDiagnosticCount = 0
     private var diagnosticOperationContext: TextInputDiagnosticContext?
     private var previousDiagnosticOperationContext: TextInputDiagnosticContext?
@@ -586,13 +594,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         for diagnostic in access.drainReadDiagnostics() {
             recordDiagnostic(diagnostic.event, diagnostic.fields, context: diagnosticOperationContext ?? previousDiagnosticOperationContext)
         }
-        defer { diagnostics.removeAll(keepingCapacity: true) }
+        defer { diagnostics.removeAll(keepingCapacity: true); diagnosticBytes = 0 }
         var result = diagnostics
         if droppedDiagnosticCount > 0 {
             result.append(TextInputDiagnostic(
                 timestamp: Date(),
                 event: "target_diagnostics_truncated",
-                fields: ["droppedEventCount": String(droppedDiagnosticCount)]
+                fields: ["droppedEventCount": String(droppedDiagnosticCount),
+                    "reason": "target_event_count_or_byte_capacity", "byteLimit": String(16 * 1024 * 1024)]
             ))
             droppedDiagnosticCount = 0
         }
@@ -609,23 +618,115 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     private func recordDiagnostic(
         _ event: String,
         _ fields: [String: String] = [:],
-        context: TextInputDiagnosticContext? = nil
+        context: TextInputDiagnosticContext? = nil,
+        textEvidence: [DiagnosticTextEvidence] = []
     ) {
         var merged = (context ?? diagnosticOperationContext)?.fields ?? [:]
         merged.merge(fields) { _, new in new }
         merged["inputSessionGeneration"] = String(keyboardGeneration)
         merged["keyboardOperationGeneration"] = String(keyboardOperationGeneration)
-        let diagnostic = TextInputDiagnostic(timestamp: Date(), event: event, fields: merged)
+        let diagnostic = TextInputDiagnostic(timestamp: Date(), event: event, fields: merged,
+            textEvidence: textEvidence)
         evidenceObserver?(diagnostic, targetElement, targetApplicationProcessID ?? targetProcessID)
-        guard diagnostics.count < 64 else {
-            droppedDiagnosticCount += 1
-            return
-        }
         diagnostics.append(diagnostic)
+        diagnosticBytes += diagnostic.estimatedDiagnosticBytes
+        while diagnostics.count > 4096 || diagnosticBytes > 16 * 1024 * 1024 {
+            droppedDiagnosticCount += 1
+            // Keep terminal outcomes even when read sampling fills the buffer.
+            let removable = diagnostics.firstIndex {
+                ["keyboard_document_observed", "ax_text_attribute_read"].contains($0.event)
+            }
+            diagnosticBytes -= diagnostics.remove(at: removable ?? 0).estimatedDiagnosticBytes
+        }
     }
 
     func currentApplication() -> TextTargetApplication? {
         access.currentApplication()
+    }
+
+    // A successful dispatch call is not proof of what the editor displayed.
+    // Record its exact payload here, never reconstruct it in an onFinish callback.
+    private func recordDispatchedText(_ text: String, expectedDocument: String?,
+                                      replacementRange: TextRange? = nil,
+                                      context: TextInputDiagnosticContext? = nil) {
+        let operation = context ?? diagnosticOperationContext
+        let now = Date()
+        func evidence(_ kind: DiagnosticTextEvidenceKind, _ source: DiagnosticEvidenceSource,
+                      _ value: String) -> DiagnosticTextEvidence {
+            DiagnosticTextEvidence(kind: kind, source: source, text: value,
+                revision: UInt64(operation?.fields["revision"] ?? ""),
+                operationID: operation.map { String($0.operationID) },
+                targetApplicationBundleIdentifier: targetApplicationBundleIdentifier,
+                targetApplicationProcessID: targetApplicationProcessID,
+                editorIdentity: targetElementObservationID,
+                selectionLocationUTF16: replacementRange?.location,
+                selectionLengthUTF16: replacementRange?.length, observedAt: now,
+                monotonicMilliseconds: writeTiming.now() / 1_000_000)
+        }
+        var texts = [evidence(.sentText, .observed, text)]
+        if let expectedDocument { texts.append(evidence(.expectedDocument, .expected, expectedDocument)) }
+        recordDiagnostic("text_dispatch_returned", ["result": "submission_returned_without_error",
+            "selectionMeaning": "requested_replacement_range_not_post_write_caret",
+            "displayResult": "not_yet_confirmed", "editorIdentityMeaning": "captured_handle_not_stable_editor_identity"],
+            context: operation, textEvidence: texts)
+    }
+
+    private func documentEvidence(_ state: KeyboardDocumentState, requested: Date,
+                                  started: Date, monotonic: UInt64) -> [DiagnosticTextEvidence] {
+        let finished = Date()
+        let context = diagnosticOperationContext ?? previousDiagnosticOperationContext
+        var values: [(DiagnosticTextEvidenceKind, String)] = []
+        if let raw = state.rawText { values.append((.axValue, raw)) }
+        if state.mapping?.source == .axStringForRange { values.append((.axStringForRange, state.text)) }
+        return values.map { kind, text in
+            DiagnosticTextEvidence(kind: kind, source: .observed, text: text,
+                revision: UInt64(context?.fields["revision"] ?? ""),
+                operationID: context.map { String($0.operationID) },
+                targetApplicationBundleIdentifier: targetApplicationBundleIdentifier,
+                targetApplicationProcessID: targetApplicationProcessID,
+                editorIdentity: targetElementObservationID,
+                selectionLocationUTF16: state.selection.location,
+                selectionLengthUTF16: state.selection.length,
+                requestedAt: requested, readStartedAt: started, readFinishedAt: finished,
+                observedAt: finished, monotonicMilliseconds: monotonic)
+        }
+    }
+
+    private var lastAXObservationEvidence: [DiagnosticTextEvidence] = []
+
+    private func readTextEvidence(_ kind: DiagnosticTextEvidenceKind,
+                                  fields: [String: String] = [:],
+                                  read: () throws -> String?) throws -> String? {
+        let start = Date()
+        let monotonic = writeTiming.now() / 1_000_000
+        let context = diagnosticOperationContext ?? previousDiagnosticOperationContext
+        do {
+            let text = try read()
+            let end = Date()
+            let evidence = text.map { text in
+                DiagnosticTextEvidence(kind: kind, source: .observed, text: text,
+                    revision: UInt64(context?.fields["revision"] ?? ""),
+                    operationID: context.map { String($0.operationID) },
+                    targetApplicationBundleIdentifier: targetApplicationBundleIdentifier,
+                    targetApplicationProcessID: targetApplicationProcessID,
+                    editorIdentity: targetElementObservationID,
+                    requestedAt: start, readStartedAt: start, readFinishedAt: end,
+                    observedAt: end, monotonicMilliseconds: monotonic)
+            }
+            recordDiagnostic("ax_text_attribute_read", fields.merging([
+                "attribute": kind.rawValue, "result": text == nil ? "unavailable" : "observed",
+                "selectionRelation": "separate_non_atomic_read",
+                "editorIdentityMeaning": "captured_handle_not_stable_editor_identity"
+            ]) { _, new in new }, context: context, textEvidence: evidence.map { [$0] } ?? [])
+            return text
+        } catch {
+            recordDiagnostic("ax_text_attribute_read", fields.merging([
+                "attribute": kind.rawValue, "result": "failed", "code": axReadDiagnosticCode(for: error),
+                "requestedAt": start.ISO8601Format(), "finishedAt": Date().ISO8601Format(),
+                "readStartedMonotonicMilliseconds": String(monotonic)
+            ]) { _, new in new }, context: context)
+            throw error
+        }
     }
 
     func capture() throws -> TextSnapshot {
@@ -649,6 +750,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         confirmedKeyboardState = nil
         requiresKeyboardAcknowledgement = false
         diagnostics.removeAll(keepingCapacity: true)
+        diagnosticBytes = 0
         droppedDiagnosticCount = 0
         diagnosticOperationContext = nil
         previousDiagnosticOperationContext = nil
@@ -660,10 +762,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         try access.requestInputPermissions()
         targetElement = nil
         targetProcessID = nil
+        targetApplicationBundleIdentifier = nil
+        targetElementObservationID = nil
+        lastKeyboardObservationTiming = nil
         expectedKeyboardSelection = nil
         activeInputStrategy = .accessibility
         let targetApplication = currentApplication()
         targetApplicationProcessID = targetApplication.map { pid_t($0.processIdentifier) }
+        targetApplicationBundleIdentifier = targetApplication?.bundleIdentifier
         isCodexTarget = targetApplication?.bundleIdentifier == "com.openai.codex"
         isObsidianTarget = targetApplication?.bundleIdentifier == "md.obsidian"
         isSafariWebEditor = false
@@ -673,16 +779,13 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         // still a valid keyboard target as long as a frontmost application is
         // known; the keyboard append path only owns the text it sends.
         let element = try? focusedElement()
-        // Safari's ProseMirror editor advertises writable AX attributes but
-        // may acknowledge an insertion without changing the DOM. Start with
-        // the existing acknowledged keyboard path; never resend an AX write.
-        isSafariWebEditor = targetApplication?.bundleIdentifier == "com.apple.Safari"
-            && (element.map { access.isProseMirrorEditor($0) } ?? false)
         targetElement = element
         if let element {
             targetProcessID = access.processIdentifier(of: element) ?? targetApplicationProcessID
+            targetElementObservationID = UUID().uuidString
         } else {
             targetProcessID = targetApplicationProcessID
+            targetElementObservationID = nil
         }
         guard targetProcessID != nil else {
             throw TextTargetError.unsupported
@@ -694,6 +797,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         // back to append-only mode. When Codex exposes readable text, however,
         // its AXValue and selection coordinates must be interpreted together.
         let inputContext = element.flatMap { access.textInputContext(for: $0) }
+        // Safari web editors can advertise writable AX attributes even when
+        // those writes do not update the page. Use the acknowledged keyboard
+        // path for positively identified editable web text areas; retain the
+        // explicit ProseMirror marker as the legacy fallback when ancestry is
+        // unavailable.
+        isSafariWebEditor = element.map {
+            isEligibleSafariWebEditor($0, application: targetApplication, context: inputContext)
+        } ?? false
         let rawText = try element.flatMap { element in
             try captureReadableText(in: element, context: inputContext)
         }
@@ -939,16 +1050,20 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 targetSelection
             ]
 
+            var dispatchedPayload = text
+            var dispatchedRange = range
             if selectedTextIsSettable(on: element) {
                 writeKind = "selected"
                 let previousText = (expectedText as NSString).substring(
                     with: NSRange(location: range.location, length: range.length)
                 )
                 let delta = TextReplacementDelta(previousText: previousText, newText: text)
+                dispatchedPayload = delta.insertion
                 let replacementRange = TextRange(
                     location: range.location + delta.prefixUTF16Length,
                     length: delta.previousMiddleUTF16Length
                 )
+                dispatchedRange = replacementRange
                 try setSelection(replacementRange, on: element)
                 allowedPostDispatchSelections.append(replacementRange)
                 _ = try await waitForAXWriteState(
@@ -984,6 +1099,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             } else {
                 guard valueIsSettable(on: element) else { throw TextTargetError.writeFailed }
                 writeKind = "value"
+                dispatchedPayload = expectedDocument
+                dispatchedRange = TextRange(location: 0, length: expectedText.utf16.count)
                 let status = try access.setValue(expectedDocument, on: element)
                 lastAXWriteStatus = status
                 lastAXWriteKind = writeKind
@@ -999,6 +1116,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             }
 
             submitted = true
+            recordDispatchedText(dispatchedPayload, expectedDocument: expectedDocument, replacementRange: dispatchedRange)
             trace.beginPostDispatch()
             recordDiagnostic("ax_write_submitted", [
                 "axWriteStatus": String(lastAXWriteStatus ?? AXError.success.rawValue),
@@ -1054,7 +1172,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 "axOperationGeneration": String(operationGeneration),
                 "failureStage": "acknowledged"
             ]) { _, new in new }
-            recordDiagnostic("ax_write_acknowledged", fields)
+            recordDiagnostic("ax_write_acknowledged", fields, textEvidence: lastAXObservationEvidence)
             return AXTextWriteReceipt(
                 text: acknowledged.text,
                 selection: acknowledged.selection,
@@ -1118,10 +1236,16 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     }
 
     private func readAXWritableState(in element: AXUIElement) throws -> AXWritableState {
-        guard let text = try access.text(in: element),
+        lastAXObservationEvidence = []
+        let start = Date()
+        let monotonic = writeTiming.now() / 1_000_000
+        guard let text = try readTextEvidence(.axValue, read: { try access.text(in: element) }),
               let selection = try access.selection(in: element) else {
             throw KeyboardWriteReadError.retryable
         }
+        lastAXObservationEvidence = documentEvidence(
+            KeyboardDocumentState(text: text, selection: selection, rawText: text),
+            requested: start, started: start, monotonic: monotonic)
         return AXWritableState(text: text, selection: selection)
     }
 
@@ -1310,12 +1434,23 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     /// will use for the next synthetic keyboard event.  This is observable
     /// at a paragraph boundary: the selection read before dispatch can be
     /// stable while the insertion is applied on the other side of the
-    /// separator.  When the target exposes a writable AX range, reseat that
+    /// separator.  For native targets with a writable AX range, reseat that
     /// already-confirmed caret and read the complete state back before
-    /// creating the receipt.  The operation is aborted if reseating changes
-    /// any part of the confirmed document or mapping; it never guesses a
-    /// replacement position.
+    /// creating the receipt. Web editors use keyboard-owned selection instead
+    /// because an AX range write may not move the page's actual caret.
     private func stabilizeKeyboardSelectionBeforeDispatch() throws {
+        if usesKeyboardOwnedSelection {
+            // Web editors may report an AX range write as successful without
+            // moving the page's actual selection. The acknowledged preflight
+            // already checked the observed document and caret; avoid changing
+            // selection through AX and let keyboard events establish ranges
+            // that are verified before replacement.
+            try ensureKeyboardTargetIdentityIsSafe()
+            recordDiagnostic("keyboard_selection_stabilization_skipped", [
+                "reason": "web_selection_is_keyboard_owned"
+            ])
+            return
+        }
         guard requiresKeyboardAcknowledgement,
               let targetElement,
               selectedTextRangeIsSettable(on: targetElement),
@@ -1334,13 +1469,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             throw TextTargetError.targetChanged
         }
 
-        try setSelection(expected.selection, on: targetElement)
+        let axSelectionRequestID = try setSelection(expected.selection, on: targetElement)
         let after = try keyboardDocumentState(in: targetElement, confirming: true)
         let comparison = after.compare(to: expected, allowingStructuralRawDifference: false)
         guard comparison == .matched else {
             invalidateKeyboardRawInsertionRegion()
             recordDiagnostic("keyboard_selection_stabilization_failed", [
                 "phase": "after_set",
+                "axSelectionRequestID": axSelectionRequestID,
                 "comparison": comparison.rawValue,
                 "expectedSelectionLocation": String(expected.selection.location),
                 "actualSelectionLocation": String(after.selection.location),
@@ -1352,6 +1488,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         commitConfirmedKeyboardState(after)
         recordDiagnostic("keyboard_selection_stabilized", [
             "route": "ax_range",
+            "axSelectionRequestID": axSelectionRequestID,
+            "nextKeyboardOperationGeneration": String(keyboardOperationGeneration &+ 1),
+            "axReadbackMonotonicNanoseconds": String(DispatchTime.now().uptimeNanoseconds),
+            "selectionEffectObservation": "ax_readback_only_not_editor_internal_state",
             "selectionLocation": String(after.selection.location),
             "selectionLength": String(after.selection.length)
         ])
@@ -1381,6 +1521,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         }
         do {
             try keyboardEventSender.send(text, processID: eventProcessID)
+            recordDispatchedText(text, expectedDocument: receipt?.text, replacementRange: operationRange)
         } catch {
             pendingKeyboardRepresentationTransition = nil
             pendingKeyboardDiagnosticOperation = nil
@@ -1469,7 +1610,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 length: 0
             )
             keyboardOperationGeneration = operationGeneration
-            let usesAXSelection = !isCodexTarget && (targetElement.map {
+            let usesAXSelection = !isCodexTarget && !usesKeyboardOwnedSelection && (targetElement.map {
                 selectedTextRangeIsSettable(on: $0)
             } ?? false)
             if usesAXSelection, let targetElement {
@@ -1507,6 +1648,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             with: text,
             processID: eventProcessID
         )
+        recordDispatchedText(text, expectedDocument: receipt?.text, replacementRange: replacementRange)
         lastKeyboardDispatch = writeTiming.now()
         if let receipt {
             pendingKeyboardWrite = receipt
@@ -1560,6 +1702,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         generation: UInt64,
         phase: String
     ) throws -> KeyboardDocumentState {
+        let requestedAt = Date()
         guard generation == keyboardGeneration else { throw CancellationError() }
         try ensureTargetApplicationIsFrontmost()
         let element = try focusedElement()
@@ -1568,7 +1711,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 invalidateKeyboardRawInsertionRegion()
                 throw TextTargetError.targetChanged
             }
-            try reacquireSafariTarget(element, phase: "\(phase)_before_read")
+            try rejectSafariTargetRebuild(element, phase: "\(phase)_before_read")
         } else if targetElement == nil {
             invalidateKeyboardRawInsertionRegion()
             throw TextTargetError.targetChanged
@@ -1578,6 +1721,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             throw TextTargetError.targetChanged
         }
         do {
+            let readStartedAt = Date()
+            let readStartedMonotonic = writeTiming.now() / 1_000_000
             let state = try KeyboardWriteAcknowledgement.readObservation {
                 try self.keyboardDocumentState(in: element, confirming: true)
             }
@@ -1588,9 +1733,18 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                     invalidateKeyboardRawInsertionRegion()
                     throw TextTargetError.targetChanged
                 }
-                try reacquireSafariTarget(afterElement, phase: "\(phase)_after_read")
-                throw KeyboardWriteReadError.retryable
+                try rejectSafariTargetRebuild(afterElement, phase: "\(phase)_after_read")
             }
+            lastKeyboardObservationTiming = (
+                requested: requestedAt,
+                started: readStartedAt,
+                finished: Date(),
+                monotonicMilliseconds: readStartedMonotonic
+            )
+            recordDiagnostic("keyboard_document_observed", ["phase": phase,
+                "editorIdentityMeaning": "captured_handle_not_stable_editor_identity"],
+                textEvidence: documentEvidence(state, requested: requestedAt,
+                    started: readStartedAt, monotonic: readStartedMonotonic))
             return state
         } catch KeyboardWriteReadError.retryable {
             recordDiagnostic("keyboard_state_read_retryable", ["phase": phase])
@@ -1713,6 +1867,9 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                         context: acknowledgementContext
                     )
                     try self.keyboardEventSender.replaceSelection(with: replacement.insertion, processID: self.eventProcessID)
+                    self.recordDispatchedText(replacement.insertion, expectedDocument: receipt.text,
+                                              replacementRange: replacement.selected.selection,
+                                              context: acknowledgementContext)
                     self.replacementWasSent = true
                     self.lastKeyboardDispatch = self.writeTiming.now()
                     self.recordDiagnostic(
@@ -1768,7 +1925,41 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                     : "not_applicable"
             )
             let mergedAcknowledgementFields = acknowledgementFields.merging(acknowledgementEvidence) { _, new in new }
-            recordDiagnostic("keyboard_write_acknowledged", mergedAcknowledgementFields, context: acknowledgementContext)
+            let timing = lastKeyboardObservationTiming
+            let observedAt = timing?.finished ?? Date()
+            var textEvidence: [DiagnosticTextEvidence] = []
+            if let rawText = acknowledgedState.rawText {
+                textEvidence.append(DiagnosticTextEvidence(
+                    kind: .axValue, source: .observed, text: rawText,
+                    revision: UInt64(acknowledgementContext?.fields["revision"] ?? ""),
+                    operationID: acknowledgementContext.map { String($0.operationID) },
+                    targetApplicationBundleIdentifier: targetApplicationBundleIdentifier,
+                    targetApplicationProcessID: targetApplicationProcessID.map { Int32($0) },
+                    editorIdentity: targetElementObservationID,
+                    selectionLocationUTF16: acknowledgedState.selection.location,
+                    selectionLengthUTF16: acknowledgedState.selection.length,
+                    requestedAt: timing?.requested, readStartedAt: timing?.started, readFinishedAt: timing?.finished,
+                    observedAt: observedAt,
+                    monotonicMilliseconds: timing?.monotonicMilliseconds
+                ))
+            }
+            if acknowledgedState.mapping?.source == .axStringForRange {
+                textEvidence.append(DiagnosticTextEvidence(
+                    kind: .axStringForRange, source: .observed, text: acknowledgedState.text,
+                    revision: UInt64(acknowledgementContext?.fields["revision"] ?? ""),
+                    operationID: acknowledgementContext.map { String($0.operationID) },
+                    targetApplicationBundleIdentifier: targetApplicationBundleIdentifier,
+                    targetApplicationProcessID: targetApplicationProcessID.map { Int32($0) },
+                    editorIdentity: targetElementObservationID,
+                    selectionLocationUTF16: acknowledgedState.selection.location,
+                    selectionLengthUTF16: acknowledgedState.selection.length,
+                    requestedAt: timing?.requested, readStartedAt: timing?.started, readFinishedAt: timing?.finished,
+                    observedAt: observedAt,
+                    monotonicMilliseconds: timing?.monotonicMilliseconds
+                ))
+            }
+            recordDiagnostic("keyboard_write_acknowledged", mergedAcknowledgementFields,
+                context: acknowledgementContext, textEvidence: textEvidence)
         } catch {
             let evidence: [String: String] = [
                 "elapsedMilliseconds": String((writeTiming.now() - start) / 1_000_000),
@@ -1800,7 +1991,26 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             let mergedFailureFields = evidence
                 .merging(failureFields) { _, new in new }
                 .merging(failureEvidence) { _, new in new }
-            recordDiagnostic("keyboard_write_unconfirmed", mergedFailureFields, context: acknowledgementContext)
+            let textEvidence = lastObservedState.flatMap { observed -> [DiagnosticTextEvidence]? in
+                guard let rawText = observed.rawText else { return nil }
+                return [DiagnosticTextEvidence(
+                    kind: .axValue, source: .observed, text: rawText,
+                    revision: UInt64(acknowledgementContext?.fields["revision"] ?? ""),
+                    operationID: acknowledgementContext.map { String($0.operationID) },
+                    targetApplicationBundleIdentifier: targetApplicationBundleIdentifier,
+                    targetApplicationProcessID: targetApplicationProcessID.map { Int32($0) },
+                    editorIdentity: targetElementObservationID,
+                    selectionLocationUTF16: observed.selection.location,
+                    selectionLengthUTF16: observed.selection.length,
+                    requestedAt: lastKeyboardObservationTiming?.requested,
+                    readStartedAt: lastKeyboardObservationTiming?.started,
+                    readFinishedAt: lastKeyboardObservationTiming?.finished,
+                    observedAt: lastKeyboardObservationTiming?.finished,
+                    monotonicMilliseconds: lastKeyboardObservationTiming?.monotonicMilliseconds
+                )]
+            } ?? []
+            recordDiagnostic("keyboard_write_unconfirmed", mergedFailureFields,
+                context: acknowledgementContext, textEvidence: textEvidence)
             pendingKeyboardDiagnosticOperation = nil
             pendingKeyboardRepresentationTransition = nil
             pendingKeyboardRawInsertionRegion = nil
@@ -2589,16 +2799,16 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         do {
             return try readKeyboardDocumentState(in: element, confirming: confirming)
         } catch let failure as AXAttributeReadFailure {
-            // kAXErrorInvalidUIElement is -25202: the AX handle is stale,
-            // even when the focus read still returned the same handle. Obtain
-            // the focused editor again, then let the bounded read loop confirm
-            // its full document and caret. Never resend the pending write.
+            // kAXErrorInvalidUIElement is -25202. A transient failure on the
+            // same focused AX element can be retried, but a newly created AX
+            // element has no stable editor identity and cannot inherit the
+            // previous position just because its text looks the same.
             if isSafariWebEditor, failure.status == AXError.invalidUIElement.rawValue,
                [kAXValueAttribute as String, kAXSelectedTextRangeAttribute as String].contains(failure.attribute) {
                 try ensureTargetApplicationIsFrontmost()
                 let focused = try focusedElement()
                 if !CFEqual(focused, element) {
-                    try reacquireSafariTarget(focused, phase: "invalid_element_read")
+                    try rejectSafariTargetRebuild(focused, phase: "invalid_element_read")
                 }
                 recordDiagnostic("safari_keyboard_invalid_element_retry", [
                     "axAttribute": failure.attribute,
@@ -2613,7 +2823,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
 
     private func readKeyboardDocumentState(in element: AXUIElement, confirming: Bool) throws -> KeyboardDocumentState {
         lastKeyboardReadUsedStructuralFallback = false
-        guard let rawText = try access.text(in: element),
+        guard let rawText = try readTextEvidence(.axValue, read: { try access.text(in: element) }),
               let selection = try access.selection(in: element) else {
             throw KeyboardDocumentStateReadError.unavailable
         }
@@ -2886,12 +3096,45 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         }
     }
 
-    private func setSelection(_ range: TextRange, on element: AXUIElement) throws {
-        let status = try access.setSelection(range, on: element)
+    @discardableResult
+    private func setSelection(_ range: TextRange, on element: AXUIElement) throws -> String {
+        let requestID = UUID().uuidString
+        let requestMonotonicNanoseconds = DispatchTime.now().uptimeNanoseconds
+        recordDiagnostic("ax_selected_text_range_set_requested", [
+            "axSelectionRequestID": requestID,
+            "requestedLocation": String(range.location),
+            "requestedLength": String(range.length),
+            "requestMonotonicNanoseconds": String(requestMonotonicNanoseconds)
+        ])
+        let status: Int32
+        do {
+            status = try access.setSelection(range, on: element)
+        } catch {
+            recordDiagnostic("ax_selected_text_range_set_threw", [
+                "axSelectionRequestID": requestID,
+                "requestedLocation": String(range.location),
+                "requestedLength": String(range.length),
+                "requestMonotonicNanoseconds": String(requestMonotonicNanoseconds),
+                "returnMonotonicNanoseconds": String(DispatchTime.now().uptimeNanoseconds),
+                "errorCode": DiagnosticErrorFormatter.code(for: error)
+            ])
+            throw error
+        }
+        let returnMonotonicNanoseconds = DispatchTime.now().uptimeNanoseconds
+        recordDiagnostic("ax_selected_text_range_set_returned", [
+            "axSelectionRequestID": requestID,
+            "requestedLocation": String(range.location),
+            "requestedLength": String(range.length),
+            "requestMonotonicNanoseconds": String(requestMonotonicNanoseconds),
+            "returnMonotonicNanoseconds": String(returnMonotonicNanoseconds),
+            "callDurationNanoseconds": String(returnMonotonicNanoseconds - requestMonotonicNanoseconds),
+            "apiStatus": String(status)
+        ])
         guard status == AXError.success.rawValue else {
             recordDiagnostic("ax_write_failed", ["status": String(status), "writeKind": "selection"])
             throw TextTargetError.writeFailed
         }
+        return requestID
     }
 
     private func selectedTextIsSettable(on element: AXUIElement) -> Bool {
@@ -2912,20 +3155,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         let currentElement = try focusedElement()
         guard CFEqual(currentElement, targetElement) else {
             if isSafariWebEditor {
-                try reacquireSafariTarget(currentElement, phase: "identity_check")
-                guard let expectedState = currentConfirmedKeyboardState(),
-                      let currentState = try? keyboardDocumentState(in: currentElement),
-                      currentState.compare(
-                          to: expectedState,
-                          allowingStructuralRawDifference: false
-                      ) == .matched else {
-                    recordDiagnostic("safari_keyboard_target_reacquire_rejected", [
-                        "phase": "identity_check",
-                        "reason": "document_mismatch"
-                    ])
-                    throw TextTargetError.targetChanged
-                }
-                return
+                try rejectSafariTargetRebuild(currentElement, phase: "identity_check")
             }
             recordDiagnostic("keyboard_focus_changed")
             invalidateKeyboardRawInsertionRegion()
@@ -2935,7 +3165,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     }
 
     private func ensureActiveInputStrategyIsStillApplicable(for element: AXUIElement) throws {
-        guard activeInputStrategy.suppressesAXReplacement else { return }
+        guard activeInputStrategy.suppressesAXReplacement || isSafariWebEditor else { return }
         let currentStrategy = AXTextInputStrategy.select(
             application: access.currentApplication(),
             context: access.textInputContext(for: element)
@@ -2972,21 +3202,32 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         }
     }
 
-    private func reacquireSafariTarget(_ element: AXUIElement, phase: String) throws {
-        guard isSafariWebEditor,
-              access.isProseMirrorEditor(element) else {
-            recordDiagnostic("safari_keyboard_target_reacquire_rejected", [
-                "phase": phase,
-                "reason": "not_prose_mirror_editor"
-            ])
-            throw TextTargetError.targetChanged
-        }
-        targetElement = element
-        targetProcessID = access.processIdentifier(of: element) ?? targetProcessID
-        recordDiagnostic("safari_keyboard_target_reacquired", [
+    private func rejectSafariTargetRebuild(_ element: AXUIElement, phase: String) throws -> Never {
+        recordDiagnostic("safari_keyboard_target_reacquire_rejected", [
             "phase": phase,
-            "targetApplicationUnchanged": "true"
+            "reason": "stable_editor_identity_unavailable",
+            "sameApplication": String(access.currentApplication()?.bundleIdentifier == "com.apple.Safari")
         ])
+        invalidateKeyboardRawInsertionRegion()
+        throw TextTargetError.targetChanged
+    }
+
+    private func isEligibleSafariWebEditor(
+        _ element: AXUIElement,
+        application: TextTargetApplication?,
+        context: AXTextInputTargetContext?
+    ) -> Bool {
+        guard application?.bundleIdentifier == "com.apple.Safari" else { return false }
+        guard context?.isReadOnly != true, context?.isSecure != true else { return false }
+        if access.isProseMirrorEditor(element) { return true }
+        guard let context,
+              context.role == "AXTextArea",
+              context.ancestorScanStatus == .webArea,
+              context.isReadOnly == false,
+              context.isSecure == false else {
+            return false
+        }
+        return true
     }
 
     private func ensureKeyboardTargetIsSafe() throws {
@@ -3081,6 +3322,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             return .ownWriteInFlight
         }
         let currentState: KeyboardDocumentState
+        let requestedAt = Date()
+        let monotonic = writeTiming.now() / 1_000_000
         do {
             currentState = try KeyboardWriteAcknowledgement.readObservation {
                 try keyboardDocumentState(in: currentElement)
@@ -3103,6 +3346,16 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             throw TextTargetError.targetChanged
         }
         let comparison = keyboardStateComparison(currentState, expected: expectedState)
+        if comparison != .matched {
+            recordDiagnostic("keyboard_state_change_observed", [
+                "comparison": comparison.rawValue,
+                "cause": "unknown",
+                "previousSelectionLocation": String(expectedState.selection.location),
+                "currentSelectionLocation": String(currentState.selection.location),
+                "productionClassification": "external_edit_inference_not_user_action_proof"
+            ], textEvidence: documentEvidence(currentState, requested: requestedAt,
+                                               started: requestedAt, monotonic: monotonic))
+        }
         guard comparison != .rawMappingUnavailable else {
             invalidateKeyboardRawInsertionRegion()
             recordDiagnostic("keyboard_user_edit_ambiguous", ["reason": "mapping_unavailable"])
@@ -3299,7 +3552,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     ) throws -> AXTextDocumentState {
         let probe = AXTextCoordinateProbe { [weak self] range in
             guard let self else { return nil }
-            return try self.access.coordinateText(for: range, in: element)
+            return try self.readTextEvidence(.axStringForRange, fields: [
+                "requestedRangeLocationUTF16": String(range.location),
+                "requestedRangeLengthUTF16": String(range.length)
+            ]) { try self.access.coordinateText(for: range, in: element) }
         }
         return try AXTextDocumentResolver.resolve(
             rawText: rawText,

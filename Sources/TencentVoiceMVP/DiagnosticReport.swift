@@ -83,6 +83,61 @@ struct DiagnosticAppInfo: Codable, Equatable, Sendable {
     let signatureDetails: String
 }
 
+enum DiagnosticReportTime {
+    static func format(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+}
+
+struct DiagnosticReportWindow: Codable, Equatable, Sendable {
+    let requestID: UUID?
+    let requestedAt: Date
+    let requestedAtMonotonicNanoseconds: UInt64?
+    let startAt: Date
+    let captureStartedAt: Date?
+    let captureEnabled: Bool
+    let coverageStatus: String
+    let omittedRecordCount: Int?
+
+    init(
+        requestedAt: Date,
+        startAt: Date,
+        captureStartedAt: Date?,
+        captureEnabled: Bool,
+        omittedRecordCount: Int? = 0,
+        requestID: UUID? = nil,
+        requestedAtMonotonicNanoseconds: UInt64? = nil
+    ) {
+        self.requestID = requestID
+        self.requestedAt = requestedAt
+        self.requestedAtMonotonicNanoseconds = requestedAtMonotonicNanoseconds
+        self.startAt = startAt
+        self.captureStartedAt = captureStartedAt
+        self.captureEnabled = captureEnabled
+        self.omittedRecordCount = omittedRecordCount
+        if !captureEnabled {
+            coverageStatus = "采集未开启；仅包含点击时仍可取得的窗口内记录"
+        } else if let captureStartedAt, captureStartedAt > startAt {
+            coverageStatus = "采集在窗口中途开启；更早部分未采集"
+        } else if captureStartedAt == nil {
+            coverageStatus = "采集起点未知；已按请求前60秒筛选，不能保证窗口完整"
+        } else {
+            coverageStatus = "按请求前60秒筛选；窗口外证据不纳入"
+        }
+    }
+}
+
+struct DiagnosticReportStageTimings: Codable, Equatable, Sendable {
+    let snapshotMilliseconds: Double?
+    let recoveryMilliseconds: Double?
+    let assemblyMilliseconds: Double?
+    let encodingMilliseconds: Double?
+    let writingMilliseconds: Double?
+    let measurementPass: String?
+}
+
 struct DiagnosticReport: Codable, Equatable, Sendable {
     let schemaVersion: Int
     let generatedAt: Date
@@ -93,16 +148,41 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
     let events: [SessionLogEntry]
     let logDirectoryPath: String
     let findings: [DiagnosticFinding]
+    let window: DiagnosticReportWindow?
+    let recoveryMetrics: DiagnosticEventRecoveryMetrics?
+    let stageTimings: DiagnosticReportStageTimings?
+
+    func replacingStageTimings(_ stageTimings: DiagnosticReportStageTimings) -> Self {
+        Self(copying: self, stageTimings: stageTimings)
+    }
+
+    private init(copying report: Self, stageTimings: DiagnosticReportStageTimings?) {
+        schemaVersion = report.schemaVersion
+        generatedAt = report.generatedAt
+        app = report.app
+        permissions = report.permissions
+        credentials = report.credentials
+        settings = report.settings
+        events = report.events
+        logDirectoryPath = report.logDirectoryPath
+        findings = report.findings
+        window = report.window
+        recoveryMetrics = report.recoveryMetrics
+        self.stageTimings = stageTimings
+    }
 
     init(
-        schemaVersion: Int = 1,
+        schemaVersion: Int = 3,
         generatedAt: Date = Date(),
         app: DiagnosticAppInfo,
         permissions: PrivacyPermissionReport,
         credentials: DiagnosticCredentialInfo,
         settings: DiagnosticSettingsInfo,
         events: [SessionLogEntry],
-        logDirectoryPath: String
+        logDirectoryPath: String,
+        window: DiagnosticReportWindow? = nil,
+        recoveryMetrics: DiagnosticEventRecoveryMetrics? = nil,
+        stageTimings: DiagnosticReportStageTimings? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.generatedAt = generatedAt
@@ -112,6 +192,9 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
         self.settings = settings
         self.events = events
         self.logDirectoryPath = logDirectoryPath
+        self.window = window
+        self.recoveryMetrics = recoveryMetrics
+        self.stageTimings = stageTimings
         findings = Self.makeFindings(
             app: app,
             permissions: permissions,
@@ -144,6 +227,31 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
             "【权限状态】"
         ]
 
+        if let window {
+            lines += [
+                "",
+                "【取证范围】",
+                "请求时刻：\(Self.format(window.requestedAt))",
+                "窗口起点：\(Self.format(window.startAt))",
+                "采集开始：\(Self.formatOptional(window.captureStartedAt))",
+                "覆盖状态：\(window.coverageStatus)",
+                "遗漏记录数：\(window.omittedRecordCount.map(String.init) ?? "未知")"
+            ]
+        }
+        if let recoveryMetrics {
+            lines += [
+                "扫描文件：\(recoveryMetrics.filesConsidered)（实际读取 \(recoveryMetrics.filesRead)）",
+                "读取字节：\(recoveryMetrics.bytesRead)，解码记录：\(recoveryMetrics.recordsDecoded)，恢复记录：\(recoveryMetrics.recordsRecovered)",
+                "恢复缺失数：\(recoveryMetrics.missingRecordCount.map(String.init) ?? "未知")"
+            ]
+        }
+        if let stageTimings {
+            lines.append("阶段耗时（毫秒）：快照 \(stageTimings.snapshotMilliseconds.map { String(format: "%.2f", $0) } ?? "未知")；恢复 \(stageTimings.recoveryMilliseconds.map { String(format: "%.2f", $0) } ?? "未知")；组装 \(stageTimings.assemblyMilliseconds.map { String(format: "%.2f", $0) } ?? "未知")；编码 \(stageTimings.encodingMilliseconds.map { String(format: "%.2f", $0) } ?? "未知")；写入 \(stageTimings.writingMilliseconds.map { String(format: "%.2f", $0) } ?? "未知")")
+            if let measurementPass = stageTimings.measurementPass {
+                lines.append("最终编码与写入实测耗时记录在同一请求 ID 的报告保存事件中；该事件发生在报告快照之后，不包含在本报告内。\(measurementPass)")
+            }
+        }
+
         for status in permissions.statuses {
             lines.append("\(status.permission.title)：\(status.detail)")
         }
@@ -171,11 +279,11 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
 
         lines += [
             "",
-            "【会话与诊断事件】",
-            "以下内容包含会话状态、错误代码和操作上下文，不包含密钥、录音或识别正文。"
+            "【会话、正文证据与诊断事件】",
+            "正文证据来自本次语音会话及目标输入框；来源和状态分别标记为观测、预期、推断或未知。"
         ]
         if events.isEmpty {
-            lines.append("没有可用的日志事件。请开启“自动保存诊断日志”后复现一次，再点击“导出诊断报告”。")
+            lines.append("没有可用的诊断事件；请在复现前开启“输入失败上下文”，并在同一语音会话中报告问题。")
         } else {
             for event in events {
                 lines.append(Self.render(event))
@@ -184,8 +292,8 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
 
         lines += [
             "",
-            "【隐私说明】",
-            "本报告不包含 AppID、SecretId、SecretKey、录音、识别文字或输入框原文。"
+            "【采集说明】",
+            "本报告严格只包含点击前60秒内的采集记录；窗口内识别和目标输入框正文按原样完整保留。窗口内未出现的会话首条识别、最后成功写入或最终 Safe Copy，不能据此判断它在窗口外还是截止点击时尚未发生。报告不包含录音或凭据。"
         ]
         return lines.joined(separator: "\n") + "\n"
     }
@@ -255,20 +363,20 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
                 "keyboard_write_unconfirmed": "发送后的正文或选区未在确认期限内匹配；未报告成功、回滚或补发文字。",
                 "keyboard_focus_changed": "键盘输入期间焦点元素发生变化，已停止输入。",
                 "keyboard_confirmed_state_changed": "确认后的正文、选区或 AX 结构发生变化；未盲目重发，等待安全处理。",
-                "keyboard_user_edit_detected": "录音期间检测到当前 Codex 输入框被用户编辑；已固定旧语音内容并重新建立输入边界。",
+                "keyboard_user_edit_detected": "观测到输入框正文或选区变化；旧事件名表示程序将其推断为外部编辑，不证明用户操作。光标变化原因尚未知。",
                 "keyboard_user_edit_ambiguous": "录音期间输入框变化无法确认是可安全接续的用户编辑，已暂停写入。",
                 "keyboard_user_edit_read_failed": "录音期间无法可靠读回输入框变化，已暂停写入。",
-                "keyboard_state_rebased_after_user_edit": "已采用用户编辑后的正文和选区作为新的语音输入起点。",
+                "keyboard_state_rebased_after_user_edit": "程序已采用变化后的正文和选区作为新起点；事件名称不证明变化由用户造成。",
                 "input_application_changed": "前台应用发生变化，已停止输入。",
                 "ax_focus_changed": "AX 文本更新期间焦点元素发生变化。",
                 "ax_document_mismatch": "AX 读回文本与预期不符；请结合上次写入返回码判断，可能涉及写入未生效、回滚、读回延迟或外部编辑。",
                 "ax_selection_mismatch": "AX 光标或文本替换范围不符合预期。",
                 "ax_selection_unreadable": "无法取得有效的 AX 光标范围。",
                 "ax_value_unreadable": "AX 未提供可读取的文本值。",
-                "ax_coordinate_mapping_resolved": "已使用 AX 坐标文本确认当前输入框状态；报告只记录长度和映射来源，不记录正文。",
+                "ax_coordinate_mapping_resolved": "已使用 AX 坐标文本建立映射；完整正文见关联证据。旧报告未采集的正文无法补回。",
                 "ax_coordinate_mapping_retryable": "AXValue 暂时落后于已前进的选区，确认器按既有确认上限重读；未重复发送文字。",
                 "ax_coordinate_mapping_failed": "AX 文本与选区坐标无法安全统一，已停止继续写入；具体原因和长度信息已记录。",
-                "mixed_input_rebased": "用户编辑后已冻结旧语音投影，并从当前光标继续输入新的语音内容。",
+                "mixed_input_rebased": "程序按外部编辑推断冻结了旧语音投影；该推断不证明用户确实操作了输入框。",
                 "mixed_input_ambiguous": "识别修订跨越了已冻结的语音边界，未猜测新旧内容，已暂停自动写入。",
                 "ax_write_failed": "AX 写入接口返回失败，具体属性和返回码已记录。",
                 "ax_read_failed": "AX 读取接口返回失败，具体属性和返回码已记录。",
@@ -457,7 +565,36 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
             }.joined(separator: ",")
             fields.append("metadata=\(metadata)")
         }
-        return fields.joined(separator: " | ")
+        var rendered = fields.joined(separator: " | ")
+        for evidence in event.textEvidence {
+            let label = evidence.kind.reportTitle
+            rendered += "\n    正文证据[\(label)/\(evidence.source.reportTitle)] UTF16=\(evidence.text.utf16.count)"
+            if let revision = evidence.revision { rendered += " revision=\(revision)" }
+            if let operationID = evidence.operationID { rendered += " operation=\(operationID)" }
+            if let location = evidence.selectionLocationUTF16 {
+                rendered += " selection=\(location)+\(evidence.selectionLengthUTF16 ?? 0)"
+            }
+            rendered += "\n    原文：\(evidence.text)"
+            rendered += "\n    转义视图：\(escapedUnicode(evidence.text))"
+            if let observedAt = evidence.observedAt { rendered += "\n    观测时间：\(format(observedAt))" }
+            if let requestedAt = evidence.requestedAt { rendered += "\n    请求时间：\(format(requestedAt))" }
+            if let readStartedAt = evidence.readStartedAt { rendered += "\n    读取开始：\(format(readStartedAt))" }
+            if let readFinishedAt = evidence.readFinishedAt { rendered += "\n    读取结束：\(format(readFinishedAt))" }
+            if let elapsed = evidence.monotonicMilliseconds { rendered += "\n    单调时钟：\(elapsed)ms" }
+        }
+        return rendered
+    }
+
+    private static func escapedUnicode(_ text: String) -> String {
+        text.unicodeScalars.map { scalar in
+            switch scalar.value {
+            case 0x0000...0x001F, 0x007F...0x009F, 0x200B...0x200F, 0x2028...0x202E,
+                 0x2060...0x206F, 0xFEFF:
+                return String(format: "\\u{%04X}", scalar.value)
+            default:
+                return String(scalar)
+            }
+        }.joined()
     }
 
     private static func diagnosticDetails(_ event: SessionLogEntry) -> String {
@@ -552,6 +689,7 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
     }
 
     private static func safeFailureMessage(for event: SessionLogEntry) -> String? {
+        if let message = event.failureMessage, !message.isEmpty { return message }
         guard let code = event.failureCode else { return nil }
         return DiagnosticErrorFormatter.canonicalMessage(for: code)
     }
@@ -590,22 +728,139 @@ final class DiagnosticReportBuilder {
         self.suppliedAppInfo = appInfo
     }
 
-    func build(events: [SessionLogEntry]? = nil) -> DiagnosticReport {
+    func build(
+        events: [SessionLogEntry]? = nil,
+        requestedAt: Date = Date(),
+        captureStartedAt: Date? = nil,
+        captureEnabled: Bool = true,
+        recoveryMetrics: DiagnosticEventRecoveryMetrics? = nil,
+        stageTimings: DiagnosticReportStageTimings? = nil,
+        omittedRecordCount: Int? = 0,
+        requestID: UUID? = nil,
+        requestedAtMonotonicNanoseconds: UInt64? = nil
+    ) -> DiagnosticReport {
+        let inputs = captureInputs(
+            events: events,
+            requestedAt: requestedAt,
+            captureStartedAt: captureStartedAt,
+            captureEnabled: captureEnabled,
+            recoveryMetrics: recoveryMetrics,
+            stageTimings: stageTimings,
+            omittedRecordCount: omittedRecordCount,
+            requestID: requestID,
+            requestedAtMonotonicNanoseconds: requestedAtMonotonicNanoseconds
+        )
+        let app = suppliedAppInfo ?? AppRuntimeInspector.inspect(inputs.runtimeMetadata)
+        return Self.assemble(inputs, app: app)
+    }
+
+    func buildAsync(
+        events: [SessionLogEntry],
+        requestedAt: Date,
+        captureStartedAt: Date?,
+        captureEnabled: Bool,
+        recoveryMetrics: DiagnosticEventRecoveryMetrics,
+        stageTimings: DiagnosticReportStageTimings? = nil,
+        omittedRecordCount: Int? = 0,
+        requestID: UUID? = nil,
+        requestedAtMonotonicNanoseconds: UInt64? = nil
+    ) async -> DiagnosticReport {
+        let inputs = captureInputs(
+            events: events,
+            requestedAt: requestedAt,
+            captureStartedAt: captureStartedAt,
+            captureEnabled: captureEnabled,
+            recoveryMetrics: recoveryMetrics,
+            stageTimings: stageTimings,
+            omittedRecordCount: omittedRecordCount,
+            requestID: requestID,
+            requestedAtMonotonicNanoseconds: requestedAtMonotonicNanoseconds
+        )
+        let app: DiagnosticAppInfo
+        if let suppliedAppInfo {
+            app = suppliedAppInfo
+        } else {
+            app = await Task.detached(priority: .utility) {
+                AppRuntimeInspector.inspect(inputs.runtimeMetadata)
+            }.value
+        }
+        let assemblyStarted = DispatchTime.now().uptimeNanoseconds
+        let report = await Task.detached(priority: .utility) {
+            Self.assemble(inputs, app: app)
+        }.value
+        let assemblyMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - assemblyStarted) / 1_000_000
+        let previousTimings = inputs.stageTimings ?? DiagnosticReportStageTimings(
+            snapshotMilliseconds: nil,
+            recoveryMilliseconds: nil,
+            assemblyMilliseconds: nil,
+            encodingMilliseconds: nil,
+            writingMilliseconds: nil,
+            measurementPass: nil
+        )
+        return report.replacingStageTimings(DiagnosticReportStageTimings(
+            snapshotMilliseconds: previousTimings.snapshotMilliseconds,
+            recoveryMilliseconds: previousTimings.recoveryMilliseconds,
+            assemblyMilliseconds: assemblyMilliseconds,
+            encodingMilliseconds: previousTimings.encodingMilliseconds,
+            writingMilliseconds: previousTimings.writingMilliseconds,
+            measurementPass: previousTimings.measurementPass
+        ))
+    }
+
+    private func captureInputs(
+        events: [SessionLogEntry]?,
+        requestedAt: Date,
+        captureStartedAt: Date?,
+        captureEnabled: Bool,
+        recoveryMetrics: DiagnosticEventRecoveryMetrics?,
+        stageTimings: DiagnosticReportStageTimings?,
+        omittedRecordCount: Int?,
+        requestID: UUID?,
+        requestedAtMonotonicNanoseconds: UInt64?
+    ) -> DiagnosticReportBuildInputs {
+        let startAt = requestedAt.addingTimeInterval(-60)
+        let selectedEvents = events ?? logger.reportEventSnapshot(
+            at: requestedAt,
+            captureStartedAt: captureStartedAt
+        ).memoryEvents
         let settings = settingsStore.load()
-        let permissions = permissionChecker.report()
-        let credentials = credentialInfo()
-        return DiagnosticReport(
-            app: suppliedAppInfo ?? AppRuntimeInspector.inspect(),
-            permissions: permissions,
-            credentials: credentials,
+        return DiagnosticReportBuildInputs(
+            runtimeMetadata: AppRuntimeInspector.captureMetadata(),
+            permissions: permissionChecker.report(),
+            credentials: credentialInfo(),
             settings: DiagnosticSettingsInfo(
                 shortcut: ShortcutFormatter.string(for: settings.shortcut),
                 engineModelType: settings.engineModelType,
                 persistentSessionLogEnabled: settings.saveTextLogs,
                 safeCopyEnabled: settings.safeCopyEnabled
             ),
-            events: events ?? mergedEvents(),
-            logDirectoryPath: logger.persistenceDirectoryURL.path
+            events: selectedEvents,
+            logDirectoryPath: logger.persistenceDirectoryURL.path,
+            window: DiagnosticReportWindow(
+                requestedAt: requestedAt,
+                startAt: startAt,
+                captureStartedAt: captureStartedAt,
+                captureEnabled: captureEnabled,
+                omittedRecordCount: omittedRecordCount,
+                requestID: requestID,
+                requestedAtMonotonicNanoseconds: requestedAtMonotonicNanoseconds
+            ),
+            recoveryMetrics: recoveryMetrics,
+            stageTimings: stageTimings
+        )
+    }
+
+    private nonisolated static func assemble(_ inputs: DiagnosticReportBuildInputs, app: DiagnosticAppInfo) -> DiagnosticReport {
+        DiagnosticReport(
+            app: app,
+            permissions: inputs.permissions,
+            credentials: inputs.credentials,
+            settings: inputs.settings,
+            events: inputs.events.filter { $0.timestamp >= inputs.window.startAt && $0.timestamp <= inputs.window.requestedAt },
+            logDirectoryPath: inputs.logDirectoryPath,
+            window: inputs.window,
+            recoveryMetrics: inputs.recoveryMetrics,
+            stageTimings: inputs.stageTimings
         )
     }
 
@@ -623,45 +878,74 @@ final class DiagnosticReportBuilder {
         }
     }
 
-    private func mergedEvents() -> [SessionLogEntry] {
-        let candidates = logger.allPersistedEntries() + logger.recentEntries(limit: 300)
-        var seen = Set<String>()
-        let unique = candidates.filter { entry in
-            let key: String
-            if let eventID = entry.eventID {
-                key = "event:\(eventID.uuidString)"
-            } else {
-                let timestampMilliseconds = Int64((entry.timestamp.timeIntervalSince1970 * 1_000).rounded())
-                key = "legacy:\(entry.sessionID.uuidString)|\(timestampMilliseconds)|\(entry.event)|\(entry.sequence ?? -1)|\(entry.segmentID ?? -1)|\(entry.revision ?? 0)"
-            }
-            return seen.insert(key).inserted
-        }
-        return unique.sorted { $0.timestamp < $1.timestamp }
-    }
+}
+
+private struct DiagnosticReportBuildInputs: Sendable {
+    let runtimeMetadata: DiagnosticAppRuntimeMetadata
+    let permissions: PrivacyPermissionReport
+    let credentials: DiagnosticCredentialInfo
+    let settings: DiagnosticSettingsInfo
+    let events: [SessionLogEntry]
+    let logDirectoryPath: String
+    let window: DiagnosticReportWindow
+    let recoveryMetrics: DiagnosticEventRecoveryMetrics?
+    let stageTimings: DiagnosticReportStageTimings?
+
+}
+
+struct DiagnosticAppRuntimeMetadata: Sendable {
+    let displayName: String
+    let bundleIdentifier: String
+    let shortVersion: String
+    let build: String
+    let bundleURL: URL
+    let executablePath: String
+    let processIdentifier: Int32
+    let processLaunchDate: Date?
+    let currentUser: String
+    let operatingSystem: String
+    let machineArchitecture: String
 }
 
 enum AppRuntimeInspector {
     @MainActor
-    static func inspect() -> DiagnosticAppInfo {
+    static func captureMetadata() -> DiagnosticAppRuntimeMetadata {
         let info = Bundle.main.infoDictionary ?? [:]
         let runningApplication = NSRunningApplication.current
         let bundleURL = Bundle.main.bundleURL
         let executableURL = Bundle.main.executableURL
-        let attributes = try? FileManager.default.attributesOfItem(atPath: bundleURL.path)
-        let modificationDate = attributes?[.modificationDate] as? Date
-        return DiagnosticAppInfo(
+        return DiagnosticAppRuntimeMetadata(
             displayName: info["CFBundleDisplayName"] as? String ?? "未知",
             bundleIdentifier: info["CFBundleIdentifier"] as? String ?? "未知",
             shortVersion: info["CFBundleShortVersionString"] as? String ?? "未知",
             build: info["CFBundleVersion"] as? String ?? "未知",
-            bundlePath: bundleURL.path,
+            bundleURL: bundleURL,
             executablePath: executableURL?.path ?? "未知",
-            bundleModificationDate: modificationDate,
             processIdentifier: Int32(ProcessInfo.processInfo.processIdentifier),
             processLaunchDate: runningApplication.launchDate,
             currentUser: NSUserName(),
             operatingSystem: ProcessInfo.processInfo.operatingSystemVersionString,
-            machineArchitecture: machineArchitecture(),
+            machineArchitecture: machineArchitecture()
+        )
+    }
+
+    nonisolated static func inspect(_ metadata: DiagnosticAppRuntimeMetadata) -> DiagnosticAppInfo {
+        let bundleURL = metadata.bundleURL
+        let attributes = try? FileManager.default.attributesOfItem(atPath: bundleURL.path)
+        let modificationDate = attributes?[.modificationDate] as? Date
+        return DiagnosticAppInfo(
+            displayName: metadata.displayName,
+            bundleIdentifier: metadata.bundleIdentifier,
+            shortVersion: metadata.shortVersion,
+            build: metadata.build,
+            bundlePath: bundleURL.path,
+            executablePath: metadata.executablePath,
+            bundleModificationDate: modificationDate,
+            processIdentifier: metadata.processIdentifier,
+            processLaunchDate: metadata.processLaunchDate,
+            currentUser: metadata.currentUser,
+            operatingSystem: metadata.operatingSystem,
+            machineArchitecture: metadata.machineArchitecture,
             signatureVerified: SignatureInspector.verify(bundleURL: bundleURL),
             signatureDetails: SignatureInspector.details(bundleURL: bundleURL)
         )

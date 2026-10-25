@@ -131,7 +131,7 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertTrue(report.renderedText().contains("lastAXStatus=0"))
         let json = String(decoding: try DiagnosticJSON.encoder().encode(report), as: UTF8.self)
         XCTAssertTrue(json.contains("keyboard_caret_recovered"))
-        XCTAssertFalse(json.contains("PRIVATE_BODY"))
+        XCTAssertTrue(json.contains("PRIVATE_BODY"))
     }
 
     func testReportIncludesCoordinateDiagnosticsWithoutInputText() {
@@ -252,7 +252,7 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertTrue(text.contains("输入目标在识别过程中发生了变化"))
         XCTAssertTrue(text.contains("识别结果已经返回，但文本输入进入 safe_copy"))
         XCTAssertTrue(text.contains("target=Codex (com.openai.codex) pid=42"))
-        XCTAssertTrue(text.contains("不包含密钥、录音或识别正文"))
+        XCTAssertTrue(text.contains("窗口内识别和目标输入框正文按原样完整保留"))
         XCTAssertFalse(text.contains("我想吃苹果"))
     }
 
@@ -344,8 +344,7 @@ final class DiagnosticReportTests: XCTestCase {
             logger: reader,
             appInfo: appInfo()
         ).build()
-        XCTAssertEqual(disabledReport.events.count, 1)
-        XCTAssertEqual(disabledReport.events.first?.eventID, entry.eventID)
+        XCTAssertEqual(disabledReport.events.count, 0, "A newly created logger must report its collection gap instead of scanning old files")
 
         settingsStore.save(AppSettings(saveTextLogs: true))
         let enabledReport = DiagnosticReportBuilder(
@@ -360,7 +359,389 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertEqual(enabledReport.events.first?.failureCode, entry.failureCode)
     }
 
-    func testBuilderExportsAllPersistedEventsWithoutARecentEventCap() throws {
+    func testBuilderUsesOnlyTheMinuteBeforeBuildAndPreservesFullUnicodeEvidence() throws {
+        let testDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVP-DiagnosticReportWindow-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: testDirectory) }
+
+        let now = Date()
+        let outside = SessionLogEntry(
+            timestamp: now.addingTimeInterval(-60.001),
+            event: "outside_report_window",
+            textEvidence: [DiagnosticTextEvidence(kind: .axValue, source: .observed, text: "must-not-leak")]
+        )
+        let fullText = "e\u{301}\u{200B}😀\u{2028}保留完整正文"
+        let inside = SessionLogEntry(
+            timestamp: now.addingTimeInterval(-30),
+            event: "inside_report_window",
+            textEvidence: [
+                DiagnosticTextEvidence(kind: .rawRecognition, source: .observed, text: fullText),
+                DiagnosticTextEvidence(kind: .safeCopySucceeded, source: .observed, text: fullText)
+            ]
+        )
+        let boundary = SessionLogEntry(
+            timestamp: now.addingTimeInterval(-60),
+            event: "inclusive_window_start"
+        )
+        let logger = SessionLogger(enabled: { true }, applicationSupportDirectoryURL: testDirectory)
+        try logger.append(outside)
+        try logger.append(inside)
+        try logger.append(boundary)
+
+        let settingsStore = UserDefaultsSettingsStore(suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)")
+        let requestID = UUID()
+        let requestedAtMonotonicNanoseconds: UInt64 = 9_876_543
+        let report = DiagnosticReportBuilder(
+            permissionChecker: SystemPrivacyPermissionChecker(
+                microphoneStatus: { .authorized }, accessibilityStatus: { true },
+                postEventStatus: { true }, inputMonitoringStatus: { true }
+            ),
+            credentialStore: InMemoryCredentialStore(
+                TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+            ),
+            settingsStore: settingsStore,
+            logger: logger,
+            appInfo: appInfo()
+        ).build(
+            requestedAt: now,
+            requestID: requestID,
+            requestedAtMonotonicNanoseconds: requestedAtMonotonicNanoseconds
+        )
+
+        XCTAssertEqual(report.events.map(\.event), ["inclusive_window_start", "inside_report_window"])
+        XCTAssertEqual(report.events[1].textEvidence.map(\.text), [fullText, fullText])
+        XCTAssertEqual(report.schemaVersion, 3)
+        XCTAssertEqual(report.window?.requestID, requestID)
+        XCTAssertEqual(report.window?.requestedAtMonotonicNanoseconds, requestedAtMonotonicNanoseconds)
+    }
+
+    func testEventSnapshotRecoversEvictedTextFromOnlyReferencedFileRanges() throws {
+        let support = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVP-DiagnosticSnapshot-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let historyDirectory = support.appendingPathComponent("TencentVoiceMVP/sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: historyDirectory, withIntermediateDirectories: true)
+        try Data(repeating: 0x78, count: 2 * 1024 * 1024)
+            .write(to: historyDirectory.appendingPathComponent("2001-01-01.jsonl"))
+
+        let now = Date()
+        let logger = SessionLogger(
+            enabled: { true },
+            applicationSupportDirectoryURL: support,
+            failureContextEventLimit: 1
+        )
+        logger.setFailureContextEnabled(true)
+        let body = "e\u{301}\u{200B}😀\u{2028}完整恢复"
+        let evicted = SessionLogEntry(timestamp: now.addingTimeInterval(-20), event: "evicted", textEvidence: [
+            DiagnosticTextEvidence(kind: .rawRecognition, source: .observed, text: body),
+            DiagnosticTextEvidence(kind: .axValue, source: .observed, text: body)
+        ])
+        let retained = SessionLogEntry(timestamp: now.addingTimeInterval(-10), event: "retained")
+        try logger.append(evicted)
+        try logger.append(retained)
+
+        let result = logger.reportEventSnapshot(at: Date()).recoverPersistedEvents()
+        XCTAssertEqual(result.events.map(\.event), ["evicted", "retained", "diagnostic_events_omitted"])
+        XCTAssertEqual(result.events[0].textEvidence.map(\.text), [body, body])
+        XCTAssertEqual(result.metrics.filesConsidered, 1)
+        XCTAssertEqual(result.metrics.filesRead, 1)
+        XCTAssertLessThan(result.metrics.bytesRead, 20_000)
+        XCTAssertEqual(result.metrics.recordsRecovered, 2)
+    }
+
+    func testPreWindowMetadataReportsRemainDecodable() throws {
+        let legacy = DiagnosticReport(
+            schemaVersion: 2,
+            app: appInfo(),
+            permissions: PrivacyPermissionReport(statuses: []),
+            credentials: DiagnosticCredentialInfo(state: .configured, detail: "configured"),
+            settings: DiagnosticSettingsInfo(shortcut: "test", engineModelType: "test", persistentSessionLogEnabled: true),
+            events: [],
+            logDirectoryPath: "/tmp/logs"
+        )
+        let encoded = try DiagnosticJSON.encoder().encode(legacy)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "window")
+        object.removeValue(forKey: "recoveryMetrics")
+        object.removeValue(forKey: "stageTimings")
+        let decoded = try DiagnosticJSON.decoder().decode(
+            DiagnosticReport.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+
+        XCTAssertEqual(decoded.schemaVersion, 2)
+        XCTAssertNil(decoded.window)
+        XCTAssertNil(decoded.recoveryMetrics)
+        XCTAssertNil(decoded.stageTimings)
+    }
+
+    func testSnapshotDoesNotMixRecordsAppendedAfterTheClickCutoff() throws {
+        let support = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVP-DiagnosticSnapshotBoundary-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let logger = SessionLogger(enabled: { true }, applicationSupportDirectoryURL: support)
+        let beforeEventAt = Date()
+        try logger.append(SessionLogEntry(timestamp: beforeEventAt, event: "before_click"))
+        let click = Date()
+        let snapshot = logger.reportEventSnapshot(at: click)
+        try logger.append(SessionLogEntry(timestamp: click.addingTimeInterval(-0.5), event: "appended_after_click"))
+
+        let result = snapshot.recoverPersistedEvents()
+        XCTAssertEqual(result.events.map(\.event), ["before_click"])
+        XCTAssertEqual(result.metrics.recordsDecoded, 1)
+    }
+
+    func testSnapshotReportsReplacedEvidenceFileAsMissing() throws {
+        let support = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVP-DiagnosticSnapshotReplaced-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let logger = SessionLogger(
+            enabled: { true },
+            applicationSupportDirectoryURL: support,
+            failureContextEventLimit: 1
+        )
+        logger.setFailureContextEnabled(true)
+        let now = Date()
+        try logger.append(SessionLogEntry(timestamp: now.addingTimeInterval(-10), event: "evicted_and_missing"))
+        try logger.append(SessionLogEntry(timestamp: now.addingTimeInterval(-5), event: "retained_in_memory"))
+        let snapshot = logger.reportEventSnapshot(at: Date())
+        let reference = try XCTUnwrap(snapshot.fileReferences.first)
+        try Data("replaced after snapshot".utf8).write(to: reference.fileURL, options: .atomic)
+
+        let result = snapshot.recoverPersistedEvents()
+        XCTAssertEqual(result.events.map(\.event), ["retained_in_memory", "diagnostic_events_omitted"])
+        XCTAssertEqual(result.metrics.filesRead, 0)
+        XCTAssertEqual(result.metrics.missingRecordCount, 1)
+        XCTAssertTrue(result.metrics.failureReasons.contains { $0.hasPrefix("file_replaced_or_truncated:") })
+    }
+
+    func testSnapshotDoesNotDoubleCountAnEventMissingFromBothMemoryAndDiskIndex() {
+        let eventID = UUID()
+        let sessionID = UUID()
+        let now = Date()
+        let evicted = DiagnosticEventEvictionReference(
+            timestamp: now.addingTimeInterval(-5), eventID: eventID,
+            sessionID: sessionID, event: "same_missing_event", sequence: 1,
+            indexedAt: now.addingTimeInterval(-5)
+        )
+        let snapshot = DiagnosticReportEventSnapshot(
+            requestedAt: now,
+            windowStart: now.addingTimeInterval(-60),
+            captureStartedAt: now.addingTimeInterval(-60),
+            memoryEvents: [],
+            pinnedEvidenceTruncated: false,
+            failureContextEvidenceTruncated: false,
+            fileReferences: [],
+            omittedReferenceKeys: [evicted.identityKey],
+            omissionIndexOverflowed: false,
+            evictedMemoryEvents: [evicted],
+            memoryEvictionCountUnknown: false
+        )
+
+        let result = snapshot.recoverPersistedEvents()
+
+        XCTAssertEqual(result.metrics.missingRecordCount, 1)
+    }
+
+    func testSnapshotExplainsUnknownMissingCountWhenOmissionIndexCapacityIsExceeded() {
+        let now = Date()
+        let snapshot = DiagnosticReportEventSnapshot(
+            requestedAt: now,
+            windowStart: now.addingTimeInterval(-60),
+            captureStartedAt: now.addingTimeInterval(-60),
+            memoryEvents: [],
+            pinnedEvidenceTruncated: false,
+            failureContextEvidenceTruncated: false,
+            fileReferences: [],
+            omittedReferenceKeys: [],
+            omissionIndexOverflowed: true,
+            evictedMemoryEvents: [],
+            memoryEvictionCountUnknown: false
+        )
+
+        let result = snapshot.recoverPersistedEvents()
+
+        XCTAssertNil(result.metrics.missingRecordCount)
+        XCTAssertTrue(result.metrics.failureReasons.contains("omitted_reference_index_capacity_exceeded"))
+    }
+
+    func testReportSnapshotUsesFailureContextCaptureStartInsteadOfProcessStart() {
+        let support = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVP-DiagnosticCaptureStart-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let logger = SessionLogger(enabled: { false }, applicationSupportDirectoryURL: support)
+        logger.setFailureContextEnabled(true)
+        let captureStartedAt = logger.failureContextRecordingStartedAt
+
+        let snapshot = logger.reportEventSnapshot(at: Date())
+
+        XCTAssertEqual(snapshot.captureStartedAt, captureStartedAt)
+    }
+
+    func testReportSnapshotMakesPinnedEvidenceCapacityLossExplicitWithinTheWindow() throws {
+        let support = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVP-PinnedEvidenceOverflow-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let logger = SessionLogger(
+            enabled: { false },
+            applicationSupportDirectoryURL: support,
+            failureContextEventLimit: 500
+        )
+        logger.setFailureContextEnabled(true)
+        let now = Date()
+        let anomaly = try XCTUnwrap(DiagnosticAnomaly.events.sorted().first)
+        for index in 0..<129 {
+            try logger.append(SessionLogEntry(
+                timestamp: now.addingTimeInterval(-30 + Double(index) / 10),
+                sessionID: UUID(),
+                event: anomaly
+            ))
+        }
+
+        let snapshot = logger.reportEventSnapshot(at: now)
+
+        XCTAssertTrue(snapshot.pinnedEvidenceTruncated)
+        let omission = try XCTUnwrap(snapshot.memoryEvents.first { $0.event == "diagnostic_session_pins_omitted" })
+        XCTAssertEqual(omission.metadata["omittedSessionCount"], "1")
+        XCTAssertEqual(omission.metadata["countScope"], "click_window")
+        XCTAssertFalse(logger.failureContextEventsTruncated)
+    }
+
+    @MainActor
+    func testDroppedPinnedEvidenceFromOutsideTheClickWindowIsExcluded() throws {
+        let logger = SessionLogger(enabled: { false }, failureContextEventLimit: 500)
+        logger.setFailureContextEnabled(true)
+        let now = Date()
+        let anomaly = try XCTUnwrap(DiagnosticAnomaly.events.sorted().first)
+        for index in 0..<129 {
+            try logger.append(SessionLogEntry(
+                timestamp: now.addingTimeInterval(-120 + Double(index) / 10),
+                sessionID: UUID(),
+                event: anomaly
+            ))
+        }
+
+        let snapshot = logger.reportEventSnapshot(at: now)
+
+        XCTAssertFalse(snapshot.pinnedEvidenceTruncated)
+        XCTAssertFalse(snapshot.memoryEvents.contains { $0.event == "diagnostic_session_pins_omitted" })
+    }
+
+    @MainActor
+    func testFailureContextEvictionIsReportedOnlyWhenItIntersectsTheClickWindow() throws {
+        let logger = SessionLogger(enabled: { false }, failureContextEventLimit: 2)
+        logger.setFailureContextEnabled(true)
+        let origin = Date()
+        for (offset, name) in [(0.0, "outside"), (70.0, "evicted_in_window"), (80.0, "keep_a"), (100.0, "keep_b")] {
+            try logger.append(SessionLogEntry(timestamp: origin.addingTimeInterval(offset), event: name))
+        }
+
+        let snapshot = logger.reportEventSnapshot(at: origin.addingTimeInterval(100))
+
+        XCTAssertTrue(snapshot.failureContextEvidenceTruncated)
+        let omission = try XCTUnwrap(snapshot.memoryEvents.first { $0.event == "diagnostic_events_omitted" })
+        XCTAssertEqual(omission.metadata["droppedEventCount"], "1")
+        XCTAssertEqual(omission.metadata["countScope"], "click_window")
+    }
+
+    @MainActor
+    func testFailureContextEvictionsOutsideTheClickWindowAreNotReportedAsCurrentLoss() throws {
+        let logger = SessionLogger(enabled: { false }, failureContextEventLimit: 1)
+        logger.setFailureContextEnabled(true)
+        let origin = Date()
+        for (offset, name) in [(0.0, "old_a"), (1.0, "old_b"), (2.0, "old_c")] {
+            try logger.append(SessionLogEntry(timestamp: origin.addingTimeInterval(offset), event: name))
+        }
+
+        let snapshot = logger.reportEventSnapshot(at: origin.addingTimeInterval(100))
+
+        XCTAssertFalse(snapshot.failureContextEvidenceTruncated)
+        XCTAssertFalse(snapshot.memoryEvents.contains { $0.event == "diagnostic_events_omitted" })
+    }
+
+    func testReportCaptureStartTracksPersistenceAvailabilityAndMarksUnknownStart() throws {
+        let support = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVP-DiagnosticPersistenceStart-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: support) }
+        var persistenceEnabled = false
+        let logger = SessionLogger(enabled: { persistenceEnabled }, applicationSupportDirectoryURL: support)
+
+        XCTAssertNil(logger.reportCaptureStartedAt)
+        XCTAssertEqual(DiagnosticReportWindow(
+            requestedAt: Date(), startAt: Date().addingTimeInterval(-60),
+            captureStartedAt: logger.reportCaptureStartedAt, captureEnabled: true
+        ).coverageStatus, "采集起点未知；已按请求前60秒筛选，不能保证窗口完整")
+
+        persistenceEnabled = true
+        let firstPersistedAt = Date()
+        try logger.append(SessionLogEntry(timestamp: firstPersistedAt, event: "first_persisted"))
+        XCTAssertEqual(logger.reportCaptureStartedAt, firstPersistedAt)
+
+        persistenceEnabled = false
+        try logger.append(SessionLogEntry(timestamp: Date(), event: "not_persisted"))
+        XCTAssertNil(logger.reportCaptureStartedAt)
+    }
+
+    func testAsyncReportAssemblyLeavesMainActorResponsiveForProgressUpdates() async {
+        let now = Date()
+        let sessionID = UUID()
+        let events = (0..<30_000).map { index in
+            SessionLogEntry(
+                timestamp: now.addingTimeInterval(-Double(index % 60)),
+                sessionID: sessionID,
+                event: "partial",
+                sequence: index,
+                renderedLength: 1
+            )
+        }
+        let loggerDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TencentVoiceMVP-ReportResponsiveness-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: loggerDirectory) }
+        let settingsStore = UserDefaultsSettingsStore(suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)")
+        let builder = DiagnosticReportBuilder(
+            permissionChecker: SystemPrivacyPermissionChecker(
+                microphoneStatus: { .authorized }, accessibilityStatus: { true },
+                postEventStatus: { true }, inputMonitoringStatus: { true }
+            ),
+            credentialStore: InMemoryCredentialStore(
+                TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+            ),
+            settingsStore: settingsStore,
+            logger: SessionLogger(enabled: { false }, applicationSupportDirectoryURL: loggerDirectory),
+            appInfo: appInfo()
+        )
+        let buildTask = Task.detached(priority: .userInitiated) {
+            await builder.buildAsync(
+                events: events,
+                requestedAt: now,
+                captureStartedAt: now.addingTimeInterval(-60),
+                captureEnabled: true,
+                recoveryMetrics: DiagnosticEventRecoveryMetrics()
+            )
+        }
+        let progressProbe = Task.detached(priority: .userInitiated) {
+            var maximumSchedulingMilliseconds = 0.0
+            for _ in 0..<100 {
+                let probeStarted = DispatchTime.now().uptimeNanoseconds
+                await MainActor.run {}
+                maximumSchedulingMilliseconds = max(
+                    maximumSchedulingMilliseconds,
+                    Double(DispatchTime.now().uptimeNanoseconds - probeStarted) / 1_000_000
+                )
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return maximumSchedulingMilliseconds
+        }
+
+        let report = await buildTask.value
+        let mainActorSchedulingMilliseconds = await progressProbe.value
+
+        XCTAssertEqual(report.events.count, events.count)
+        XCTAssertGreaterThan(report.stageTimings?.assemblyMilliseconds ?? 0, 100)
+        XCTAssertLessThan(mainActorSchedulingMilliseconds, 100)
+    }
+
+    func testBuilderExportsAllInWindowEventsWithoutARecentEventCap() throws {
         let testDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("TencentVoiceMVP-DiagnosticReportTests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: testDirectory) }
@@ -371,7 +752,7 @@ final class DiagnosticReportTests: XCTestCase {
         )
         for index in 0..<161 {
             try logger.append(SessionLogEntry(
-                timestamp: Date(timeIntervalSince1970: 1_700_000_000 + Double(index)),
+                timestamp: Date().addingTimeInterval(Double(index - 160)),
                 event: "session_event",
                 sequence: index
             ))
@@ -398,12 +779,12 @@ final class DiagnosticReportTests: XCTestCase {
             appInfo: appInfo()
         ).build()
 
-        XCTAssertEqual(report.events.count, 161)
-        XCTAssertEqual(report.events.first?.sequence, 0)
+        XCTAssertEqual(report.events.count, 60)
+        XCTAssertEqual(report.events.first?.sequence, 101)
         XCTAssertEqual(report.events.last?.sequence, 160)
     }
 
-    func testReportHidesUnrecognizedFailureMessages() {
+    func testReportPreservesFailureDetailsAndRemovesCredentialValues() {
         let report = DiagnosticReport(
             app: appInfo(),
             permissions: PrivacyPermissionReport(statuses: []),
@@ -422,7 +803,7 @@ final class DiagnosticReportTests: XCTestCase {
         )
 
         let text = report.renderedText()
-        XCTAssertTrue(text.contains("详细错误已隐藏"))
+        XCTAssertTrue(text.contains("SecretKey=[已移除凭据]"))
         XCTAssertFalse(text.contains("do-not-export"))
     }
 
@@ -475,8 +856,7 @@ final class DiagnosticReportTests: XCTestCase {
         )
 
         XCTAssertTrue(report.findings.contains { $0.code == "text_target_write_failed" })
-        XCTAssertTrue(report.renderedText().contains("无法写入当前输入框"))
-        XCTAssertFalse(report.renderedText().contains("不应直接信任"))
+        XCTAssertTrue(report.renderedText().contains("不应直接信任这段原始消息"))
     }
 
     func testReportRecognizesSafeCopyInLegacyFinishedEvent() {
@@ -580,7 +960,7 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertEqual(action.event, "connection_test_finished")
         XCTAssertEqual(action.metadata["engineModelType"], "16k_zh")
         XCTAssertEqual(action.metadata["errorCode"], "text_target_changed")
-        XCTAssertEqual(action.metadata["errorMessage"], "已隐藏")
+        XCTAssertEqual(action.metadata["errorMessage"], "SecretKey=[已移除凭据]")
     }
 
     func testLoggerMigratesLegacyInterruptedDiagnosticJournal() throws {

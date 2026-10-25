@@ -339,25 +339,30 @@ final class SessionCoordinator: SessionCoordinating {
     private func process(_ update: ASRUpdate, sessionID: UUID) {
         guard self.sessionID == sessionID else { return }
         guard state == .listening || state == .stopping || state == .recovering else { return }
+        let recognitionObservedAt = Date()
+        let recognitionMonotonic = TextInputDiagnosticClock.milliseconds()
         audioProgress?.receivedRecognitionUpdate()
         if update.isStreamEnded {
             asrStreamEnded = true
             if let projection = projectionAccumulator.apply(update) {
                 latestProjection = projection
                 injector?.apply(projection: projection)
-                log(event: "stream_ended", update: update, projection: projection)
+                log(event: "stream_ended", update: update, projection: projection,
+                    recognitionObservation: (recognitionObservedAt, recognitionMonotonic))
                 logDegradationIfNeeded(update: update, projection: projection)
             }
             return
         }
         guard let projection = projectionAccumulator.apply(update) else {
             discardCount += 1
-            log(event: "discarded", update: update, projection: latestProjection)
+            log(event: "discarded", update: update, projection: latestProjection,
+                recognitionObservation: (recognitionObservedAt, recognitionMonotonic))
             return
         }
         latestProjection = projection
         injector?.apply(projection: projection)
-        log(event: projection.isFinal ? "final" : "partial", update: update, projection: projection)
+        log(event: projection.isFinal ? "final" : "partial", update: update, projection: projection,
+            recognitionObservation: (recognitionObservedAt, recognitionMonotonic))
         logDegradationIfNeeded(update: update, projection: projection)
     }
 
@@ -557,6 +562,7 @@ final class SessionCoordinator: SessionCoordinating {
         failureCode: String? = nil,
         failureMessage: String? = nil,
         metadata: [String: String] = [:],
+        recognitionObservation: (Date, UInt64)? = nil,
         sessionID overrideSessionID: UUID? = nil
     ) {
         guard let sessionID = overrideSessionID ?? sessionID else { return }
@@ -594,8 +600,33 @@ final class SessionCoordinator: SessionCoordinating {
                 ? "lifecycle_event"
                 : "asr_event_or_following_update"
         }
+        var textEvidence: [DiagnosticTextEvidence] = []
+        if let update, !update.isStreamEnded {
+            textEvidence.append(DiagnosticTextEvidence(
+                kind: .rawRecognition,
+                source: .observed,
+                text: update.segmentText,
+                revision: projection?.revision,
+                targetApplicationBundleIdentifier: injector?.targetApplication?.bundleIdentifier,
+                targetApplicationProcessID: injector?.targetApplication?.processIdentifier,
+                observedAt: recognitionObservation?.0,
+                monotonicMilliseconds: recognitionObservation?.1
+            ))
+        }
+        if let projection {
+            textEvidence.append(DiagnosticTextEvidence(
+                kind: .processedRecognition,
+                source: .observed,
+                text: projection.text,
+                revision: projection.revision,
+                targetApplicationBundleIdentifier: injector?.targetApplication?.bundleIdentifier,
+                targetApplicationProcessID: injector?.targetApplication?.processIdentifier,
+                observedAt: recognitionObservation?.0,
+                monotonicMilliseconds: recognitionObservation?.1
+            ))
+        }
         let entry = SessionLogEntry(
-            timestamp: Date(),
+            timestamp: recognitionObservation?.0 ?? Date(),
             sessionID: sessionID,
             event: event,
             state: stateName,
@@ -621,7 +652,8 @@ final class SessionCoordinator: SessionCoordinating {
             errorCode: errorCode,
             failureCode: resolvedFailureCode,
             failureMessage: resolvedFailureMessage,
-            metadata: entryMetadata
+            metadata: entryMetadata,
+            textEvidence: textEvidence
         )
         try? logger.append(entry)
         for diagnostic in injector?.drainDiagnostics() ?? [] {
@@ -652,7 +684,8 @@ final class SessionCoordinator: SessionCoordinating {
                 discardCount: discardCount,
                 errorCount: errorCount + (injector?.errorCount ?? 0),
                 failureCode: injector?.degradationCode,
-                metadata: fields
+                metadata: fields,
+                textEvidence: diagnostic.textEvidence
             ))
         }
     }

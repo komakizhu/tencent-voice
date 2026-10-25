@@ -68,6 +68,7 @@ struct SessionLogEntry: Codable, Equatable, Sendable {
     let failureCode: String?
     let failureMessage: String?
     let metadata: [String: String]
+    let textEvidence: [DiagnosticTextEvidence]
 
     private enum CodingKeys: String, CodingKey {
         case timestamp
@@ -99,6 +100,7 @@ struct SessionLogEntry: Codable, Equatable, Sendable {
         case failureCode
         case failureMessage
         case metadata
+        case textEvidence
     }
 
     init(
@@ -130,7 +132,8 @@ struct SessionLogEntry: Codable, Equatable, Sendable {
         errorCode: Int? = nil,
         failureCode: String? = nil,
         failureMessage: String? = nil,
-        metadata: [String: String] = [:]
+        metadata: [String: String] = [:],
+        textEvidence: [DiagnosticTextEvidence] = []
     ) {
         self.timestamp = timestamp
         self.sessionID = sessionID
@@ -159,10 +162,9 @@ struct SessionLogEntry: Codable, Equatable, Sendable {
         self.errorCount = errorCount
         self.errorCode = errorCode
         self.failureCode = failureCode
-        self.failureMessage = failureMessage.map {
-            DiagnosticLogSanitizer.value($0, forKey: "failureMessage")
-        }
+        self.failureMessage = failureMessage.map(DiagnosticLogSanitizer.failureMessage)
         self.metadata = DiagnosticLogSanitizer.fields(metadata)
+        self.textEvidence = textEvidence
     }
 
     init(from decoder: Decoder) throws {
@@ -201,49 +203,286 @@ struct SessionLogEntry: Codable, Equatable, Sendable {
         errorCount = try container.decodeIfPresent(Int.self, forKey: .errorCount)
         errorCode = try container.decodeIfPresent(Int.self, forKey: .errorCode)
         failureCode = try container.decodeIfPresent(String.self, forKey: .failureCode)
-        failureMessage = try container.decodeIfPresent(String.self, forKey: .failureMessage).map {
-            DiagnosticLogSanitizer.value($0, forKey: "failureMessage")
-        }
+        failureMessage = try container.decodeIfPresent(String.self, forKey: .failureMessage)
+            .map(DiagnosticLogSanitizer.failureMessage)
         metadata = DiagnosticLogSanitizer.fields(
             try container.decodeIfPresent([String: String].self, forKey: .metadata) ?? [:]
         )
+        textEvidence = try container.decodeIfPresent(
+            [DiagnosticTextEvidence].self,
+            forKey: .textEvidence
+        ) ?? []
     }
 }
 
 @MainActor
 final class SessionLogger {
+    var evidenceObserver: ((SessionLogEntry) -> Void)?
     private let enabled: () -> Bool
     private let fileManager = FileManager.default
     private let applicationSupportDirectoryURL: URL
+    private let loggerStartedAt = Date()
+    private var persistenceCaptureStartedAt: Date?
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var inMemoryEntries: [SessionLogEntry] = []
     private let diagnosticActionSessionID = UUID()
     private let inMemoryLimit = 300
+    private let reportReferenceLimit = 200_000
+    private var reportFileReferences: [DiagnosticEventFileReference] = []
+    private var reportReferenceHead = 0
+    private var droppedReportReferences: [DiagnosticEventEvictionReference] = []
+    private var droppedReportReferenceHead = 0
+    private var droppedReportReferenceOverflowRange: [Date]?
+    private var evictedMemoryEvents: [DiagnosticEventEvictionReference] = []
+    private var memoryEvictionHead = 0
+    private var memoryEvictionOverflowAt: Date?
     private var failureContextEnabled = false
-    private var failureContextEvents: [SessionLogEntry] = []
-    private var lastFailureContextPrune = Date.distantPast
+    private var failureContextEvents: DiagnosticEventBuffer
     private(set) var failureContextEventsTruncated = false
+    private var failureContextDroppedEventTimes: [Date] = []
+    private var failureContextDroppedEventHead = 0
+    private var failureContextDroppedOverflowRange: [Date]?
+    private let failureContextDropIndexLimit = 200_000
+    private var failureContextStartedAt: Date?
+    var failureContextRecordingStartedAt: Date? { failureContextStartedAt }
+    var reportCaptureStartedAt: Date? {
+        var starts: [Date] = []
+        if failureContextEnabled, let failureContextStartedAt { starts.append(failureContextStartedAt) }
+        if enabled(), let persistenceCaptureStartedAt { starts.append(persistenceCaptureStartedAt) }
+        return starts.min()
+    }
+    private var persistenceFailures = 0
+    private var lastPersistenceError: String?
+    private struct PinnedSessionEvidence {
+        var lastSuccess: SessionLogEntry?
+        var firstAnomaly: SessionLogEntry?
+        var finalCopy: SessionLogEntry?
+    }
+    private var pinnedSessions: [UUID: PinnedSessionEvidence] = [:]
+    private var pinnedSessionOrder: [UUID] = []
+    private struct PinnedSessionDropReference {
+        let sessionID: UUID
+        let evidenceTimestamps: [Date]
+    }
+    private var droppedPinnedSessionReferences: [PinnedSessionDropReference] = []
+    private var droppedPinnedSessionHead = 0
+    private var droppedPinnedSessionOverflowRange: [Date]?
+    private let droppedPinnedSessionIndexLimit = 200_000
+
+    private func recordPinnedSessionDrop(sessionID: UUID, evidence: PinnedSessionEvidence, fallbackTimestamp: Date) {
+        let timestamps = [evidence.lastSuccess, evidence.firstAnomaly, evidence.finalCopy]
+            .compactMap { $0?.timestamp }
+        droppedPinnedSessionReferences.append(PinnedSessionDropReference(
+            sessionID: sessionID,
+            evidenceTimestamps: timestamps.isEmpty ? [fallbackTimestamp] : timestamps
+        ))
+        while droppedPinnedSessionReferences.count - droppedPinnedSessionHead > droppedPinnedSessionIndexLimit {
+            let omittedTimestamps = droppedPinnedSessionReferences[droppedPinnedSessionHead].evidenceTimestamps
+            let rangeMinimum = omittedTimestamps.min() ?? fallbackTimestamp
+            let rangeMaximum = omittedTimestamps.max() ?? fallbackTimestamp
+            let previous = droppedPinnedSessionOverflowRange ?? [rangeMinimum, rangeMaximum]
+            droppedPinnedSessionOverflowRange = [
+                min(previous.min() ?? rangeMinimum, rangeMinimum),
+                max(previous.max() ?? rangeMaximum, rangeMaximum)
+            ]
+            droppedPinnedSessionHead += 1
+        }
+        if droppedPinnedSessionHead >= 1024 && droppedPinnedSessionHead * 2 >= droppedPinnedSessionReferences.count {
+            droppedPinnedSessionReferences.removeFirst(droppedPinnedSessionHead)
+            droppedPinnedSessionHead = 0
+        }
+    }
+
+    private func pinnedSessionDropSummary(from start: Date, through end: Date) -> (count: Int?, truncated: Bool) {
+        let retainedSessionIDs = Set(droppedPinnedSessionReferences[droppedPinnedSessionHead...].compactMap { reference in
+            reference.evidenceTimestamps.contains { $0 >= start && $0 <= end } ? reference.sessionID : nil
+        })
+        let overflowIntersectsWindow: Bool = {
+            guard let range = droppedPinnedSessionOverflowRange,
+                  let earliest = range.min(), let latest = range.max() else { return false }
+            return latest >= start && earliest <= end
+        }()
+        if overflowIntersectsWindow { return (nil, true) }
+        return (retainedSessionIDs.count, !retainedSessionIDs.isEmpty)
+    }
+
+    private func recordFailureContextDrops(_ entries: [SessionLogEntry]) {
+        failureContextDroppedEventTimes.append(contentsOf: entries.map(\.timestamp))
+        while failureContextDroppedEventTimes.count - failureContextDroppedEventHead > failureContextDropIndexLimit {
+            let omittedTimestamp = failureContextDroppedEventTimes[failureContextDroppedEventHead]
+            let previous = failureContextDroppedOverflowRange ?? [omittedTimestamp, omittedTimestamp]
+            failureContextDroppedOverflowRange = [
+                min(previous.min() ?? omittedTimestamp, omittedTimestamp),
+                max(previous.max() ?? omittedTimestamp, omittedTimestamp)
+            ]
+            failureContextDroppedEventHead += 1
+        }
+        if failureContextDroppedEventHead >= 1024
+            && failureContextDroppedEventHead * 2 >= failureContextDroppedEventTimes.count {
+            failureContextDroppedEventTimes.removeFirst(failureContextDroppedEventHead)
+            failureContextDroppedEventHead = 0
+        }
+    }
+
+    private func failureContextDropSummary(from start: Date, through end: Date) -> (count: Int?, truncated: Bool) {
+        let retainedCount = failureContextDroppedEventTimes[failureContextDroppedEventHead...]
+            .filter { $0 >= start && $0 <= end }.count
+        let overflowIntersectsWindow: Bool = {
+            guard let range = failureContextDroppedOverflowRange,
+                  let earliest = range.min(), let latest = range.max() else { return false }
+            return latest >= start && earliest <= end
+        }()
+        if overflowIntersectsWindow { return (nil, true) }
+        return (retainedCount, retainedCount > 0)
+    }
+
+    func failureContextEvidenceTruncated(at date: Date) -> Bool {
+        failureContextDropSummary(from: date.addingTimeInterval(-60), through: date).truncated
+    }
 
     func setFailureContextEnabled(_ enabled: Bool) {
         failureContextEnabled = enabled
-        failureContextEvents = []
+        failureContextEvents.removeAll()
         failureContextEventsTruncated = false
-        lastFailureContextPrune = .distantPast
+        failureContextDroppedEventTimes = []
+        failureContextDroppedEventHead = 0
+        failureContextDroppedOverflowRange = nil
+        failureContextStartedAt = enabled ? Date() : nil
+        pinnedSessions = [:]
+        pinnedSessionOrder = []
+        droppedPinnedSessionReferences = []
+        droppedPinnedSessionHead = 0
+        droppedPinnedSessionOverflowRange = nil
     }
 
-    func failureEvents(at date: Date) -> [SessionLogEntry] {
-        failureContextEvents.filter { $0.timestamp >= date.addingTimeInterval(-60) && $0.timestamp <= date }
-            .sorted { $0.timestamp < $1.timestamp }
+    func failureEvents(at date: Date, recoverPersisted: Bool = true) -> [SessionLogEntry] {
+        let windowStart = date.addingTimeInterval(-60)
+        var events = failureContextEvents.entries.filter { $0.timestamp >= windowStart && $0.timestamp <= date }
+        var retainedIDs = Set(events.compactMap(\.eventID))
+        for pin in pinnedSessions.values {
+            for entry in [pin.lastSuccess, pin.firstAnomaly, pin.finalCopy].compactMap({ $0 })
+            where entry.timestamp >= windowStart && entry.timestamp <= date {
+                if let id = entry.eventID, retainedIDs.insert(id).inserted { events.append(entry) }
+            }
+        }
+        let pinDropSummary = pinnedSessionDropSummary(from: windowStart, through: date)
+        if pinDropSummary.truncated {
+            events.append(SessionLogEntry(timestamp: date, event: "diagnostic_session_pins_omitted", metadata: [
+                "omittedSessionCount": pinDropSummary.count.map(String.init) ?? "unknown",
+                "countScope": pinDropSummary.count == nil ? "click_window_unknown_due_capacity" : "click_window",
+                "reason": "pinned_session_count_or_16MiB_capacity"
+            ]))
+        }
+        if recoverPersisted, enabled() {
+            let snapshot = reportEventSnapshot(at: date, captureStartedAt: failureContextStartedAt)
+            let memoryIDs = Set(events.compactMap(\.eventID))
+            let recovered = snapshot.recoverPersistedEvents().events
+            events += recovered.filter { $0.eventID.map { !memoryIDs.contains($0) } ?? true }
+        }
+        if persistenceFailures > 0 {
+            events.append(SessionLogEntry(timestamp: date, event: "diagnostic_persistence_failed", metadata: [
+                "failedEventCount": String(persistenceFailures),
+                "errorDetail": lastPersistenceError ?? "unknown",
+                "memoryEvidenceMayRemainAvailable": "true"
+            ]))
+        }
+        let failureDropSummary = failureContextDropSummary(from: windowStart, through: date)
+        if failureDropSummary.truncated {
+            events.append(SessionLogEntry(timestamp: date, event: "diagnostic_events_omitted", metadata: [
+                "droppedEventCount": failureDropSummary.count.map(String.init) ?? "unknown",
+                "countScope": failureDropSummary.count == nil ? "click_window_unknown_due_capacity" : "click_window",
+                "reason": "failure_context_memory_capacity",
+                "countMeaning": "evicted_records_in_click_window",
+                "byteLimit": String(failureContextEvents.byteLimit),
+                "diskRecoveryAttempted": String(recoverPersisted && enabled() && failureContextStartedAt != nil),
+                "windowStart": DiagnosticReportTime.format(windowStart),
+                "windowEnd": DiagnosticReportTime.format(date)
+            ]))
+        }
+        return events.sorted { $0.timestamp < $1.timestamp }
+    }
+
+    func reportEventSnapshot(
+        at date: Date,
+        captureStartedAt: Date? = nil,
+        windowDuration: TimeInterval = 60
+    ) -> DiagnosticReportEventSnapshot {
+        let windowStart = date.addingTimeInterval(-max(0, windowDuration))
+        while memoryEvictionHead < evictedMemoryEvents.count,
+              evictedMemoryEvents[memoryEvictionHead].indexedAt < date.addingTimeInterval(-60) {
+            memoryEvictionHead += 1
+        }
+        let omittedReferenceKeys = Set(droppedReportReferences[droppedReportReferenceHead...].filter {
+            $0.timestamp >= windowStart && $0.timestamp <= date && $0.indexedAt <= date
+        }.map(\.identityKey))
+        let omissionIndexOverflowed: Bool = {
+            guard let range = droppedReportReferenceOverflowRange,
+                  let earliest = range.min(), let latest = range.max() else { return false }
+            return latest >= windowStart && earliest <= date
+        }()
+        var sourceEntries = failureContextEnabled
+            ? failureContextEvents.entries + pinnedSessions.values.flatMap {
+                [$0.lastSuccess, $0.firstAnomaly, $0.finalCopy].compactMap { $0 }
+            }
+            : inMemoryEntries
+        let failureDropSummary = failureContextDropSummary(from: windowStart, through: date)
+        if failureDropSummary.truncated {
+            sourceEntries.append(SessionLogEntry(timestamp: date, event: "diagnostic_events_omitted", metadata: [
+                "droppedEventCount": failureDropSummary.count.map(String.init) ?? "unknown",
+                "countScope": failureDropSummary.count == nil ? "click_window_unknown_due_capacity" : "click_window",
+                "reason": "failure_context_memory_capacity",
+                "countMeaning": "memory_evictions_not_proven_remaining_gaps",
+                "remainingMissingEventCount": "unknown",
+                "diskRecoveryAttempted": String(enabled())
+            ]))
+        }
+        let pinDropSummary = pinnedSessionDropSummary(from: windowStart, through: date)
+        if pinDropSummary.truncated {
+            sourceEntries.append(SessionLogEntry(timestamp: date, event: "diagnostic_session_pins_omitted", metadata: [
+                "omittedSessionCount": pinDropSummary.count.map(String.init) ?? "unknown",
+                "countScope": pinDropSummary.count == nil ? "click_window_unknown_due_capacity" : "click_window",
+                "reason": "pinned_session_count_or_16MiB_capacity"
+            ]))
+        }
+        var seen = Set<String>()
+        let memory = sourceEntries.filter { entry in
+            guard entry.timestamp >= windowStart && entry.timestamp <= date else { return false }
+            let key = entry.eventID.map { "event:\($0.uuidString)" }
+                ?? "legacy:\(entry.sessionID.uuidString)|\(entry.timestamp.timeIntervalSince1970)|\(entry.event)|\(entry.sequence ?? -1)"
+            return seen.insert(key).inserted
+        }.sorted { $0.timestamp < $1.timestamp }
+        return DiagnosticReportEventSnapshot(
+            requestedAt: date,
+            windowStart: windowStart,
+            captureStartedAt: captureStartedAt ?? reportCaptureStartedAt,
+            memoryEvents: memory,
+            pinnedEvidenceTruncated: pinDropSummary.truncated,
+            failureContextEvidenceTruncated: failureDropSummary.truncated,
+            fileReferences: reportFileReferences[reportReferenceHead...].filter {
+                $0.timestamp >= windowStart && $0.timestamp <= date && $0.indexedAt <= date
+            },
+            omittedReferenceKeys: omittedReferenceKeys,
+            omissionIndexOverflowed: omissionIndexOverflowed,
+            evictedMemoryEvents: evictedMemoryEvents[memoryEvictionHead...].filter {
+                $0.timestamp >= windowStart && $0.timestamp <= date && $0.indexedAt <= date
+            },
+            memoryEvictionCountUnknown: memoryEvictionOverflowAt.map {
+                $0 >= date.addingTimeInterval(-60) && $0 <= date
+            } ?? false
+        )
     }
 
     init(
         enabled: @escaping () -> Bool,
-        applicationSupportDirectoryURL: URL? = nil
+        applicationSupportDirectoryURL: URL? = nil,
+        failureContextEventLimit: Int = 100_000
     ) {
         self.enabled = enabled
+        self.failureContextEvents = DiagnosticEventBuffer(eventLimit: failureContextEventLimit)
         self.applicationSupportDirectoryURL = applicationSupportDirectoryURL
             ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        if enabled() { self.persistenceCaptureStartedAt = loggerStartedAt }
         DiagnosticJSON.configureDateEncoding(for: encoder)
         DiagnosticJSON.configureDateDecoding(for: decoder)
         try? migrateLegacyDiagnosticJournal()
@@ -251,26 +490,145 @@ final class SessionLogger {
 
     func append(_ entry: SessionLogEntry) throws {
         if failureContextEnabled {
-            let now = Date()
-            if now.timeIntervalSince(lastFailureContextPrune) >= 1 {
-                failureContextEvents.removeAll { $0.timestamp < now.addingTimeInterval(-60) }
-                lastFailureContextPrune = now
+            if entry.kind == .session && (DiagnosticAnomaly.events.contains(entry.event)
+                || ["keyboard_write_acknowledged", "ax_write_acknowledged"].contains(entry.event)
+                || entry.textEvidence.contains(where: { $0.kind == .safeCopySucceeded })) {
+                if pinnedSessions[entry.sessionID] == nil {
+                    pinnedSessionOrder.append(entry.sessionID)
+                    if pinnedSessionOrder.count > 128 {
+                        let droppedSessionID = pinnedSessionOrder.removeFirst()
+                        if let droppedEvidence = pinnedSessions.removeValue(forKey: droppedSessionID) {
+                            recordPinnedSessionDrop(
+                                sessionID: droppedSessionID,
+                                evidence: droppedEvidence,
+                                fallbackTimestamp: entry.timestamp
+                            )
+                        }
+                    }
+                }
+                var pin = pinnedSessions[entry.sessionID] ?? PinnedSessionEvidence()
+                if DiagnosticAnomaly.events.contains(entry.event), entry.timestamp < (pin.firstAnomaly?.timestamp ?? .distantFuture) {
+                    pin.firstAnomaly = entry
+                    pin.lastSuccess = (failureContextEvents.entries + [pin.lastSuccess].compactMap { $0 })
+                        .filter { $0.sessionID == entry.sessionID && $0.timestamp <= entry.timestamp
+                            && ["keyboard_write_acknowledged", "ax_write_acknowledged"].contains($0.event) }
+                        .max { $0.timestamp < $1.timestamp }
+                } else if ["keyboard_write_acknowledged", "ax_write_acknowledged"].contains(entry.event),
+                          entry.timestamp <= (pin.firstAnomaly?.timestamp ?? .distantFuture),
+                          entry.timestamp >= (pin.lastSuccess?.timestamp ?? .distantPast) {
+                    pin.lastSuccess = entry
+                }
+                if entry.textEvidence.contains(where: { $0.kind == .safeCopySucceeded }),
+                   entry.timestamp >= (pin.finalCopy?.timestamp ?? .distantPast) { pin.finalCopy = entry }
+                pinnedSessions[entry.sessionID] = pin
+                func pinnedBytes() -> Int {
+                    pinnedSessions.values.reduce(0) { total, item in
+                        total + [item.lastSuccess, item.firstAnomaly, item.finalCopy].compactMap { $0 }
+                            .reduce(0) { $0 + $1.estimatedDiagnosticBytes }
+                    }
+                }
+                while pinnedBytes() > 16 * 1024 * 1024, !pinnedSessionOrder.isEmpty {
+                    let droppedSessionID = pinnedSessionOrder.removeFirst()
+                    if let droppedEvidence = pinnedSessions.removeValue(forKey: droppedSessionID) {
+                        recordPinnedSessionDrop(
+                            sessionID: droppedSessionID,
+                            evidence: droppedEvidence,
+                            fallbackTimestamp: entry.timestamp
+                        )
+                    }
+                }
             }
-            failureContextEvents.append(entry)
-            if failureContextEvents.count > 12000 {
-                failureContextEvents.removeFirst(failureContextEvents.count - 12000)
+            let overflow = failureContextEvents.append(entry)
+            if overflow > 0 {
                 failureContextEventsTruncated = true
+                recordFailureContextDrops(failureContextEvents.lastEvictedEntries)
             }
         }
         inMemoryEntries.append(entry)
         if inMemoryEntries.count > inMemoryLimit {
-            inMemoryEntries.removeFirst(inMemoryEntries.count - inMemoryLimit)
+            let removedCount = inMemoryEntries.count - inMemoryLimit
+            let removed = inMemoryEntries.prefix(removedCount)
+            let indexedAt = Date()
+            while memoryEvictionHead < evictedMemoryEvents.count,
+                  evictedMemoryEvents[memoryEvictionHead].indexedAt < indexedAt.addingTimeInterval(-60) {
+                memoryEvictionHead += 1
+            }
+            evictedMemoryEvents.append(contentsOf: removed.map {
+                DiagnosticEventEvictionReference(
+                    timestamp: $0.timestamp,
+                    eventID: $0.eventID,
+                    sessionID: $0.sessionID,
+                    event: $0.event,
+                    sequence: $0.sequence,
+                    indexedAt: indexedAt
+                )
+            })
+            if evictedMemoryEvents.count - memoryEvictionHead > 200_000 {
+                memoryEvictionHead += evictedMemoryEvents.count - memoryEvictionHead - 200_000
+                memoryEvictionOverflowAt = indexedAt
+            }
+            if memoryEvictionHead >= 1024 && memoryEvictionHead * 2 >= evictedMemoryEvents.count {
+                evictedMemoryEvents.removeFirst(memoryEvictionHead)
+                memoryEvictionHead = 0
+            }
+            inMemoryEntries.removeFirst(removedCount)
         }
-        guard enabled() else { return }
-        try persist(entry)
+        evidenceObserver?(entry)
+        let persistenceEnabled = enabled()
+        if persistenceEnabled {
+            if persistenceCaptureStartedAt == nil { persistenceCaptureStartedAt = entry.timestamp }
+        } else {
+            persistenceCaptureStartedAt = nil
+        }
+        guard persistenceEnabled else { return }
+        do {
+            let reference = try persist(entry)
+            let indexedAt = reference.indexedAt
+            let lowerBound = indexedAt.addingTimeInterval(-60)
+            while reportReferenceHead < reportFileReferences.count,
+                  reportFileReferences[reportReferenceHead].indexedAt < lowerBound {
+                reportReferenceHead += 1
+            }
+            reportReferenceHead = min(reportReferenceHead, reportFileReferences.count)
+            reportFileReferences.append(reference)
+            while reportFileReferences.count - reportReferenceHead > reportReferenceLimit {
+                let omitted = reportFileReferences[reportReferenceHead]
+                droppedReportReferences.append(DiagnosticEventEvictionReference(
+                    timestamp: omitted.timestamp,
+                    eventID: omitted.eventID,
+                    sessionID: omitted.sessionID,
+                    event: omitted.event,
+                    sequence: omitted.sequence,
+                    indexedAt: omitted.indexedAt
+                ))
+                if droppedReportReferences.count - droppedReportReferenceHead > reportReferenceLimit {
+                    let omittedTimestamp = droppedReportReferences[droppedReportReferenceHead].timestamp
+                    let previous = droppedReportReferenceOverflowRange ?? [omittedTimestamp, omittedTimestamp]
+                    droppedReportReferenceOverflowRange = [
+                        min(previous.min() ?? omittedTimestamp, omittedTimestamp),
+                        max(previous.max() ?? omittedTimestamp, omittedTimestamp)
+                    ]
+                    droppedReportReferenceHead += 1
+                }
+                if droppedReportReferenceHead >= 1024
+                    && droppedReportReferenceHead * 2 >= droppedReportReferences.count {
+                    droppedReportReferences.removeFirst(droppedReportReferenceHead)
+                    droppedReportReferenceHead = 0
+                }
+                reportReferenceHead += 1
+            }
+            if reportReferenceHead >= 1024 && reportReferenceHead * 2 >= reportFileReferences.count {
+                reportFileReferences.removeFirst(reportReferenceHead)
+                reportReferenceHead = 0
+            }
+        } catch {
+            persistenceFailures += 1
+            lastPersistenceError = DiagnosticLogSanitizer.failureMessage(error.localizedDescription)
+            throw error
+        }
     }
 
-    private func persist(_ entry: SessionLogEntry) throws {
+    private func persist(_ entry: SessionLogEntry) throws -> DiagnosticEventFileReference {
         let directory = applicationSupportDirectoryURL
             .appendingPathComponent("TencentVoiceMVP/sessions", isDirectory: true)
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -280,14 +638,30 @@ final class SessionLogger {
         let fileURL = directory.appendingPathComponent("\(formatter.string(from: entry.timestamp)).jsonl")
         var line = try encoder.encode(entry)
         line.append(0x0A)
+        let offset: UInt64
         if fileManager.fileExists(atPath: fileURL.path) {
             let handle = try FileHandle(forWritingTo: fileURL)
-            try handle.seekToEnd()
+            offset = try handle.seekToEnd()
             try handle.write(contentsOf: line)
             try handle.close()
         } else {
             try line.write(to: fileURL, options: .atomic)
+            offset = 0
         }
+        let attributes = try? fileManager.attributesOfItem(atPath: fileURL.path)
+        let identity = (attributes?[.systemFileNumber] as? NSNumber)?.stringValue
+        return DiagnosticEventFileReference(
+            fileURL: fileURL,
+            fileIdentity: identity,
+            offset: offset,
+            length: line.count,
+            timestamp: entry.timestamp,
+            eventID: entry.eventID,
+            sessionID: entry.sessionID,
+            event: entry.event,
+            sequence: entry.sequence,
+            indexedAt: Date()
+        )
     }
 
     func recentEntries(limit: Int = 120) -> [SessionLogEntry] {
@@ -306,11 +680,19 @@ final class SessionLogger {
         if let limit, limit <= 0 { return [] }
         let directory = applicationSupportDirectoryURL
             .appendingPathComponent("TencentVoiceMVP/sessions", isDirectory: true)
-        guard let urls = try? fileManager.contentsOfDirectory(
+        guard fileManager.fileExists(atPath: directory.path) else { return [] }
+        let urls: [URL]
+        do {
+            urls = try fileManager.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles]
-        ) else { return [] }
+            )
+        } catch {
+            return [SessionLogEntry(event: "diagnostic_read_failed", metadata: [
+                "stage": "directory", "errorDetail": DiagnosticLogSanitizer.failureMessage(error.localizedDescription)
+            ])]
+        }
 
         var entries: [SessionLogEntry] = []
         let sortedURLs = urls
@@ -323,13 +705,29 @@ final class SessionLogger {
 
         for url in sortedURLs {
             guard let data = try? Data(contentsOf: url),
-                  let content = String(data: data, encoding: .utf8) else { continue }
-            let lines = content.split(whereSeparator: \.isNewline).reversed()
+                  let content = String(data: data, encoding: .utf8) else {
+                entries.append(SessionLogEntry(event: "diagnostic_read_failed", metadata: [
+                    "file": url.lastPathComponent, "stage": "file_or_utf8", "missingEventCount": "unknown"
+                ]))
+                continue
+            }
+            // JSONL records use LF. U+0085/U+2028/U+2029 can occur literally
+            // inside JSON strings and must not split a full-text record.
+            let lines = content.split(separator: "\n").reversed()
+            var corruptLines = 0
             for line in lines {
                 guard let lineData = line.data(using: .utf8),
-                      let entry = try? decoder.decode(SessionLogEntry.self, from: lineData) else { continue }
+                      let entry = try? decoder.decode(SessionLogEntry.self, from: lineData) else {
+                    corruptLines += 1
+                    continue
+                }
                 entries.append(entry)
                 if let limit, entries.count >= limit { return Array(entries.reversed()) }
+            }
+            if corruptLines > 0 {
+                entries.append(SessionLogEntry(event: "diagnostic_decode_failed", metadata: [
+                    "file": url.lastPathComponent, "missingEventCount": String(corruptLines)
+                ]))
             }
         }
         return Array(entries.reversed())
@@ -379,9 +777,9 @@ final class SessionLogger {
             )
         }
         for entry in entries {
-            try persist(entry)
+            _ = try persist(entry)
         }
-        try persist(SessionLogEntry(
+        _ = try persist(SessionLogEntry(
             timestamp: Date(),
             sessionID: fallbackSessionID,
             eventID: nil,
@@ -423,7 +821,14 @@ final class SessionLogger {
         sessionID: UUID? = nil,
         fields: [String: String] = [:]
     ) {
-        let metadata = DiagnosticLogSanitizer.fields(fields)
+        let metadata = fields.reduce(into: [String: String]()) { result, field in
+            let key = field.key.lowercased()
+            if key.contains("error") || key.contains("message") || key.contains("detail") {
+                result[field.key] = DiagnosticLogSanitizer.failureMessage(field.value)
+            } else {
+                result.merge(DiagnosticLogSanitizer.fields([field.key: field.value])) { _, new in new }
+            }
+        }
         let entry = SessionLogEntry(
             sessionID: sessionID ?? diagnosticActionSessionID,
             kind: .action,

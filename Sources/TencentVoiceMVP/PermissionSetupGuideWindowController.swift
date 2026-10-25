@@ -4,6 +4,7 @@ import AppKit
 final class PermissionSetupGuideWindowController: NSWindowController, NSWindowDelegate {
     private let permissionChecker: PrivacyPermissionChecking
     private let onFinished: () -> Void
+    private let currentAppName: String
     private let stepLabel = NSTextField(labelWithString: "")
     private let titleLabel = NSTextField(labelWithString: "")
     private let instructionLabel = NSTextField(wrappingLabelWithString: "")
@@ -26,6 +27,7 @@ final class PermissionSetupGuideWindowController: NSWindowController, NSWindowDe
 
     init(
         permissionChecker: PrivacyPermissionChecking,
+        currentAppName: String = Bundle.main.bundleURL.deletingPathExtension().lastPathComponent,
         onFinished: @escaping () -> Void = {}
     ) {
         let window = NSWindow(
@@ -37,6 +39,7 @@ final class PermissionSetupGuideWindowController: NSWindowController, NSWindowDe
         window.title = "Rime Voice 权限向导"
         window.isReleasedWhenClosed = false
         self.permissionChecker = permissionChecker
+        self.currentAppName = currentAppName
         self.onFinished = onFinished
         super.init(window: window)
         window.delegate = self
@@ -102,16 +105,8 @@ final class PermissionSetupGuideWindowController: NSWindowController, NSWindowDe
         buttons.spacing = 8
         buttons.translatesAutoresizingMaskIntoConstraints = false
 
-        let appIcon = PermissionAppDragView()
-        appIcon.image = NSWorkspace.shared.icon(forFile: Bundle.main.bundlePath)
-        appIcon.toolTip = "拖动此图标到系统设置的权限列表，添加当前这份 Rime Voice"
-        appIcon.widthAnchor.constraint(equalToConstant: 48).isActive = true
-        appIcon.heightAnchor.constraint(equalToConstant: 48).isActive = true
-        let appHint = NSTextField(wrappingLabelWithString: "列表没有 Rime Voice？把左侧图标拖进权限列表，然后打开开关。无需寻找文件。")
-        appHint.preferredMaxLayoutWidth = 380
-        let appRow = NSStackView(views: [appIcon, appHint])
-        appRow.orientation = .horizontal
-        appRow.spacing = 12
+        let appHint = NSTextField(wrappingLabelWithString: "只操作这一项：\(currentAppName)。如果还看到旧版“Rime Voice”，不要选旧版。")
+        appHint.preferredMaxLayoutWidth = 464
         let content = NSStackView(views: [
             stepLabel,
             titleLabel,
@@ -119,7 +114,7 @@ final class PermissionSetupGuideWindowController: NSWindowController, NSWindowDe
             noteLabel,
             stateLabel,
             restartButton,
-            appRow,
+            appHint,
             buttons
         ])
         content.orientation = .vertical
@@ -135,6 +130,7 @@ final class PermissionSetupGuideWindowController: NSWindowController, NSWindowDe
             instructionLabel.widthAnchor.constraint(equalToConstant: 464),
             noteLabel.widthAnchor.constraint(equalToConstant: 464),
             stateLabel.widthAnchor.constraint(equalToConstant: 464),
+            appHint.widthAnchor.constraint(equalToConstant: 464),
             buttons.widthAnchor.constraint(equalToConstant: 464)
         ])
     }
@@ -146,7 +142,7 @@ final class PermissionSetupGuideWindowController: NSWindowController, NSWindowDe
         guard let permission = currentPermission else {
             stepLabel.stringValue = "授权流程已完成"
             titleLabel.stringValue = "权限已全部开启"
-            instructionLabel.stringValue = "Rime Voice 现在可以录音、监听全局快捷键，并把识别结果输入到当前应用。"
+            instructionLabel.stringValue = "\(currentAppName) 现在可以录音、监听全局快捷键，并把识别结果输入到当前应用。"
             noteLabel.stringValue = "以后如果更换 App 或权限再次失效，可以回到设置页重新启动这个向导。"
             stateLabel.stringValue = "已完成"
             stateLabel.textColor = .systemGreen
@@ -160,7 +156,7 @@ final class PermissionSetupGuideWindowController: NSWindowController, NSWindowDe
         stepLabel.stringValue = "第 \(stepIndex + 1)/\(steps.count) 步"
         titleLabel.stringValue = stepTitle(for: permission)
         instructionLabel.stringValue = instruction(for: permission)
-        noteLabel.stringValue = "系统要求密码或 Touch ID 时，在系统窗口确认。开启后回到这里会自动进入下一步。"
+        noteLabel.stringValue = "按 macOS 提示确认；授权后回到这里，向导会自动继续。"
         openSettingsButton.isHidden = false
         restartButton.isHidden = false
         openSettingsButton.title = openSettingsTitle(for: permission)
@@ -178,10 +174,10 @@ final class PermissionSetupGuideWindowController: NSWindowController, NSWindowDe
         } else {
             let accessibilityGranted = permissionChecker.report().status(for: .accessibility)?.isGranted == true
             stateLabel.stringValue = permission == .accessibility && accessibilityGranted
-                ? "辅助功能已允许；发送键盘事件尚未生效。如果开关已经开启，请点击下方“重启并检查”，保留现有授权后重新检测。"
-                : "当前进程尚未检测到授权。如果系统开关已经开启，请点击下方“重启并检查”，无需重新删除、添加 App。"
+                ? "辅助功能已允许；发送键盘事件尚未生效。确认打开的是“\(currentAppName)”这一项；仍无效再点“重启并检查”。"
+                : "尚未检测到“\(currentAppName)”的授权。如果开关已经开启，先点“刷新授权状态”；仍无效再点“重启并检查”。"
             stateLabel.textColor = .systemRed
-            nextButton.title = "我已开启，检查下一步"
+            nextButton.title = "刷新授权状态"
         }
     }
 
@@ -272,26 +268,13 @@ final class PermissionSetupGuideWindowController: NSWindowController, NSWindowDe
     private func instruction(for permission: PrivacyPermission) -> String {
         switch permission {
         case .microphone:
-            return "请在系统弹窗中点击“允许”。如果以前拒绝过，请打开麦克风设置，开启 Rime Voice。麦克风列表由系统请求自动添加，不支持拖入。"
+            return "请在系统弹窗中点击“允许”。如果以前拒绝过，请打开麦克风设置并开启“\(currentAppName)”。麦克风列表由系统请求自动添加，不支持拖入。"
         case .accessibility:
-            return "点击“打开辅助功能设置”，打开 Rime Voice 右侧的开关。这一步同时允许输入文字，不需要另外授权“发送键盘事件”。列表没有 App 时，直接拖入下方图标。"
+            return "系统设置打开后，在“辅助功能”列表里找到“\(currentAppName)”并打开右侧开关。"
         case .postEvent:
-            return "仍在“辅助功能”页面，确认 Rime Voice 已被允许发送键盘事件。它和辅助功能使用同一个系统页面，不需要重复添加 App。"
+            return "macOS 会显示发送键盘事件的授权提示。按提示继续；如果打开系统设置，只开启“\(currentAppName)”这一项。"
         case .inputMonitoring:
-            return "点击下方按钮，在“隐私与安全性 → 输入监控”中找到 Rime Voice，打开右侧开关。"
+            return "macOS 会显示监听快捷键的授权提示。按提示继续；如果打开系统设置，只开启“\(currentAppName)”这一项。"
         }
-    }
-}
-
-@MainActor
-private final class PermissionAppDragView: NSImageView, NSDraggingSource {
-    override func mouseDown(with event: NSEvent) {
-        let item = NSDraggingItem(pasteboardWriter: Bundle.main.bundleURL as NSURL)
-        item.setDraggingFrame(bounds, contents: image)
-        beginDraggingSession(with: [item], event: event, source: self)
-    }
-
-    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
-        .copy
     }
 }
