@@ -102,3 +102,7 @@ The shared policy fix removes the app's own competing AX caret request from keyb
 
 - Runnable app: `dist/Rime Voice Build214.app`
 - Bundle version: `0.5.0` (Build `214`)
+
+## Finalization version and build
+
+The prior latest release and tag were `0.5.0-macos`. This change adds new diagnostic coverage as well as the input strategy fix, so the finalized product version is `0.6.0` under the repository's version rules. The Build number advances to `215` for a fresh complete App build. `swift test` passed all 629 tests, and `./scripts/build-app.sh` produced a signed, executable `dist/Rime Voice Build215.app` with bundle version `0.6.0` / Build `215`.
