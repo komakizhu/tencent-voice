@@ -176,13 +176,7 @@ final class TextInjector {
                 ])
                 return
             }
-            // Codex advertises writable AX text and returns success even when
-            // the next read does not reflect the insertion. Use keyboard input
-            // from the start; retrying after an AX write could duplicate text.
-            // AXTextTarget still checks the focused element and caret before
-            // each keyboard operation.
             let requiresKeyboardInput = captured.preferredInputStrategy.prefersAcknowledgedKeyboard
-                || captured.targetApplication?.bundleIdentifier == "com.openai.codex"
             mode = captured.supportsAXReplacement && !requiresKeyboardInput ? .ax : .keyboardLiveTail
             installAXWriterIfNeeded()
             installKeyboardPacerIfNeeded()

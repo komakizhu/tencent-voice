@@ -480,6 +480,8 @@ protocol AXTextTargetAccess {
     func currentApplication() -> TextTargetApplication?
     func focusedElement() throws -> AXUIElement
     func processIdentifier(of element: AXUIElement) -> pid_t?
+    func elementValidity(_ element: AXUIElement) -> AXTextElementValidity
+    func safariEditorContinuityEvidence(for element: AXUIElement) -> AXSafariEditorContinuityEvidence?
     func textInputContext(for element: AXUIElement) -> AXTextInputTargetContext?
     func text(in element: AXUIElement) throws -> String?
     func selection(in element: AXUIElement) throws -> TextRange?
@@ -496,7 +498,49 @@ protocol AXTextTargetAccess {
 extension AXTextTargetAccess {
     func textInputContext(for element: AXUIElement) -> AXTextInputTargetContext? { nil }
     func isProseMirrorEditor(_ element: AXUIElement) -> Bool { false }
+    func elementValidity(_ element: AXUIElement) -> AXTextElementValidity { .unavailable }
+    func safariEditorContinuityEvidence(for element: AXUIElement) -> AXSafariEditorContinuityEvidence? { nil }
     func drainReadDiagnostics() -> [TextInputDiagnostic] { [] }
+}
+
+enum AXTextElementValidity: Equatable {
+    case valid
+    case invalid
+    case unavailable
+}
+
+struct AXSafariEditorContinuityEvidence {
+    let webArea: AXUIElement
+    let editorAnchor: AXUIElement
+    let editorAnchorRole: String
+    let rolesFromEditorToAnchor: [String]
+    let identifiersFromEditorToAnchor: [String?]
+    let editableEditorCount: Int
+    let scanComplete: Bool
+}
+
+enum AXSafariEditorContinuity {
+    static func matches(
+        _ previous: AXSafariEditorContinuityEvidence,
+        _ current: AXSafariEditorContinuityEvidence
+    ) -> Bool {
+        guard previous.scanComplete, current.scanComplete,
+              previous.editableEditorCount == 1, current.editableEditorCount == 1,
+              previous.editorAnchorRole == current.editorAnchorRole,
+              ["AXGroup", "AXContainer"].contains(current.editorAnchorRole),
+              CFEqual(previous.webArea, current.webArea),
+              CFEqual(previous.editorAnchor, current.editorAnchor),
+              previous.rolesFromEditorToAnchor == current.rolesFromEditorToAnchor,
+              previous.identifiersFromEditorToAnchor.count == current.identifiersFromEditorToAnchor.count else {
+            return false
+        }
+        for index in previous.identifiersFromEditorToAnchor.indices {
+            let oldIdentifier = previous.identifiersFromEditorToAnchor[index]
+            let newIdentifier = current.identifiersFromEditorToAnchor[index]
+            if let oldIdentifier, let newIdentifier, oldIdentifier != newIdentifier { return false }
+        }
+        return true
+    }
 }
 
 @MainActor
@@ -505,6 +549,7 @@ protocol AXTextTargetKeyboardEventSending: AnyObject {
     func replaceSelection(with text: String, processID: pid_t?) throws
     func send(_ text: String, processID: pid_t?) throws
     func replaceTrailingText(_ previousText: String, with text: String, processID: pid_t?) throws
+    func advanceCaretRight(processID: pid_t?) throws
 }
 
 struct AXTextTargetWriteTiming {
@@ -548,6 +593,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             || (isSafariWebEditor && requiresKeyboardAcknowledgement)
     }
     private var targetElement: AXUIElement?
+    private var safariEditorContinuity: AXSafariEditorContinuityEvidence?
     private var targetProcessID: pid_t?
     private var targetApplicationProcessID: pid_t?
     private var targetApplicationBundleIdentifier: String?
@@ -560,6 +606,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     private let writeTiming: AXTextTargetWriteTiming
     private let preflightTimeoutNanoseconds: UInt64
     private let acknowledgementTimeoutNanoseconds: UInt64
+    private let enableExperimentalCodexCaretRecovery: Bool
     private let evidenceObserver: ((TextInputDiagnostic, AXUIElement?, pid_t?) -> Void)?
     private var diagnostics: [TextInputDiagnostic] = []
     private var diagnosticBytes = 0
@@ -579,7 +626,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         keyboardEventSender: (any AXTextTargetKeyboardEventSending)? = nil,
         writeTiming: AXTextTargetWriteTiming = .init(),
         preflightTimeoutNanoseconds: UInt64 = 5_000_000_000,
-        acknowledgementTimeoutNanoseconds: UInt64 = 5_000_000_000
+        acknowledgementTimeoutNanoseconds: UInt64 = 5_000_000_000,
+        enableExperimentalCodexCaretRecovery: Bool = false
     ) {
         self.evidenceObserver = evidenceObserver
         self.access = access ?? SystemAXTextTargetAccess()
@@ -588,6 +636,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         self.writeTiming = writeTiming
         self.preflightTimeoutNanoseconds = preflightTimeoutNanoseconds
         self.acknowledgementTimeoutNanoseconds = acknowledgementTimeoutNanoseconds
+        self.enableExperimentalCodexCaretRecovery = enableExperimentalCodexCaretRecovery
     }
 
     func drainDiagnostics() -> [TextInputDiagnostic] {
@@ -761,6 +810,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         lastKeyboardReadUsedStructuralFallback = false
         try access.requestInputPermissions()
         targetElement = nil
+        safariEditorContinuity = nil
         targetProcessID = nil
         targetApplicationBundleIdentifier = nil
         targetElementObservationID = nil
@@ -805,6 +855,9 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         isSafariWebEditor = element.map {
             isEligibleSafariWebEditor($0, application: targetApplication, context: inputContext)
         } ?? false
+        safariEditorContinuity = isSafariWebEditor
+            ? element.flatMap { access.safariEditorContinuityEvidence(for: $0) }
+            : nil
         let rawText = try element.flatMap { element in
             try captureReadableText(in: element, context: inputContext)
         }
@@ -883,6 +936,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         }
         recordDiagnostic("input_target_captured", [
             "hasElement": String(element != nil), "hasReadableState": String(hasReadableAXTextState),
+            "targetElementObservationID": targetElementObservationID ?? "unknown",
+            "targetElementObservationMeaning": "captured_AX_handle_not_stable_editor_identity",
             "selectedSettable": String(element.map { selectedTextIsSettable(on: $0) } ?? false),
             "selectedRangeSettable": String(element.map { selectedTextRangeIsSettable(on: $0) } ?? false),
             "valueSettable": String(element.map { valueIsSettable(on: $0) } ?? false),
@@ -1422,12 +1477,35 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         try await waitForSafeKeyboardTargetIdentity(generation: generation)
         try Task.checkCancellation()
         guard generation == keyboardGeneration else { throw CancellationError() }
+        try await waitForKeyboardSelectionStabilization(generation: generation)
+        try Task.checkCancellation()
+        guard generation == keyboardGeneration else { throw CancellationError() }
         if previousText.isEmpty {
-            try submitPaste(text)
+            try submitPaste(text, selectionAlreadyStabilized: true)
         } else {
-            try submitTrailingReplacement(previousText, with: text)
+            try submitTrailingReplacement(previousText, with: text, selectionAlreadyStabilized: true)
         }
         try await acknowledgeKeyboardWrite()
+    }
+
+    private func waitForKeyboardSelectionStabilization(generation: UInt64) async throws {
+        let start = writeTiming.now()
+        while true {
+            try Task.checkCancellation()
+            guard generation == keyboardGeneration else { throw CancellationError() }
+            do {
+                try stabilizeKeyboardSelectionBeforeDispatch()
+                return
+            } catch KeyboardWriteReadError.retryable, KeyboardDocumentStateReadError.retryable {
+                recordDiagnostic("keyboard_state_read_retryable", ["phase": "selection_stabilization"])
+            }
+
+            let elapsed = writeTiming.now() &- start
+            guard elapsed < preflightTimeoutNanoseconds else {
+                throw TextTargetError.writeFailed
+            }
+            try await writeTiming.sleep(min(10_000_000, preflightTimeoutNanoseconds - elapsed))
+        }
     }
 
     /// A readable AX caret is not necessarily the caret that the web editor
@@ -1502,8 +1580,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         try submitPaste(text)
     }
 
-    private func submitPaste(_ text: String) throws {
-        try stabilizeKeyboardSelectionBeforeDispatch()
+    private func submitPaste(_ text: String, selectionAlreadyStabilized: Bool = false) throws {
+        if !selectionAlreadyStabilized {
+            try stabilizeKeyboardSelectionBeforeDispatch()
+        }
         keyboardOperationGeneration &+= 1
         let operationGeneration = keyboardOperationGeneration
         pendingKeyboardDiagnosticOperation = nil
@@ -1563,8 +1643,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         try submitTrailingReplacement(previousText, with: text)
     }
 
-    private func submitTrailingReplacement(_ previousText: String, with text: String) throws {
-        try stabilizeKeyboardSelectionBeforeDispatch()
+    private func submitTrailingReplacement(
+        _ previousText: String,
+        with text: String,
+        selectionAlreadyStabilized: Bool = false
+    ) throws {
+        if !selectionAlreadyStabilized {
+            try stabilizeKeyboardSelectionBeforeDispatch()
+        }
         var completed = false
         defer {
             if !completed {
@@ -1610,13 +1696,13 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 length: 0
             )
             keyboardOperationGeneration = operationGeneration
-            let usesAXSelection = !isCodexTarget && !usesKeyboardOwnedSelection && (targetElement.map {
+            let usesAXSelection = !usesKeyboardOwnedSelection && (targetElement.map {
                 selectedTextRangeIsSettable(on: $0)
             } ?? false)
             if usesAXSelection, let targetElement {
-                // Codex exposes AXSelectedTextRange, but replacing through that
-                // range can collapse an adjacent structural paragraph marker.
-                // Its keyboard path preserves the editor's paragraph boundary.
+                // The selected input strategy owns selection changes. Keyboard
+                // routes must establish replacements with keyboard events and
+                // confirm the selection before inserting text.
                 try setSelection(replacementRange, on: targetElement)
             } else {
                 try keyboardEventSender.selectTrailingText(previousText, processID: eventProcessID)
@@ -1711,7 +1797,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 invalidateKeyboardRawInsertionRegion()
                 throw TextTargetError.targetChanged
             }
-            try rejectSafariTargetRebuild(element, phase: "\(phase)_before_read")
+            try acceptSafariTargetRebuild(element, phase: "\(phase)_before_read")
         } else if targetElement == nil {
             invalidateKeyboardRawInsertionRegion()
             throw TextTargetError.targetChanged
@@ -1728,12 +1814,12 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             }
             try ensureTargetApplicationIsFrontmost()
             let afterElement = try focusedElement()
-            guard CFEqual(afterElement, targetElement) else {
+            if !CFEqual(afterElement, targetElement) {
                 guard isSafariWebEditor else {
                     invalidateKeyboardRawInsertionRegion()
                     throw TextTargetError.targetChanged
                 }
-                try rejectSafariTargetRebuild(afterElement, phase: "\(phase)_after_read")
+                try acceptSafariTargetRebuild(afterElement, phase: "\(phase)_after_read")
             }
             lastKeyboardObservationTiming = (
                 requested: requestedAt,
@@ -1775,6 +1861,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         var usedRepresentationTransition = false
         var matchedRawInsertionRegion: KeyboardRawInsertionRegion?
         var matchedCandidateRegionWasResolved = false
+        var attemptedAppendCaretRecovery = false
         let acknowledgementContext = diagnosticOperationContext ?? previousDiagnosticOperationContext
         var acknowledgementTrace = KeyboardAcknowledgementTrace(
             insertionPositionClass: pendingRepresentationTransition?.insertionPositionClass ?? "not_applicable",
@@ -1789,6 +1876,23 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 )
                 acknowledgementTrace.recordRead(self.keyboardStateEvidence(observed))
                 lastObservedState = observed
+                if self.enableExperimentalCodexCaretRecovery,
+                   !attemptedAppendCaretRecovery,
+                   self.shouldRecoverUnadvancedCodexAppendCaret(
+                    expected: receipt,
+                    observed: observed,
+                    operation: diagnosticOperation
+                   ) {
+                    attemptedAppendCaretRecovery = true
+                    try self.ensureKeyboardTargetIdentityIsSafe()
+                    try self.keyboardEventSender.advanceCaretRight(processID: self.eventProcessID)
+                    self.recordDiagnostic("keyboard_caret_recovery_submitted", [
+                        "route": "right_arrow",
+                        "reason": "exact_single_character_append_caret_did_not_advance",
+                        "fromLocation": String(observed.selection.location),
+                        "toLocation": String(receipt.selection.location)
+                    ], context: acknowledgementContext)
+                }
                 return observed
             } catch {
                 acknowledgementTrace.recordReadError(
@@ -2291,6 +2395,31 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             )
         }
         return primary
+    }
+
+    private func shouldRecoverUnadvancedCodexAppendCaret(
+        expected: KeyboardDocumentState,
+        observed: KeyboardDocumentState,
+        operation: KeyboardDiagnosticDiffOperation?
+    ) -> Bool {
+        guard isCodexTarget,
+              let operation,
+              let inputText = operation.inputText,
+              inputText.count == 1,
+              inputText.utf16.count == 1,
+              operation.coordinateRange.length == 0,
+              expected.text == observed.text,
+              expected.rawText == observed.rawText,
+              expected.selection.length == 0,
+              expected.selection.location == expected.text.utf16.count,
+              observed.selection.length == 0,
+              observed.selection.location == operation.coordinateRange.location,
+              expected.selection.location == observed.selection.location + 1,
+              keyboardDiagnosticMappingIsValid(observed),
+              observed.matchesExpectedMapping(of: expected) else {
+            return false
+        }
+        return true
     }
 
     private func expectedKeyboardMapping(
@@ -2808,7 +2937,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 try ensureTargetApplicationIsFrontmost()
                 let focused = try focusedElement()
                 if !CFEqual(focused, element) {
-                    try rejectSafariTargetRebuild(focused, phase: "invalid_element_read")
+                    try acceptSafariTargetRebuild(focused, phase: "invalid_element_read")
                 }
                 recordDiagnostic("safari_keyboard_invalid_element_retry", [
                     "axAttribute": failure.attribute,
@@ -3153,13 +3282,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         try ensureTargetApplicationIsFrontmost()
         guard let targetElement else { return }
         let currentElement = try focusedElement()
-        guard CFEqual(currentElement, targetElement) else {
+        if !CFEqual(currentElement, targetElement) {
             if isSafariWebEditor {
-                try rejectSafariTargetRebuild(currentElement, phase: "identity_check")
+                try acceptSafariTargetRebuild(currentElement, phase: "identity_check")
+            } else {
+                recordDiagnostic("keyboard_focus_changed")
+                invalidateKeyboardRawInsertionRegion()
+                throw TextTargetError.targetChanged
             }
-            recordDiagnostic("keyboard_focus_changed")
-            invalidateKeyboardRawInsertionRegion()
-            throw TextTargetError.targetChanged
         }
         try ensureActiveInputStrategyIsStillApplicable(for: currentElement)
     }
@@ -3202,14 +3332,55 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         }
     }
 
-    private func rejectSafariTargetRebuild(_ element: AXUIElement, phase: String) throws -> Never {
-        recordDiagnostic("safari_keyboard_target_reacquire_rejected", [
+    private func acceptSafariTargetRebuild(_ element: AXUIElement, phase: String) throws {
+        func reject(_ reason: String) throws -> Never {
+            recordDiagnostic("safari_keyboard_target_reacquire_rejected", [
+                "phase": phase,
+                "reason": reason,
+                "sameApplication": String(access.currentApplication()?.bundleIdentifier == "com.apple.Safari")
+            ])
+            invalidateKeyboardRawInsertionRegion()
+            throw TextTargetError.targetChanged
+        }
+
+        guard let currentApplication = access.currentApplication(),
+              currentApplication.bundleIdentifier == "com.apple.Safari",
+              let expectedPID = targetApplicationProcessID,
+              currentApplication.processIdentifier == expectedPID,
+              access.processIdentifier(of: element) == expectedPID,
+              let previousElement = targetElement,
+              access.elementValidity(previousElement) == .invalid else {
+            try reject("old_handle_or_process_not_verified")
+        }
+        guard let previous = safariEditorContinuity,
+              let current = access.safariEditorContinuityEvidence(for: element),
+              Self.safariEditorContinuityMatches(previous, current),
+              let context = access.textInputContext(for: element),
+              isEligibleSafariWebEditor(element, application: access.currentApplication(), context: context) else {
+            try reject("stable_unique_editor_continuity_unverified")
+        }
+
+        let previousID = targetElementObservationID
+        targetElement = element
+        targetProcessID = expectedPID
+        safariEditorContinuity = current
+        targetElementObservationID = UUID().uuidString
+        recordDiagnostic("safari_keyboard_target_reacquired", [
             "phase": phase,
-            "reason": "stable_editor_identity_unavailable",
-            "sameApplication": String(access.currentApplication()?.bundleIdentifier == "com.apple.Safari")
+            "reason": "same_web_area_unique_editor_anchor_and_expected_document",
+            "previousHandleObservationID": previousID ?? "unknown",
+            "currentHandleObservationID": targetElementObservationID ?? "unknown",
+            "editableEditorCount": String(current.editableEditorCount),
+            "editorAnchorRole": current.editorAnchorRole,
+            "rolePathDepth": String(current.rolesFromEditorToAnchor.count)
         ])
-        invalidateKeyboardRawInsertionRegion()
-        throw TextTargetError.targetChanged
+    }
+
+    private static func safariEditorContinuityMatches(
+        _ previous: AXSafariEditorContinuityEvidence,
+        _ current: AXSafariEditorContinuityEvidence
+    ) -> Bool {
+        AXSafariEditorContinuity.matches(previous, current)
     }
 
     private func isEligibleSafariWebEditor(
@@ -3719,6 +3890,132 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
         return processID
     }
 
+    func elementValidity(_ element: AXUIElement) -> AXTextElementValidity {
+        var value: CFTypeRef?
+        AXUIElementSetMessagingTimeout(element, 0.03)
+        switch AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &value) {
+        case .success: return .valid
+        case .invalidUIElement: return .invalid
+        default: return .unavailable
+        }
+    }
+
+    func safariEditorContinuityEvidence(for element: AXUIElement) -> AXSafariEditorContinuityEvidence? {
+        let deadline = Date().addingTimeInterval(0.25)
+        var node = element
+        var roles: [String] = []
+        var identifiers: [String?] = []
+        var candidates: [(element: AXUIElement, role: String, depth: Int)] = []
+        var webArea: AXUIElement?
+
+        for depth in 0..<64 {
+            guard Date() < deadline,
+                  let role = requiredAXString(kAXRoleAttribute as String, in: node) else { return nil }
+            roles.append(role)
+            guard let identifier = optionalAXString(kAXIdentifierAttribute as String, in: node, deadline: deadline) else {
+                return nil
+            }
+            identifiers.append(identifier)
+            if role == "AXWebArea" {
+                webArea = node
+                break
+            }
+            if role == "AXGroup" || role == "AXContainer" {
+                candidates.append((node, role, depth))
+            }
+            guard let parent = requiredAXElement("AXParent", in: node) else { return nil }
+            node = parent
+        }
+        guard let webArea else { return nil }
+
+        for candidate in candidates {
+            guard Date() < deadline,
+                  let (count, complete) = editableEditorCount(in: candidate.element, deadline: deadline), complete else {
+                return nil
+            }
+            if count == 1 {
+                return AXSafariEditorContinuityEvidence(
+                    webArea: webArea,
+                    editorAnchor: candidate.element,
+                    editorAnchorRole: candidate.role,
+                    rolesFromEditorToAnchor: Array(roles.prefix(candidate.depth)),
+                    identifiersFromEditorToAnchor: Array(identifiers.prefix(candidate.depth)),
+                    editableEditorCount: count,
+                    scanComplete: true
+                )
+            }
+        }
+        return nil
+    }
+
+    private func editableEditorCount(in root: AXUIElement, deadline: Date) -> (Int, Bool)? {
+        var pending = [root]
+        var visited: [AXUIElement] = []
+        var editableCount = 0
+        while !pending.isEmpty {
+            guard Date() < deadline, visited.count < 160 else { return (editableCount, false) }
+            let node = pending.removeLast()
+            guard !visited.contains(where: { CFEqual($0, node) }) else { continue }
+            visited.append(node)
+            guard let role = requiredAXString(kAXRoleAttribute as String, in: node) else { return (editableCount, false) }
+            if ["AXTextArea", "AXTextField", "AXSearchField"].contains(role) {
+                guard let subrole = optionalAXString(kAXSubroleAttribute as String, in: node, deadline: deadline),
+                      subrole != "AXSecureTextField",
+                      requiredAXBoolean("AXReadOnly", in: node) == false else { return (editableCount, false) }
+                editableCount += 1
+            }
+            guard Date() < deadline else { return (editableCount, false) }
+            var childValue: CFTypeRef?
+            AXUIElementSetMessagingTimeout(node, 0.03)
+            let status = AXUIElementCopyAttributeValue(node, "AXChildren" as CFString, &childValue)
+            switch status {
+            case .success:
+                guard let children = childValue as? [AXUIElement] else { return (editableCount, false) }
+                pending.append(contentsOf: children)
+            case .noValue: break
+            default: return (editableCount, false)
+            }
+        }
+        return (editableCount, true)
+    }
+
+    private func requiredAXString(_ name: String, in element: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        AXUIElementSetMessagingTimeout(element, 0.03)
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+        return value as? String
+    }
+
+    private func optionalAXString(_ name: String, in element: AXUIElement, deadline: Date) -> String?? {
+        guard Date() < deadline else { return nil }
+        var value: CFTypeRef?
+        AXUIElementSetMessagingTimeout(element, 0.03)
+        switch AXUIElementCopyAttributeValue(element, name as CFString, &value) {
+        case .success: return .some(value as? String)
+        case .attributeUnsupported, .noValue: return .some(nil)
+        default: return nil
+        }
+    }
+
+    private func requiredAXElement(_ name: String, in element: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+        AXUIElementSetMessagingTimeout(element, 0.03)
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return unsafeBitCast(value, to: AXUIElement.self)
+    }
+
+    private func requiredAXBoolean(_ name: String, in element: AXUIElement) -> Bool? {
+        var value: CFTypeRef?
+        AXUIElementSetMessagingTimeout(element, 0.03)
+        let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        if status == .noValue { return false }
+        guard status == .success else { return nil }
+        if let value = value as? Bool { return value }
+        if let value = value as? NSNumber { return value.boolValue }
+        return nil
+    }
+
     func textInputContext(for element: AXUIElement) -> AXTextInputTargetContext? {
         let role = stringAttribute(kAXRoleAttribute as String, from: element)
         let subroleState = stringAttributeState(kAXSubroleAttribute as String, from: element)
@@ -4015,6 +4312,7 @@ private final class KeyboardEventSender: AXTextTargetKeyboardEventSending, @unch
     }
     private let queue = DispatchQueue(label: "local.tencent.voice.mvp.keyboard-events")
     private let leftArrowKeyCode: CGKeyCode = 123
+    private let rightArrowKeyCode: CGKeyCode = 124
     private let deleteKeyCode: CGKeyCode = 51
 
     func selectTrailingText(_ previousText: String, processID: pid_t?) throws {
@@ -4046,6 +4344,17 @@ private final class KeyboardEventSender: AXTextTargetKeyboardEventSending, @unch
             stageObserver?("append_post_begin")
             try sendText(text, processID: processID)
             stageObserver?("append_post_end")
+        }
+    }
+
+    func advanceCaretRight(processID: pid_t?) throws {
+        try queue.sync {
+            guard let source = CGEventSource(stateID: .privateState) else {
+                throw TextTargetError.writeFailed
+            }
+            stageObserver?("caret_recovery_post_begin")
+            try sendKey(keyCode: rightArrowKeyCode, source: source, processID: processID)
+            stageObserver?("caret_recovery_post_end")
         }
     }
 

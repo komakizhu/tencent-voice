@@ -995,7 +995,8 @@ private final class CoordinateAwareCodexTarget: KeyboardAcknowledgingTarget {
             rawText: state.rawText,
             coordinateText: state.text,
             placeholderNormalized: state.placeholderNormalized,
-            coordinateMapping: state.mapping
+            coordinateMapping: state.mapping,
+            preferredInputStrategy: .acknowledgedKeyboard(reason: "codex_editable_text_control")
         )
     }
 

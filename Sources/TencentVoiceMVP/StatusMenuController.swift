@@ -87,7 +87,7 @@ final class StatusMenuController: NSObject {
         menu.addItem(record)
         menu.addItem(autoStart)
         menu.addItem(.separator())
-        let context = NSMenuItem(title: "记录 Codex 故障前一分钟操作", action: #selector(toggleFailureContextPressed), keyEquivalent: "")
+        let context = NSMenuItem(title: "记录浏览器与 Codex 故障前操作", action: #selector(toggleFailureContextPressed), keyEquivalent: "")
         context.target = self
         context.toolTip = "保留开启期间的语音识别、目标输入框完整文字及操作证据；容量不足会明确报告遗漏。持久化由设置页日志开关控制；不录音、不截图、不自动上传。"
         menu.addItem(context)

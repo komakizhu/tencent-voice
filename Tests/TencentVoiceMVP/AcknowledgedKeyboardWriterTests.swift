@@ -283,7 +283,8 @@ private final class DelayedKeyboardTarget: KeyboardAcknowledgingTarget {
 
     func capture() throws -> TextSnapshot {
         .init(text: text, selection: .init(location: text.utf16.count, length: 0),
-              targetApplication: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 1))
+              targetApplication: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 1),
+              preferredInputStrategy: .acknowledgedKeyboard(reason: "codex_editable_text_control"))
     }
     func replace(snapshot: TextSnapshot, range: TencentVoiceMVP.TextRange, expectedText: String,
                  with text: String) throws -> TencentVoiceMVP.TextRange { throw TextTargetError.unsupported }
@@ -335,7 +336,8 @@ private final class MixedInputKeyboardTarget: KeyboardAcknowledgingTarget {
         TextSnapshot(
             text: text,
             selection: selection,
-            targetApplication: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 1)
+            targetApplication: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 1),
+            preferredInputStrategy: .acknowledgedKeyboard(reason: "codex_editable_text_control")
         )
     }
 

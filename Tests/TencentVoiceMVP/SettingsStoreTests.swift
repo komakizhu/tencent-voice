@@ -30,6 +30,7 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(settings.engineModelType, "16k_zh")
         XCTAssertFalse(settings.saveTextLogs)
         XCTAssertFalse(settings.safeCopyEnabled)
+        XCTAssertFalse(settings.captureDiagnosticWindowFrames)
         XCTAssertTrue(settings.prepaidQuotaHoursByModel.isEmpty)
     }
 
@@ -102,6 +103,14 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(settings.prepaidQuotaHoursByModel.isEmpty)
         XCTAssertFalse(settings.safeCopyEnabled)
         XCTAssertFalse(settings.hideMenuBarIcon)
+        XCTAssertFalse(settings.captureDiagnosticWindowFrames)
+    }
+
+    func testDiagnosticWindowCaptureSettingRoundTripsAndDefaultsOff() throws {
+        XCTAssertFalse(AppSettings().captureDiagnosticWindowFrames)
+        let enabled = AppSettings(captureDiagnosticWindowFrames: true)
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(enabled))
+        XCTAssertTrue(decoded.captureDiagnosticWindowFrames)
     }
 }
 

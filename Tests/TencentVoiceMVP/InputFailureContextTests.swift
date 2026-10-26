@@ -4,6 +4,86 @@ import XCTest
 @testable import TencentVoiceMVP
 
 final class InputFailureContextTests: XCTestCase {
+    @MainActor
+    func testAXNotificationObserverRebindsAndDropsCallbacksAfterSessionEnds() async {
+        let observer = FakeInputFailureAXNotificationObserver()
+        let recorder = InputFailureContextRecorder(axNotificationObserver: observer)
+        let logger = SessionLogger(enabled: { false })
+        recorder.setEnabled(true)
+        defer { recorder.stop() }
+        let sessionID = UUID()
+        recorder.sessionBegan(sessionID)
+        recorder.observeTarget(
+            TextInputDiagnostic(
+                timestamp: Date(),
+                event: "input_target_captured",
+                fields: ["targetElementObservationID": "target-A"]
+            ),
+            element: nil,
+            pid: 9001,
+            logger: logger
+        )
+
+        XCTAssertEqual(observer.lastTargetObservationID, "target-A")
+        XCTAssertEqual(recorder.snapshot(at: Date()).collectionStatus["axNotificationIsIndependentPageEvidence"], "false")
+        let delayedCallback = try! XCTUnwrap(observer.callback)
+        delayedCallback("AXValueChanged", Date(), 123)
+        await Task.yield()
+
+        let beforeEnd = recorder.snapshot(at: Date())
+        let notification = beforeEnd.events.first { $0.event == "ax_notification_observed" }
+        XCTAssertEqual(notification?.sessionID, sessionID)
+        XCTAssertEqual(notification?.fields["independentPageEvidence"], "false")
+        XCTAssertEqual(notification?.monotonicTimestampNanoseconds, 123)
+
+        let beforeCount = beforeEnd.events.count
+        recorder.sessionEnded()
+        delayedCallback("AXSelectedTextChanged", Date(), 124)
+        await Task.yield()
+        XCTAssertEqual(recorder.snapshot(at: Date()).events.count, beforeCount)
+        XCTAssertGreaterThanOrEqual(observer.stopCount, 1)
+    }
+
+    @MainActor
+    func testDetailedFocusProbeIncludesSafariChromeAndCodexOnly() {
+        XCTAssertEqual(InputFailureContextRecorder.focusProbeApplicationBundleIdentifiers, [
+            "com.apple.Safari", "com.google.Chrome", "com.openai.codex"
+        ])
+        XCTAssertFalse(InputFailureContextRecorder.focusProbeApplicationBundleIdentifiers.contains("com.apple.finder"))
+    }
+
+    func testLateReportRetainsFailureMinuteSeparatelyFromClickMinute() {
+        let failureAt = Date(timeIntervalSince1970: 100)
+        let clickAt = failureAt.addingTimeInterval(62)
+        let sessionID = UUID()
+        let failure = InputFailureEvidence(
+            desktopContext: InputContextWindow(
+                requestedStart: failureAt.addingTimeInterval(-60),
+                recordingStartedAt: failureAt.addingTimeInterval(-120),
+                capturedAt: failureAt,
+                enabled: true,
+                droppedEventCount: 0,
+                events: [
+                    .init(timestamp: failureAt.addingTimeInterval(-1), event: "last_success", fields: [:]),
+                    .init(timestamp: failureAt, event: "failure", fields: [:])
+                ]
+            ),
+            diagnosticEvents: [
+                SessionLogEntry(timestamp: failureAt, sessionID: sessionID, event: "input_degradation")
+            ],
+            diagnosticEventsTruncated: false
+        )
+
+        let retained = failure.retainingFailureContext(
+            reportWindowStart: clickAt.addingTimeInterval(-60),
+            through: clickAt
+        )
+        XCTAssertEqual(retained.desktopContext.events.map(\.event), ["last_success", "failure"])
+        XCTAssertEqual(retained.desktopContext.collectionStatus["associatedFailureAt"], DiagnosticReportTime.format(failureAt))
+        XCTAssertEqual(retained.desktopContext.collectionStatus["timelineIncludesOlderFailureContext"], "true")
+        XCTAssertEqual(retained.sessionIDs, Set([sessionID]))
+    }
+
     func testLaterFailureDoesNotDiscardFirstFailureProbe() {
         var buffer = InputContextBuffer()
         let start = Date(timeIntervalSince1970: 1000)
@@ -29,6 +109,98 @@ final class InputFailureContextTests: XCTestCase {
         buffer.append(.init(timestamp: start.addingTimeInterval(63), event: "ignored", fields: [:]), now: start.addingTimeInterval(63))
         XCTAssertFalse(buffer.snapshot(at: start.addingTimeInterval(63)).enabled)
         XCTAssertTrue(buffer.events.isEmpty)
+    }
+
+    func testInputTimelinePairsMonotonicTimeWithSessionOperationAndTarget() throws {
+        let start = Date(timeIntervalSince1970: 2_000)
+        let sessionID = UUID()
+        var buffer = InputContextBuffer()
+        buffer.start(at: start)
+        buffer.append(InputContextEvent(
+            timestamp: start.addingTimeInterval(0.25),
+            event: "input_editor_probe",
+            fields: ["phase": "keyboard_write_acknowledged"],
+            monotonicTimestampNanoseconds: 98_765,
+            sessionID: sessionID,
+            operationID: 17,
+            targetApplicationBundleIdentifier: "com.apple.Safari",
+            targetApplicationProcessID: 123
+        ), now: start.addingTimeInterval(0.25))
+
+        let snapshot = buffer.snapshot(at: start.addingTimeInterval(0.5))
+        XCTAssertEqual(snapshot.events.first?.sessionID, sessionID)
+        XCTAssertEqual(snapshot.events.first?.operationID, 17)
+        XCTAssertEqual(snapshot.events.first?.targetApplicationBundleIdentifier, "com.apple.Safari")
+        XCTAssertEqual(snapshot.events.first?.targetApplicationProcessID, 123)
+        XCTAssertEqual(snapshot.events.first?.monotonicTimestampNanoseconds, 98_765)
+        XCTAssertNotNil(snapshot.capturedAtMonotonicNanoseconds)
+        XCTAssertNotNil(snapshot.recordingStartedAtMonotonicNanoseconds)
+
+        let oldEvent = try JSONDecoder().decode(InputContextEvent.self, from: Data(
+            "{\"timestamp\":0,\"event\":\"legacy\",\"fields\":{}}".utf8
+        ))
+        XCTAssertNil(oldEvent.sessionID)
+        XCTAssertNil(oldEvent.monotonicTimestampNanoseconds)
+    }
+
+    func testInputTimelineUsesMonotonicOrderWhenWallClockMovesBackward() {
+        let start = Date(timeIntervalSince1970: 2_000)
+        var buffer = InputContextBuffer()
+        buffer.start(at: start)
+        buffer.append(.init(
+            timestamp: start.addingTimeInterval(2), event: "later_monotonic",
+            fields: [:], monotonicTimestampNanoseconds: 200
+        ), now: start.addingTimeInterval(2))
+        buffer.append(.init(
+            timestamp: start.addingTimeInterval(1), event: "earlier_monotonic",
+            fields: [:], monotonicTimestampNanoseconds: 100
+        ), now: start.addingTimeInterval(2))
+
+        XCTAssertEqual(buffer.snapshot(at: start.addingTimeInterval(3)).events.map(\.event), [
+            "earlier_monotonic", "later_monotonic"
+        ])
+    }
+
+    func testDiagnosticSessionTimelineUsesMonotonicOrderWhenWallClockMovesBackward() {
+        let laterWallClock = SessionLogEntry(
+            timestamp: Date(timeIntervalSince1970: 2_002),
+            monotonicTimestampNanoseconds: 200,
+            event: "later_monotonic"
+        )
+        let earlierWallClock = SessionLogEntry(
+            timestamp: Date(timeIntervalSince1970: 2_001),
+            monotonicTimestampNanoseconds: 100,
+            event: "earlier_monotonic"
+        )
+
+        XCTAssertEqual(orderedDiagnosticSessionEntries([laterWallClock, earlierWallClock]).map(\.event), [
+            "earlier_monotonic", "later_monotonic"
+        ])
+    }
+
+    @MainActor
+    func testRecorderKeepsSelectionMilestoneIDAndExplainsInteractionCoverage() {
+        let recorder = InputFailureContextRecorder()
+        let logger = SessionLogger(enabled: { false })
+        recorder.setEnabled(true)
+        defer { recorder.stop() }
+        let eventID = UUID()
+        let diagnostic = TextInputDiagnostic(
+            eventID: eventID,
+            timestamp: Date(),
+            event: "keyboard_selection_stabilized",
+            fields: ["operationID": "17", "inputSessionGeneration": "3"]
+        )
+
+        recorder.observeTarget(diagnostic, element: nil, pid: nil, logger: logger)
+
+        let snapshot = recorder.snapshot(at: Date())
+        let selectionEvent = snapshot.events.first { $0.event == "keyboard_selection_stabilized" }
+        XCTAssertEqual(selectionEvent?.eventID, eventID)
+        XCTAssertEqual(selectionEvent?.operationID, 17)
+        XCTAssertNotNil(snapshot.collectionStatus["keyboardActivityThrottledCount"])
+        XCTAssertNotNil(snapshot.collectionStatus["secureInputFilteredCount"])
+        XCTAssertEqual(snapshot.collectionStatus["axNotificationNoCallbackMeaning"], "no_callback_is_not_evidence_of_no_change")
     }
 
     func testFrozenFailureSurvivesLateReportAndClearsWhenDisabled() {
@@ -349,7 +521,7 @@ final class InputFailureContextTests: XCTestCase {
             onSelectRimeTheme: { _ in }, onManageRimeDictionary: {}, onExportRimeConfiguration: {},
             onImportRimeConfiguration: {}, onToggleFailureContext: { toggles += 1 },
             onReportInputFailure: { reports += 1 }, onOpenFailureReports: { opens += 1 })
-        for title in ["记录 Codex 故障前一分钟操作", "报告输入失效", "打开失效报告目录"] {
+        for title in ["记录浏览器与 Codex 故障前操作", "报告输入失效", "打开失效报告目录"] {
             let index = try XCTUnwrap(menu.items.firstIndex { $0.title == title })
             menu.performActionForItem(at: index)
         }
@@ -357,6 +529,34 @@ final class InputFailureContextTests: XCTestCase {
         XCTAssertEqual(reports, 1)
         XCTAssertEqual(opens, 1)
         menuController.update(failureContextEnabled: true)
-        XCTAssertEqual(menu.items.first { $0.title == "记录 Codex 故障前一分钟操作" }?.state, .on)
+        XCTAssertEqual(menu.items.first { $0.title == "记录浏览器与 Codex 故障前操作" }?.state, .on)
+    }
+}
+
+@MainActor
+private final class FakeInputFailureAXNotificationObserver: InputFailureAXNotificationObserving {
+    private(set) var lastTargetObservationID: String?
+    private(set) var stopCount = 0
+    private(set) var callback: (@Sendable (String, Date, UInt64) -> Void)?
+
+    func start(
+        processID: pid_t,
+        target: AXUIElement?,
+        targetObservationID: String?,
+        onNotification: @escaping @Sendable (String, Date, UInt64) -> Void
+    ) -> [String: String] {
+        lastTargetObservationID = targetObservationID
+        callback = onNotification
+        return [
+            "state": "active",
+            "selectedTextChanged": "registered",
+            "valueChanged": "registered",
+            "evidenceSource": "test_AX_callback"
+        ]
+    }
+
+    func stop() {
+        stopCount += 1
+        callback = nil
     }
 }

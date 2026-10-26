@@ -3,6 +3,67 @@ import XCTest
 
 @MainActor
 final class DiagnosticReportTests: XCTestCase {
+    func testLegacyInputFailureReportDecodesWithoutNewClockAndFrameFields() throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let event = InputContextEvent(timestamp: timestamp, event: "legacy_activity", fields: [:])
+        let context = InputContextWindow(
+            requestedStart: timestamp.addingTimeInterval(-60),
+            recordingStartedAt: nil,
+            capturedAt: timestamp,
+            enabled: false,
+            droppedEventCount: 0,
+            events: [event]
+        )
+        let diagnosticReport = DiagnosticReport(
+            schemaVersion: 3,
+            app: appInfo(),
+            permissions: PrivacyPermissionReport(statuses: []),
+            credentials: DiagnosticCredentialInfo(state: .configured, detail: "configured"),
+            settings: DiagnosticSettingsInfo(
+                shortcut: "test",
+                engineModelType: "test",
+                persistentSessionLogEnabled: false
+            ),
+            events: [],
+            logDirectoryPath: "/tmp/logs"
+        )
+        let inputFailureReport = InputFailureReport(
+            schemaVersion: 3,
+            id: UUID(),
+            generatedAt: timestamp,
+            desktopContext: context,
+            diagnosticReport: diagnosticReport,
+            diagnosticEventsTruncated: false,
+            evidenceScopeNote: "legacy"
+        )
+        let encoded = try DiagnosticJSON.encoder().encode(inputFailureReport)
+        var root = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        root.removeValue(forKey: "windowFrameCapture")
+        var desktopContext = try XCTUnwrap(root["desktopContext"] as? [String: Any])
+        desktopContext.removeValue(forKey: "capturedAtMonotonicNanoseconds")
+        desktopContext.removeValue(forKey: "recordingStartedAtMonotonicNanoseconds")
+        var events = try XCTUnwrap(desktopContext["events"] as? [[String: Any]])
+        events[0].removeValue(forKey: "monotonicTimestampNanoseconds")
+        events[0].removeValue(forKey: "sessionID")
+        events[0].removeValue(forKey: "operationID")
+        events[0].removeValue(forKey: "targetApplicationBundleIdentifier")
+        events[0].removeValue(forKey: "targetApplicationProcessID")
+        desktopContext["events"] = events
+        root["desktopContext"] = desktopContext
+
+        let decoded = try DiagnosticJSON.decoder().decode(
+            InputFailureReport.self,
+            from: JSONSerialization.data(withJSONObject: root)
+        )
+
+        XCTAssertEqual(decoded.schemaVersion, 3)
+        XCTAssertNil(decoded.windowFrameCapture)
+        XCTAssertNil(decoded.desktopContext.capturedAtMonotonicNanoseconds)
+        XCTAssertNil(decoded.desktopContext.recordingStartedAtMonotonicNanoseconds)
+        XCTAssertNil(decoded.desktopContext.events.first?.monotonicTimestampNanoseconds)
+        XCTAssertNil(decoded.desktopContext.events.first?.sessionID)
+    }
+
     func testReportSeparatesWaitSkippedFromActualTimeoutAndShowsOperationContext() throws {
         let session = UUID()
         let events = [
@@ -1062,6 +1123,54 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertEqual(entry.sessionID, sessionID)
         XCTAssertEqual(entry.kind, .session)
         XCTAssertEqual(entry.metadata, [:])
+    }
+
+    func testFailureSummarySeparatesObservedMismatchFromUnprovenCause() throws {
+        let failure = SessionLogEntry(
+            event: "keyboard_write_unconfirmed",
+            metadata: ["failureCode": "documentMismatch"],
+            textEvidence: [
+                DiagnosticTextEvidence(
+                    kind: .expectedDocument, source: .expected, text: "上一句，那必"
+                ),
+                DiagnosticTextEvidence(
+                    kind: .axValue, source: .observed, text: "上一句必，那"
+                )
+            ]
+        )
+
+        let summary = try XCTUnwrap(DiagnosticSessionSummary.make(from: [failure]).first)
+        let encoded = try JSONEncoder().encode(summary)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let assessment = try XCTUnwrap(object["causeAssessment"] as? [String: Any])
+        XCTAssertEqual(assessment["observableFailure"] as? String, "正文与预期正文不一致")
+        XCTAssertEqual(assessment["status"] as? String, "原因未唯一确定")
+        XCTAssertTrue((assessment["candidateCauses"] as? [String] ?? []).contains("编辑器实际选区移动"))
+        XCTAssertTrue((assessment["candidateCauses"] as? [String] ?? []).contains("AX 读数滞后"))
+        XCTAssertTrue((assessment["missingEvidence"] as? [String] ?? []).contains("独立于 AX 的页面正文或选区状态"))
+    }
+
+    func testSchemaFiveSummaryWithoutCauseAssessmentStillDecodes() throws {
+        let summary = DiagnosticSessionSummary(
+            sessionID: UUID(),
+            firstAnomaly: nil,
+            lastSuccessBeforeAnomaly: nil,
+            recognitionEventsAfterAnomaly: 0,
+            finalSafeCopy: nil,
+            fullTextEvidenceCount: 0,
+            screenEvidenceStatus: "not_captured"
+        )
+        let encoded = try DiagnosticJSON.encoder().encode(summary)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "causeAssessment")
+
+        let decoded = try DiagnosticJSON.decoder().decode(
+            DiagnosticSessionSummary.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+
+        XCTAssertNil(decoded.causeAssessment)
+        XCTAssertEqual(decoded.screenEvidenceStatus, "not_captured")
     }
 
     private func appInfo() -> DiagnosticAppInfo {

@@ -1,7 +1,9 @@
 import Foundation
 
 struct TextInputDiagnostic {
+    let eventID: UUID
     let timestamp: Date
+    let monotonicTimestampNanoseconds: UInt64
     let event: String
     let fields: [String: String]
     let textEvidence: [DiagnosticTextEvidence]
@@ -11,8 +13,17 @@ struct TextInputDiagnostic {
             + textEvidence.reduce(0) { $0 + 256 + $1.text.utf8.count }
     }
 
-    init(timestamp: Date, event: String, fields: [String: String], textEvidence: [DiagnosticTextEvidence] = []) {
+    init(
+        eventID: UUID = UUID(),
+        timestamp: Date,
+        monotonicTimestampNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds,
+        event: String,
+        fields: [String: String],
+        textEvidence: [DiagnosticTextEvidence] = []
+    ) {
+        self.eventID = eventID
         self.timestamp = timestamp
+        self.monotonicTimestampNanoseconds = monotonicTimestampNanoseconds
         self.event = event
         self.fields = fields
         self.textEvidence = textEvidence

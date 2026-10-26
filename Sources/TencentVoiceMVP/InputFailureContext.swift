@@ -7,6 +7,12 @@ struct InputContextEvent: Codable, Equatable, Sendable {
     let timestamp: Date
     let event: String
     let fields: [String: String]
+    var eventID: UUID? = nil
+    var monotonicTimestampNanoseconds: UInt64? = nil
+    var sessionID: UUID? = nil
+    var operationID: Int? = nil
+    var targetApplicationBundleIdentifier: String? = nil
+    var targetApplicationProcessID: Int32? = nil
 }
 
 struct InputContextWindow: Codable, Sendable {
@@ -19,6 +25,24 @@ struct InputContextWindow: Codable, Sendable {
     var collectionStatus: [String: String] = [:]
     var droppedEventTimestamps: [Date]? = nil
     var droppedEventTimestampOverflowRange: [Date]? = nil
+    var capturedAtMonotonicNanoseconds: UInt64? = nil
+    var recordingStartedAtMonotonicNanoseconds: UInt64? = nil
+
+    static func ordered(_ events: [InputContextEvent]) -> [InputContextEvent] {
+        let indexed = Array(events.enumerated())
+        if events.allSatisfy({ $0.monotonicTimestampNanoseconds != nil }) {
+            return indexed.sorted {
+                let lhs = $0.element.monotonicTimestampNanoseconds ?? 0
+                let rhs = $1.element.monotonicTimestampNanoseconds ?? 0
+                return lhs == rhs ? $0.offset < $1.offset : lhs < rhs
+            }.map(\.element)
+        }
+        return indexed.sorted {
+            $0.element.timestamp == $1.element.timestamp
+                ? $0.offset < $1.offset
+                : $0.element.timestamp < $1.element.timestamp
+        }.map(\.element)
+    }
 
     func restricted(to start: Date, through end: Date) -> Self {
         var status = collectionStatus
@@ -51,10 +75,12 @@ struct InputContextWindow: Codable, Sendable {
             capturedAt: min(capturedAt, end),
             enabled: enabled,
             droppedEventCount: windowDropCount,
-            events: events.filter { $0.timestamp >= start && $0.timestamp <= end },
+            events: Self.ordered(events.filter { $0.timestamp >= start && $0.timestamp <= end }),
             collectionStatus: status,
             droppedEventTimestamps: nil,
-            droppedEventTimestampOverflowRange: nil
+            droppedEventTimestampOverflowRange: nil,
+            capturedAtMonotonicNanoseconds: capturedAtMonotonicNanoseconds,
+            recordingStartedAtMonotonicNanoseconds: recordingStartedAtMonotonicNanoseconds
         )
     }
 }
@@ -65,7 +91,9 @@ struct InputContextBuffer {
     private(set) var latestFailure: InputContextWindow?
     private(set) var firstFailure: InputContextWindow?
     private(set) var startedAt: Date?
+    private(set) var startedAtMonotonicNanoseconds: UInt64?
     private var dropped = 0
+    private var eventIDs = Set<UUID>()
     private var droppedEventTimestamps: [Date] = []
     private var droppedEventTimestampHead = 0
     private var droppedEventTimestampOverflowRange: [Date]?
@@ -79,10 +107,12 @@ struct InputContextBuffer {
         latestFailure = nil
         firstFailure = nil
         dropped = 0
+        eventIDs = []
         droppedEventTimestamps = []
         droppedEventTimestampHead = 0
         droppedEventTimestampOverflowRange = nil
         startedAt = date
+        startedAtMonotonicNanoseconds = DispatchTime.now().uptimeNanoseconds
     }
 
     mutating func stop() {
@@ -90,20 +120,24 @@ struct InputContextBuffer {
         latestFailure = nil
         firstFailure = nil
         dropped = 0
+        eventIDs = []
         droppedEventTimestamps = []
         droppedEventTimestampHead = 0
         droppedEventTimestampOverflowRange = nil
         startedAt = nil
+        startedAtMonotonicNanoseconds = nil
     }
 
     mutating func append(_ event: InputContextEvent, now: Date) {
         guard startedAt != nil else { return }
+        if let eventID = event.eventID, !eventIDs.insert(eventID).inserted { return }
         events.append(event)
         if events.count > capacity {
             let overflow = events.count - capacity
             dropped += overflow
             for removedEvent in events.prefix(overflow) {
                 droppedEventTimestamps.append(removedEvent.timestamp)
+                if let eventID = removedEvent.eventID { eventIDs.remove(eventID) }
             }
             events.removeFirst(overflow)
             while droppedEventTimestamps.count - droppedEventTimestampHead > droppedEventTimestampLimit {
@@ -122,9 +156,12 @@ struct InputContextBuffer {
     mutating func snapshot(at now: Date) -> InputContextWindow {
         return InputContextWindow(requestedStart: startedAt ?? now,
             recordingStartedAt: startedAt, capturedAt: now, enabled: startedAt != nil,
-            droppedEventCount: dropped, events: events.filter { $0.timestamp <= now },
+            droppedEventCount: dropped,
+            events: InputContextWindow.ordered(events.filter { $0.timestamp <= now }),
             droppedEventTimestamps: droppedEventTimestamps[droppedEventTimestampHead...].filter { $0 <= now },
-            droppedEventTimestampOverflowRange: droppedEventTimestampOverflowRange)
+            droppedEventTimestampOverflowRange: droppedEventTimestampOverflowRange,
+            capturedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds,
+            recordingStartedAtMonotonicNanoseconds: startedAtMonotonicNanoseconds)
     }
 
     mutating func freezeFailure(at date: Date, probeStatus: String = "pending") {
@@ -141,7 +178,9 @@ struct InputContextBuffer {
                 enabled: first.enabled, droppedEventCount: first.droppedEventCount,
                 events: first.events + [event], collectionStatus: first.collectionStatus,
                 droppedEventTimestamps: first.droppedEventTimestamps,
-                droppedEventTimestampOverflowRange: first.droppedEventTimestampOverflowRange)
+                droppedEventTimestampOverflowRange: first.droppedEventTimestampOverflowRange,
+                capturedAtMonotonicNanoseconds: first.capturedAtMonotonicNanoseconds,
+                recordingStartedAtMonotonicNanoseconds: first.recordingStartedAtMonotonicNanoseconds)
             firstFailure?.collectionStatus["failureProbeStatus"] = "completed"
         }
         guard let window = latestFailure, window.capturedAt == failureAt else { return }
@@ -150,7 +189,9 @@ struct InputContextBuffer {
             enabled: window.enabled, droppedEventCount: window.droppedEventCount,
             events: window.events + [event], collectionStatus: window.collectionStatus,
             droppedEventTimestamps: window.droppedEventTimestamps,
-            droppedEventTimestampOverflowRange: window.droppedEventTimestampOverflowRange)
+            droppedEventTimestampOverflowRange: window.droppedEventTimestampOverflowRange,
+            capturedAtMonotonicNanoseconds: window.capturedAtMonotonicNanoseconds,
+            recordingStartedAtMonotonicNanoseconds: window.recordingStartedAtMonotonicNanoseconds)
         latestFailure?.collectionStatus["failureProbeStatus"] = "completed"
     }
 
@@ -168,7 +209,148 @@ enum InputContextKeyFilter {
 }
 
 @MainActor
+protocol InputFailureAXNotificationObserving: AnyObject {
+    func start(
+        processID: pid_t,
+        target: AXUIElement?,
+        targetObservationID: String?,
+        onNotification: @escaping @Sendable (String, Date, UInt64) -> Void
+    ) -> [String: String]
+    func stop()
+}
+
+private final class InputFailureAXObserverCallbackContext: @unchecked Sendable {
+    let onNotification: @Sendable (String, Date, UInt64) -> Void
+
+    init(onNotification: @escaping @Sendable (String, Date, UInt64) -> Void) {
+        self.onNotification = onNotification
+    }
+}
+
+private let inputFailureAXObserverCallback: AXObserverCallback = { _, _, notification, refcon in
+    guard let refcon else { return }
+    let context = Unmanaged<InputFailureAXObserverCallbackContext>.fromOpaque(refcon).takeUnretainedValue()
+    context.onNotification(
+        notification as String,
+        Date(),
+        DispatchTime.now().uptimeNanoseconds
+    )
+}
+
+@MainActor
+private final class SystemInputFailureAXNotificationObserver: InputFailureAXNotificationObserving {
+    private struct Registration {
+        let element: AXUIElement
+        let notification: CFString
+    }
+
+    private var observer: AXObserver?
+    private var callbackContext: InputFailureAXObserverCallbackContext?
+    private var registrations: [Registration] = []
+    private var runLoopSource: CFRunLoopSource?
+
+    func start(
+        processID: pid_t,
+        target: AXUIElement?,
+        targetObservationID: String?,
+        onNotification: @escaping @Sendable (String, Date, UInt64) -> Void
+    ) -> [String: String] {
+        stop()
+        var status = [
+            "accessibilityPermission": AXIsProcessTrusted() ? "granted" : "denied",
+            "targetObservationID": targetObservationID ?? "unknown"
+        ]
+        guard AXIsProcessTrusted() else {
+            status["state"] = "permission_denied"
+            return status
+        }
+
+        var createdObserver: AXObserver?
+        let createError = AXObserverCreate(processID, inputFailureAXObserverCallback, &createdObserver)
+        guard createError == .success, let createdObserver else {
+            status["state"] = "observer_create_failed"
+            status["observerCreateError"] = String(createError.rawValue)
+            return status
+        }
+
+        let callbackContext = InputFailureAXObserverCallbackContext(onNotification: onNotification)
+        let refcon = Unmanaged.passUnretained(callbackContext).toOpaque()
+        let appElement = AXUIElementCreateApplication(processID)
+        status["focusedElementChanged"] = register(
+            kAXFocusedUIElementChangedNotification as CFString,
+            on: appElement,
+            observer: createdObserver,
+            refcon: refcon
+        )
+        if let target {
+            status["selectedTextChanged"] = register(
+                kAXSelectedTextChangedNotification as CFString,
+                on: target,
+                observer: createdObserver,
+                refcon: refcon
+            )
+            status["valueChanged"] = register(
+                kAXValueChangedNotification as CFString,
+                on: target,
+                observer: createdObserver,
+                refcon: refcon
+            )
+        } else {
+            status["selectedTextChanged"] = "target_handle_unavailable"
+            status["valueChanged"] = "target_handle_unavailable"
+        }
+
+        guard !registrations.isEmpty else {
+            status["state"] = "no_notifications_supported"
+            self.callbackContext = nil
+            registrations = []
+            return status
+        }
+        let source = AXObserverGetRunLoopSource(createdObserver)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        observer = createdObserver
+        self.callbackContext = callbackContext
+        runLoopSource = source
+        status["state"] = registrations.count == 3 ? "active" : "partially_active"
+        status["registeredNotificationCount"] = String(registrations.count)
+        status["evidenceSource"] = "AX_notification_not_independent_DOM_or_screen_evidence"
+        return status
+    }
+
+    func stop() {
+        if let observer {
+            for registration in registrations {
+                AXObserverRemoveNotification(observer, registration.element, registration.notification)
+            }
+        }
+        if let runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        }
+        observer = nil
+        callbackContext = nil
+        registrations = []
+        runLoopSource = nil
+    }
+
+    private func register(
+        _ notification: CFString,
+        on element: AXUIElement,
+        observer: AXObserver,
+        refcon: UnsafeMutableRawPointer
+    ) -> String {
+        let result = AXObserverAddNotification(observer, element, notification, refcon)
+        guard result == .success else { return "unsupported_or_failed_\(result.rawValue)" }
+        registrations.append(Registration(element: element, notification: notification))
+        return "registered"
+    }
+}
+
+@MainActor
 final class InputFailureContextRecorder {
+    static let focusProbeApplicationBundleIdentifiers: Set<String> = [
+        "com.apple.Safari", "com.google.Chrome", "com.openai.codex"
+    ]
+
     private(set) var isEnabled = false
     private var buffer = InputContextBuffer()
     private var globalMonitor: Any?
@@ -185,6 +367,29 @@ final class InputFailureContextRecorder {
     private var firstFailureDiagnostics: [SessionLogEntry] = []
     private var firstFailureDiagnosticsTruncated = false
     private var lastOperationProbe: Date = .distantPast
+    private var activeSessionID: UUID?
+    private let axNotificationObserver: any InputFailureAXNotificationObserving
+    private var axNotificationStatus: [String: String] = ["state": "not_started"]
+    private var observedAXTargetPID: pid_t?
+    private var observedAXTargetID: String?
+    private var interactionCaptureCounts: [String: Int] = [:]
+    private var observedAXTargetElement: AXUIElement?
+    private var axNotificationGeneration = 0
+
+    private static let timelineTargetEvents: Set<String> = [
+        "keyboard_selection_stabilization_skipped", "keyboard_selection_stabilized",
+        "keyboard_selection_stabilization_failed", "keyboard_selection_submitted",
+        "ax_selected_text_range_set_requested", "ax_selected_text_range_set_returned",
+        "ax_selected_text_range_set_threw", "keyboard_document_observed",
+        "keyboard_state_change_observed", "keyboard_write_submitted",
+        "keyboard_write_acknowledged", "keyboard_write_unconfirmed",
+        "keyboard_focus_changed", "ax_focus_changed", "safari_keyboard_target_reacquired",
+        "safari_keyboard_target_reacquire_rejected", "text_dispatch_returned"
+    ]
+
+    init(axNotificationObserver: (any InputFailureAXNotificationObserving)? = nil) {
+        self.axNotificationObserver = axNotificationObserver ?? SystemInputFailureAXNotificationObserver()
+    }
 
     var latestFailure: InputFailureEvidence? {
         guard let context = buffer.latestFailure else { return nil }
@@ -205,12 +410,32 @@ final class InputFailureContextRecorder {
         }
     }
 
+    func sessionBegan(_ sessionID: UUID) {
+        activeSessionID = sessionID
+    }
+
+    func sessionEnded() {
+        activeSessionID = nil
+        stopAXNotificationObserver(status: "session_ended")
+    }
+
     func observeSessionEntry(_ entry: SessionLogEntry, logger: SessionLogger) {
-        guard isEnabled, DiagnosticAnomaly.events.contains(entry.event) else { return }
+        guard isEnabled else { return }
+        guard DiagnosticAnomaly.events.contains(entry.event) else { return }
         // Target observations can precede the unified log. Preserve their pending
         // probe; injector/session-only failures have no safe editor handle to probe.
         if buffer.latestFailure?.capturedAt != entry.timestamp {
-            record(entry.event, fields: entry.metadata, at: entry.timestamp)
+            record(
+                entry.event,
+                fields: entry.metadata,
+                at: entry.timestamp,
+                sessionID: entry.sessionID,
+                operationID: Int(entry.metadata["operationID"] ?? ""),
+                targetApplicationBundleIdentifier: entry.targetApplicationBundleIdentifier,
+                targetApplicationProcessID: entry.targetApplicationProcessID,
+                eventID: entry.eventID,
+                monotonicTimestampNanoseconds: entry.monotonicTimestampNanoseconds
+            )
             buffer.freezeFailure(at: entry.timestamp, probeStatus: "not_requested_no_target_handle")
         }
         latestFailureDiagnostics = logger.failureEvents(at: entry.timestamp, recoverPersisted: false)
@@ -224,14 +449,46 @@ final class InputFailureContextRecorder {
         let capture = diagnostic.event == "input_target_captured"
         let dispatch = ["keyboard_write_submitted", "ax_write_submitted"].contains(diagnostic.event)
         let acknowledged = ["keyboard_write_acknowledged", "ax_write_acknowledged"].contains(diagnostic.event)
-        guard failure || capture || dispatch || acknowledged else { return }
+        let timelineEvent = Self.timelineTargetEvents.contains(diagnostic.event)
+        guard failure || capture || dispatch || acknowledged || timelineEvent else { return }
         let now = diagnostic.timestamp
+        let bundleIdentifier = pid.flatMap { NSRunningApplication(processIdentifier: $0)?.bundleIdentifier }
+        if capture, let pid {
+            bindAXNotificationObserver(
+                processID: pid,
+                target: element,
+                bundleIdentifier: bundleIdentifier,
+                targetObservationID: diagnostic.fields["targetElementObservationID"]
+            )
+        }
         if failure {
-            record(diagnostic.event, fields: DiagnosticLogSanitizer.fields(diagnostic.fields), at: now)
+            record(
+                diagnostic.event,
+                fields: DiagnosticLogSanitizer.fields(diagnostic.fields),
+                at: now,
+                sessionID: activeSessionID,
+                operationID: Int(diagnostic.fields["operationID"] ?? ""),
+                targetApplicationBundleIdentifier: bundleIdentifier,
+                targetApplicationProcessID: pid.map { Int32($0) },
+                eventID: diagnostic.eventID,
+                monotonicTimestampNanoseconds: diagnostic.monotonicTimestampNanoseconds
+            )
             buffer.freezeFailure(at: now, probeStatus: pid == nil ? "not_requested_no_target_pid" : "pending")
             latestFailureDiagnostics = logger.failureEvents(at: now, recoverPersisted: false)
             latestFailureDiagnosticsTruncated = logger.failureContextEvidenceTruncated(at: now)
             retainFirstFailureDiagnostics(at: now)
+        } else if timelineEvent || dispatch || acknowledged || capture {
+            record(
+                diagnostic.event,
+                fields: DiagnosticLogSanitizer.fields(diagnostic.fields),
+                at: now,
+                sessionID: activeSessionID,
+                operationID: Int(diagnostic.fields["operationID"] ?? ""),
+                targetApplicationBundleIdentifier: bundleIdentifier,
+                targetApplicationProcessID: pid.map { Int32($0) },
+                eventID: diagnostic.eventID,
+                monotonicTimestampNanoseconds: diagnostic.monotonicTimestampNanoseconds
+            )
         }
         guard failure || capture || now.timeIntervalSince(lastOperationProbe) >= 1 else { return }
         lastOperationProbe = now
@@ -251,10 +508,83 @@ final class InputFailureContextRecorder {
             fields["pid"] = String(pid)
             fields["requestedAt"] = now.ISO8601Format()
             fields["frontmostPIDAtCompletion"] = String(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0)
-            let event = InputContextEvent(timestamp: Date(), event: "input_editor_probe", fields: fields)
+            let bundleIdentifier = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+            let event = InputContextEvent(
+                timestamp: Date(),
+                event: "input_editor_probe",
+                fields: fields,
+                monotonicTimestampNanoseconds: DispatchTime.now().uptimeNanoseconds,
+                sessionID: self.activeSessionID,
+                operationID: Int(diagnostic.fields["operationID"] ?? ""),
+                targetApplicationBundleIdentifier: bundleIdentifier,
+                targetApplicationProcessID: Int32(pid)
+            )
             self.buffer.append(event, now: event.timestamp)
             if failure { self.buffer.appendFailureProbe(event, failureAt: now) }
         }
+    }
+
+    private func bindAXNotificationObserver(
+        processID: pid_t,
+        target: AXUIElement?,
+        bundleIdentifier: String?,
+        targetObservationID: String?
+    ) {
+        if observedAXTargetPID == processID,
+           observedAXTargetID == targetObservationID,
+           ((observedAXTargetElement == nil && target == nil)
+                || (observedAXTargetElement.flatMap { old in target.map { CFEqual(old, $0) } } == true)) {
+            return
+        }
+        stopAXNotificationObserver(status: "target_rebound")
+        observedAXTargetPID = processID
+        observedAXTargetID = targetObservationID
+        observedAXTargetElement = target
+        axNotificationGeneration += 1
+        let token = axNotificationGeneration
+        axNotificationStatus = axNotificationObserver.start(
+            processID: processID,
+            target: target,
+            targetObservationID: targetObservationID
+        ) { [weak self] name, timestamp, monotonic in
+            Task { @MainActor [weak self] in
+                guard let self, self.isEnabled, self.axNotificationGeneration == token else { return }
+                self.record(
+                    "ax_notification_observed",
+                    fields: [
+                        "notification": name,
+                        "observation": "AX_callback_only",
+                        "independentPageEvidence": "false",
+                        "targetObservationID": targetObservationID ?? "unknown"
+                    ],
+                    at: timestamp,
+                    sessionID: self.activeSessionID,
+                    targetApplicationBundleIdentifier: bundleIdentifier,
+                    targetApplicationProcessID: Int32(processID),
+                    monotonicTimestampNanoseconds: monotonic
+                )
+            }
+        }
+        var fields = axNotificationStatus
+        fields["targetApplicationBundleIdentifier"] = bundleIdentifier ?? "unknown"
+        fields["targetApplicationProcessID"] = String(processID)
+        fields["targetObservationID"] = targetObservationID ?? "unknown"
+        fields["scope"] = "selected_text_value_and_application_focus_notifications"
+        record(
+            "ax_notification_observer_status",
+            fields: fields,
+            targetApplicationBundleIdentifier: bundleIdentifier,
+            targetApplicationProcessID: Int32(processID)
+        )
+    }
+
+    private func stopAXNotificationObserver(status: String) {
+        axNotificationGeneration += 1
+        axNotificationObserver.stop()
+        observedAXTargetPID = nil
+        observedAXTargetID = nil
+        observedAXTargetElement = nil
+        axNotificationStatus = ["state": status]
     }
 
     func setEnabled(_ enabled: Bool) {
@@ -263,6 +593,15 @@ final class InputFailureContextRecorder {
         guard enabled else { return }
         isEnabled = true
         buffer.start(at: Date())
+        interactionCaptureCounts = [
+            "syntheticInputFilteredCount": 0,
+            "unsupportedAppKeyboardFilteredCount": 0,
+            "repeatKeyboardFilteredCount": 0,
+            "secureInputFilteredCount": 0,
+            "keyboardActivityThrottledCount": 0,
+            "scrollActivityThrottledCount": 0
+        ]
+        axNotificationStatus = ["state": "awaiting_target_capture"]
         let mask: NSEvent.EventTypeMask = [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel]
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
             self?.observe(event)
@@ -281,8 +620,13 @@ final class InputFailureContextRecorder {
                 self?.record("application_activated", fields: fields, at: date)
             }
         }
-        record("recording_started", fields: ["globalMonitorInstalled": String(globalMonitor != nil),
-            "accessibilityGranted": String(AXIsProcessTrusted()), "pollIntervalMilliseconds": "500"])
+        record("recording_started", fields: [
+            "globalMonitorInstalled": String(globalMonitor != nil),
+            "localMonitorInstalled": String(localMonitor != nil),
+            "accessibilityGranted": String(AXIsProcessTrusted()),
+            "pollIntervalMilliseconds": "500",
+            "typedCharactersRecorded": "false"
+        ])
         sampleTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 await self?.sample()
@@ -293,6 +637,7 @@ final class InputFailureContextRecorder {
 
     func stop() {
         generation += 1
+        stopAXNotificationObserver(status: "disabled")
         sampleTask?.cancel()
         sampleTask = nil
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
@@ -310,6 +655,7 @@ final class InputFailureContextRecorder {
         firstFailureDiagnostics = []
         firstFailureDiagnosticsTruncated = false
         lastOperationProbe = .distantPast
+        interactionCaptureCounts = [:]
     }
 
     func snapshot(at date: Date) -> InputContextWindow {
@@ -317,34 +663,89 @@ final class InputFailureContextRecorder {
         window.collectionStatus = ["globalMonitorInstalled": String(globalMonitor != nil),
             "accessibilityGranted": String(AXIsProcessTrusted()), "secureInputActive": String(IsSecureEventInputEnabled()),
             "focusPollingIntervalMilliseconds": "500", "typedCharactersRecorded": "false", "screenshotsRecorded": "false", "latestFailureRetained": String(buffer.latestFailure != nil),
+            "wallClockPairedWithMonotonicUptime": "true", "monotonicClock": "DispatchTime.uptimeNanoseconds",
+            "sessionOperationAndTargetIDsIncludedWhenAvailable": "true",
             "editorProbeNodeLimit": "160", "editorProbeDepthLimit": "64",
             "editorProbeTraversal": "reverse_depth_first", "editorProbeBudgetMilliseconds": "250"]
+        window.collectionStatus["localMonitorInstalled"] = String(localMonitor != nil)
+        window.collectionStatus["axNotificationCaptureScope"] = "focused_target_value_selection_and_application_focus_only"
+        window.collectionStatus["axNotificationIsIndependentPageEvidence"] = "false"
+        window.collectionStatus["axNotificationNoCallbackMeaning"] = "no_callback_is_not_evidence_of_no_change"
+        window.collectionStatus["axNotificationTargetState"] = axNotificationStatus["state"] ?? "unknown"
+        window.collectionStatus["axNotificationRetention"] = "same_bounded_input_failure_window"
+        for (key, value) in axNotificationStatus where key != "state" {
+            window.collectionStatus["axNotification_\(key)"] = value
+        }
+        for (key, value) in interactionCaptureCounts {
+            window.collectionStatus[key] = String(value)
+        }
         return window
     }
 
-    private func record(_ name: String, fields: [String: String], at date: Date = Date()) {
-        buffer.append(InputContextEvent(timestamp: date, event: name, fields: fields), now: date)
+    private func record(
+        _ name: String,
+        fields: [String: String],
+        at date: Date = Date(),
+        sessionID: UUID? = nil,
+        operationID: Int? = nil,
+        targetApplicationBundleIdentifier: String? = nil,
+        targetApplicationProcessID: Int32? = nil,
+        eventID: UUID? = nil,
+        monotonicTimestampNanoseconds: UInt64? = nil
+    ) {
+        buffer.append(InputContextEvent(
+            timestamp: date,
+            event: name,
+            fields: fields,
+            eventID: eventID ?? UUID(),
+            monotonicTimestampNanoseconds: monotonicTimestampNanoseconds ?? DispatchTime.now().uptimeNanoseconds,
+            sessionID: sessionID ?? activeSessionID,
+            operationID: operationID ?? Int(fields["operationID"] ?? ""),
+            targetApplicationBundleIdentifier: targetApplicationBundleIdentifier
+                ?? fields["application"]
+                ?? fields["targetApplicationBundleIdentifier"],
+            targetApplicationProcessID: targetApplicationProcessID
+                ?? fields["pid"].flatMap(Int32.init)
+        ), now: date)
     }
 
     private func observe(_ event: NSEvent) {
         guard isEnabled else { return }
         // Do not confuse our injected Unicode events with the user's actions.
-        if event.cgEvent?.getIntegerValueField(.eventSourceUnixProcessID) == Int64(ProcessInfo.processInfo.processIdentifier) { return }
+        if event.cgEvent?.getIntegerValueField(.eventSourceUnixProcessID) == Int64(ProcessInfo.processInfo.processIdentifier) {
+            incrementInteractionCount("syntheticInputFilteredCount")
+            return
+        }
         let now = Date()
         let app = NSWorkspace.shared.frontmostApplication
         var fields = ["application": app?.bundleIdentifier ?? "unknown", "pid": String(app?.processIdentifier ?? 0)]
         if event.type == .keyDown {
-            guard ["com.openai.codex", "com.apple.Safari", "md.obsidian"].contains(app?.bundleIdentifier ?? ""),
-                  !event.isARepeat, !IsSecureEventInputEnabled() else { return }
+            guard ["com.openai.codex", "com.apple.Safari", "com.google.Chrome", "md.obsidian"].contains(app?.bundleIdentifier ?? "") else {
+                incrementInteractionCount("unsupportedAppKeyboardFilteredCount")
+                return
+            }
+            guard !event.isARepeat else {
+                incrementInteractionCount("repeatKeyboardFilteredCount")
+                return
+            }
+            guard !IsSecureEventInputEnabled() else {
+                incrementInteractionCount("secureInputFilteredCount")
+                return
+            }
             if let shortcut = InputContextKeyFilter.shortcut(keyCode: event.keyCode, flags: event.modifierFlags) {
                 fields["shortcut"] = shortcut
                 record(app?.bundleIdentifier == "com.openai.codex" ? "codex_shortcut" : "application_shortcut", fields: fields, at: now)
             } else if now.timeIntervalSince(lastActivity) >= 1 {
                 lastActivity = now
                 record(app?.bundleIdentifier == "com.openai.codex" ? "codex_keyboard_activity" : "application_keyboard_activity", fields: fields, at: now)
+            } else {
+                incrementInteractionCount("keyboardActivityThrottledCount")
             }
         } else if event.type == .scrollWheel {
-            guard now.timeIntervalSince(lastActivity) >= 1 else { return }
+            guard now.timeIntervalSince(lastActivity) >= 1 else {
+                incrementInteractionCount("scrollActivityThrottledCount")
+                return
+            }
             lastActivity = now
             record("desktop_scroll", fields: fields, at: now)
         } else {
@@ -357,6 +758,10 @@ final class InputFailureContextRecorder {
         }
     }
 
+    private func incrementInteractionCount(_ key: String) {
+        interactionCaptureCounts[key, default: 0] += 1
+    }
+
     private func sample() async {
         guard isEnabled else { return }
         let token = generation
@@ -364,7 +769,9 @@ final class InputFailureContextRecorder {
         let app = NSWorkspace.shared.frontmostApplication
         var fields = ["application": app?.bundleIdentifier ?? "unknown", "pid": String(app?.processIdentifier ?? 0),
             "accessibilityGranted": String(AXIsProcessTrusted())]
-        if app?.bundleIdentifier == "com.openai.codex", let pid = app?.processIdentifier {
+        if let bundleIdentifier = app?.bundleIdentifier,
+           Self.focusProbeApplicationBundleIdentifiers.contains(bundleIdentifier),
+           let pid = app?.processIdentifier {
             let probe = self.probe
             let details = await withCheckedContinuation { continuation in
                 probeQueue.async { continuation.resume(returning: probe.sample(pid: pid, includeEditors: true)) }
@@ -373,6 +780,7 @@ final class InputFailureContextRecorder {
             // Do not attribute a slow AX result to an app that is no longer active.
             guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
             fields.merge(details) { _, new in new }
+            fields["detailedProbeApplication"] = bundleIdentifier
         }
         guard generation == token, isEnabled else { return }
         if previousSample != fields {
@@ -394,6 +802,23 @@ struct InputFailureEvidence: Codable, Sendable {
             diagnosticEventsTruncated: diagnosticEventsTruncated
         )
     }
+
+    func retainingFailureContext(reportWindowStart: Date, through end: Date) -> Self {
+        let failureWindowStart = desktopContext.capturedAt.addingTimeInterval(-60)
+        let joinedStart = min(reportWindowStart, failureWindowStart)
+        var context = desktopContext.restricted(to: joinedStart, through: end)
+        context.collectionStatus["reportPrimaryWindowStart"] = DiagnosticReportTime.format(reportWindowStart)
+        context.collectionStatus["associatedFailureWindowStart"] = DiagnosticReportTime.format(failureWindowStart)
+        context.collectionStatus["associatedFailureAt"] = DiagnosticReportTime.format(desktopContext.capturedAt)
+        context.collectionStatus["timelineIncludesOlderFailureContext"] = String(failureWindowStart < reportWindowStart)
+        return Self(
+            desktopContext: context,
+            diagnosticEvents: diagnosticEvents.filter { $0.timestamp >= joinedStart && $0.timestamp <= end },
+            diagnosticEventsTruncated: diagnosticEventsTruncated
+        )
+    }
+
+    var sessionIDs: Set<UUID> { Set(diagnosticEvents.map(\.sessionID)) }
 }
 
 struct InputFailureReport: Codable, Sendable {
@@ -407,6 +832,7 @@ struct InputFailureReport: Codable, Sendable {
     var sessionEvidenceSummaries: [DiagnosticSessionSummary]? = nil
     var firstFailure: InputFailureEvidence? = nil
     let evidenceScopeNote: String?
+    var windowFrameCapture: DiagnosticWindowFrameEvidence? = nil
 
     func replacingDiagnosticReport(_ diagnosticReport: DiagnosticReport) -> Self {
         Self(
@@ -419,7 +845,24 @@ struct InputFailureReport: Codable, Sendable {
             latestFailure: latestFailure,
             sessionEvidenceSummaries: sessionEvidenceSummaries,
             firstFailure: firstFailure,
-            evidenceScopeNote: evidenceScopeNote
+            evidenceScopeNote: evidenceScopeNote,
+            windowFrameCapture: windowFrameCapture
+        )
+    }
+
+    func replacingWindowFrameCapture(_ evidence: DiagnosticWindowFrameEvidence) -> Self {
+        Self(
+            schemaVersion: schemaVersion,
+            id: id,
+            generatedAt: generatedAt,
+            desktopContext: desktopContext,
+            diagnosticReport: diagnosticReport,
+            diagnosticEventsTruncated: diagnosticEventsTruncated,
+            latestFailure: latestFailure,
+            sessionEvidenceSummaries: sessionEvidenceSummaries,
+            firstFailure: firstFailure,
+            evidenceScopeNote: evidenceScopeNote,
+            windowFrameCapture: evidence
         )
     }
 }

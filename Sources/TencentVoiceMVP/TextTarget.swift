@@ -119,6 +119,23 @@ enum AXTextInputStrategy: Equatable {
         context: AXTextInputTargetContext?,
         hasReadableTextState: Bool = true
     ) -> AXTextInputStrategy {
+        if application?.bundleIdentifier == "com.openai.codex" {
+            guard let context,
+                  context.role == "AXTextArea" || context.role == "AXTextField" else {
+                return .safeStop(reason: "codex_target_unclassified")
+            }
+            guard context.isReadOnly != true, context.isSecure != true else {
+                return .safeStop(reason: "web_control_not_editable")
+            }
+            guard context.isReadOnly == false, context.isSecure == false else {
+                return .safeStop(reason: "codex_editability_unknown")
+            }
+            guard hasReadableTextState else {
+                return .safeStop(reason: "codex_text_state_unreadable")
+            }
+            return .acknowledgedKeyboard(reason: "codex_editable_text_control")
+        }
+
         guard let context,
               context.role == "AXTextArea" || context.role == "AXTextField" else {
             return .accessibility
@@ -130,11 +147,9 @@ enum AXTextInputStrategy: Equatable {
             return .safeStop(reason: "web_control_not_editable")
         }
 
-        // Codex and Obsidian have existing application-specific handling
-        // below this strategy layer.
-        let usesSpecializedLegacyRoute = application?.bundleIdentifier == "com.openai.codex"
-            || application?.bundleIdentifier == "md.obsidian"
-        if usesSpecializedLegacyRoute {
+        // Obsidian keeps its existing application-specific handling below
+        // this strategy layer.
+        if application?.bundleIdentifier == "md.obsidian" {
             return .accessibility
         }
 

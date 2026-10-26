@@ -40,6 +40,7 @@ struct SessionLogEntry: Codable, Equatable, Sendable {
     }
 
     let timestamp: Date
+    let monotonicTimestampNanoseconds: UInt64?
     let sessionID: UUID
     let eventID: UUID?
     let kind: Kind
@@ -72,6 +73,7 @@ struct SessionLogEntry: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case timestamp
+        case monotonicTimestampNanoseconds
         case sessionID
         case eventID
         case kind
@@ -105,6 +107,7 @@ struct SessionLogEntry: Codable, Equatable, Sendable {
 
     init(
         timestamp: Date = Date(),
+        monotonicTimestampNanoseconds: UInt64? = nil,
         sessionID: UUID = UUID(),
         eventID: UUID? = UUID(),
         kind: Kind = .session,
@@ -136,6 +139,7 @@ struct SessionLogEntry: Codable, Equatable, Sendable {
         textEvidence: [DiagnosticTextEvidence] = []
     ) {
         self.timestamp = timestamp
+        self.monotonicTimestampNanoseconds = monotonicTimestampNanoseconds
         self.sessionID = sessionID
         self.eventID = eventID
         self.kind = kind
@@ -170,6 +174,7 @@ struct SessionLogEntry: Codable, Equatable, Sendable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         timestamp = try container.decode(Date.self, forKey: .timestamp)
+        monotonicTimestampNanoseconds = try container.decodeIfPresent(UInt64.self, forKey: .monotonicTimestampNanoseconds)
         sessionID = try container.decode(UUID.self, forKey: .sessionID)
         eventID = try container.decodeIfPresent(UUID.self, forKey: .eventID)
         let rawKind = try container.decodeIfPresent(String.self, forKey: .kind) ?? Kind.session.rawValue
@@ -213,6 +218,22 @@ struct SessionLogEntry: Codable, Equatable, Sendable {
             forKey: .textEvidence
         ) ?? []
     }
+}
+
+func orderedDiagnosticSessionEntries(_ entries: [SessionLogEntry]) -> [SessionLogEntry] {
+    let indexed = Array(entries.enumerated())
+    if entries.allSatisfy({ $0.monotonicTimestampNanoseconds != nil }) {
+        return indexed.sorted {
+            let lhs = $0.element.monotonicTimestampNanoseconds ?? 0
+            let rhs = $1.element.monotonicTimestampNanoseconds ?? 0
+            return lhs == rhs ? $0.offset < $1.offset : lhs < rhs
+        }.map(\.element)
+    }
+    return indexed.sorted {
+        $0.element.timestamp == $1.element.timestamp
+            ? $0.offset < $1.offset
+            : $0.element.timestamp < $1.element.timestamp
+    }.map(\.element)
 }
 
 @MainActor
@@ -400,7 +421,7 @@ final class SessionLogger {
                 "windowEnd": DiagnosticReportTime.format(date)
             ]))
         }
-        return events.sorted { $0.timestamp < $1.timestamp }
+        return orderedDiagnosticSessionEntries(events)
     }
 
     func reportEventSnapshot(
@@ -451,12 +472,12 @@ final class SessionLogger {
             let key = entry.eventID.map { "event:\($0.uuidString)" }
                 ?? "legacy:\(entry.sessionID.uuidString)|\(entry.timestamp.timeIntervalSince1970)|\(entry.event)|\(entry.sequence ?? -1)"
             return seen.insert(key).inserted
-        }.sorted { $0.timestamp < $1.timestamp }
+        }
         return DiagnosticReportEventSnapshot(
             requestedAt: date,
             windowStart: windowStart,
             captureStartedAt: captureStartedAt ?? reportCaptureStartedAt,
-            memoryEvents: memory,
+            memoryEvents: orderedDiagnosticSessionEntries(memory),
             pinnedEvidenceTruncated: pinDropSummary.truncated,
             failureContextEvidenceTruncated: failureDropSummary.truncated,
             fileReferences: reportFileReferences[reportReferenceHead...].filter {

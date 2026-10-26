@@ -71,7 +71,8 @@ final class FinalizationAcknowledgingKeyboardTarget: KeyboardAcknowledgingTarget
                 name: "Codex",
                 bundleIdentifier: "com.openai.codex",
                 processIdentifier: 1
-            )
+            ),
+            preferredInputStrategy: .acknowledgedKeyboard(reason: "codex_editable_text_control")
         )
     }
 
