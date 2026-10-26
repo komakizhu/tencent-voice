@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let coordinator: SessionCoordinator
     private let sessionLogger: SessionLogger
     private let failureContext: InputFailureContextRecorder
+    private let diagnosticWindowFrameRecorder: DiagnosticWindowFrameRecorder
     private var failureReportTasks: [UUID: Task<Void, Never>] = [:]
     private var diagnosticReportInProgress = false
     private var failureContextMainMenuItem: NSMenuItem?
@@ -49,6 +50,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let rimeThemeStore = RimeThemeStore()
         let permissionChecker = SystemPrivacyPermissionChecker()
         let failureContext = InputFailureContextRecorder()
+        let diagnosticWindowFrameRecorder = DiagnosticWindowFrameRecorder()
+        diagnosticWindowFrameRecorder.setCaptureEnabled(settingsStore.load().captureDiagnosticWindowFrames)
         let sessionLogger = SessionLogger(enabled: { settingsStore.load().saveTextLogs })
         let rimeBackupRetentionStore = RimeBackupRetentionStore(
             policy: RimeBackupSettings.loadPolicy()
@@ -99,6 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.rimeLocalDirectory = localRimeDirectory
         self.sessionLogger = sessionLogger
         self.failureContext = failureContext
+        self.diagnosticWindowFrameRecorder = diagnosticWindowFrameRecorder
         sessionLogger.evidenceObserver = { [weak failureContext, weak sessionLogger] entry in
             guard let sessionLogger else { return }
             failureContext?.observeSessionEntry(entry, logger: sessionLogger)
@@ -107,11 +111,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             asr: TencentASRClient(),
             audio: SystemAudioCapture(),
             textTarget: AXTextTarget(evidenceObserver: { diagnostic, element, pid in
+                if diagnostic.event == "input_target_captured", let pid {
+                    let bundleIdentifier = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+                    diagnosticWindowFrameRecorder.targetCaptured(
+                        pid: pid,
+                        bundleIdentifier: bundleIdentifier,
+                        targetElement: element
+                    )
+                } else if DiagnosticAnomaly.events.contains(diagnostic.event)
+                            || ["ax_focus_changed", "keyboard_focus_changed", "text_target_changed"].contains(diagnostic.event) {
+                    diagnosticWindowFrameRecorder.targetBecameAmbiguous(status: "input_target_became_uncertain")
+                }
                 failureContext.observeTarget(diagnostic, element: element, pid: pid, logger: sessionLogger)
             }),
             settingsStore: settingsStore,
             credentialStore: credentialStore,
             logger: sessionLogger,
+            onSessionStart: { sessionID in
+                failureContext.sessionBegan(sessionID)
+                diagnosticWindowFrameRecorder.sessionBegan(sessionID)
+            },
             onStateChange: { state in
                 let diagnosticState: String = switch state {
                 case .idle: "idle"
@@ -131,6 +150,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 case .recovering: menu.update(status: "麦克风恢复中…")
                 case .stopping: menu.update(status: "收尾中…")
                 case let .error(message): menu.update(status: "错误：\(message)")
+                }
+                switch state {
+                case .idle, .error:
+                    diagnosticWindowFrameRecorder.sessionEnded()
+                    failureContext.sessionEnded()
+                case .stopping:
+                    diagnosticWindowFrameRecorder.sessionEnded()
+                case .connecting, .listening, .recovering:
+                    break
                 }
             }
         )
@@ -269,6 +297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         endTrackedUsageSession()
         coordinator.cancel()
+        diagnosticWindowFrameRecorder.sessionEnded()
         menu.uninstall()
     }
 
@@ -374,6 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     throw error
                 }
                 settingsStore.save(newSettings)
+                diagnosticWindowFrameRecorder.setCaptureEnabled(newSettings.captureDiagnosticWindowFrames)
                 menu.setVisible(!newSettings.hideMenuBarIcon)
                 if !newSettings.hideMenuBarIcon {
                     menu.update(autoStartEnabled: loginItemManager.isEnabled)
@@ -581,9 +611,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let snapshotStarted = requestedAtMonotonicNanoseconds
         let windowStart = now.addingTimeInterval(-60)
         let context = failureContext.snapshot(at: now).restricted(to: windowStart, through: now)
+        let frameSnapshot = diagnosticWindowFrameRecorder.snapshot(at: now)
         let captureStartedAt = sessionLogger.reportCaptureStartedAt
         let eventSnapshot = sessionLogger.reportEventSnapshot(at: now, captureStartedAt: captureStartedAt)
-        let captureEnabledAtRequest = context.enabled || settingsStore.load().saveTextLogs
+        let reportSettings = settingsStore.load()
+        let diagnosticCaptureEnabledAtRequest = context.enabled || reportSettings.saveTextLogs
+        let captureEnabledAtRequest = diagnosticCaptureEnabledAtRequest
+            || reportSettings.captureDiagnosticWindowFrames
         let snapshotMilliseconds = elapsedMilliseconds(since: snapshotStarted)
         let latestFailureSnapshot = failureContext.latestFailure
         let firstFailureSnapshot = failureContext.firstFailure
@@ -596,7 +630,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
         let directory = sessionLogger.persistenceDirectoryURL.deletingLastPathComponent()
             .appendingPathComponent("input-failure-reports", isDirectory: true)
-        let destination = directory.appendingPathComponent("InputFailure-\(reportID.uuidString).json")
+        let jsonDestination = directory.appendingPathComponent("InputFailure-\(reportID.uuidString).json")
+        let archiveDestination = directory.appendingPathComponent("InputFailure-\(reportID.uuidString).zip")
         failureReportTasks[reportID] = Task { @MainActor [weak self] in
             defer {
                 self?.failureReportTasks.removeValue(forKey: reportID)
@@ -625,7 +660,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     events: recovery.events,
                     requestedAt: now,
                     captureStartedAt: captureStartedAt,
-                    captureEnabled: captureEnabledAtRequest,
+                    captureEnabled: diagnosticCaptureEnabledAtRequest,
                     recoveryMetrics: recovery.metrics,
                     stageTimings: DiagnosticReportStageTimings(
                         snapshotMilliseconds: snapshotMilliseconds,
@@ -642,17 +677,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let assemblyMilliseconds = diagnosticReport.stageTimings?.assemblyMilliseconds ?? elapsedMilliseconds(since: assemblyStarted)
                 let scopedFailureEvidence = await Task.detached(priority: .utility) {
                     let latest = latestFailureSnapshot.flatMap {
-                        $0.desktopContext.capturedAt >= windowStart && $0.desktopContext.capturedAt <= now
-                            ? $0.restricted(to: windowStart, through: now) : nil
+                        $0.desktopContext.capturedAt <= now
+                            ? $0.retainingFailureContext(reportWindowStart: windowStart, through: now) : nil
                     }
-                    let first = firstFailureSnapshot.flatMap {
-                        $0.desktopContext.capturedAt >= windowStart && $0.desktopContext.capturedAt <= now
-                            ? $0.restricted(to: windowStart, through: now) : nil
+                    let first: InputFailureEvidence? = firstFailureSnapshot.flatMap { snapshot -> InputFailureEvidence? in
+                        guard snapshot.desktopContext.capturedAt <= now else { return nil }
+                        let firstSessionIDs = snapshot.sessionIDs
+                        let sharesLatestSession = latest.map { !firstSessionIDs.isDisjoint(with: $0.sessionIDs) } ?? false
+                        let occurredInReportWindow = snapshot.desktopContext.capturedAt >= windowStart
+                        guard sharesLatestSession || occurredInReportWindow else { return nil }
+                        return snapshot.retainingFailureContext(reportWindowStart: windowStart, through: now)
                     }
-                    return (latest, first, DiagnosticSessionSummary.make(from: recovery.events))
+                    var summaryEvents = recovery.events
+                    var knownIDs = Set(summaryEvents.compactMap(\.eventID))
+                    for event in (latest?.diagnosticEvents ?? []) + (first?.diagnosticEvents ?? []) {
+                        if let eventID = event.eventID, knownIDs.insert(eventID).inserted {
+                            summaryEvents.append(event)
+                        } else if event.eventID == nil {
+                            summaryEvents.append(event)
+                        }
+                    }
+                    let screenEvidenceStatus = frameSnapshot.assets.isEmpty
+                        ? "report_level_frames_not_included_status_\(frameSnapshot.evidence.status)"
+                        : "report_level_frames_available_correlate_by_timestamp_and_targetPID"
+                    return (
+                        latest,
+                        first,
+                        DiagnosticSessionSummary.make(
+                            from: summaryEvents,
+                            screenEvidenceStatus: screenEvidenceStatus
+                        )
+                    )
                 }.value
                 let preliminaryReport = InputFailureReport(
-                    schemaVersion: 3,
+                    schemaVersion: 6,
                     id: reportID,
                     generatedAt: now,
                     desktopContext: context,
@@ -668,23 +726,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     latestFailure: scopedFailureEvidence.0,
                     sessionEvidenceSummaries: scopedFailureEvidence.2,
                     firstFailure: scopedFailureEvidence.1,
-                    evidenceScopeNote: "严格限定为点击前60秒。未出现在窗口内的首条识别、最后成功写入或最终 Safe Copy，表示本窗口没有取得；无法据此区分它发生在窗口外还是截止点击时尚未发生。"
+                    evidenceScopeNote: "主时间线严格限定为点击前60秒；另附最近故障点之前60秒的关联快照（若早于主窗口则会标注原始时间）。采集未开启、截断、权限不足、节流或读取失败时，报告会标明缺口。键盘事件提交、AX调用返回和AX通知都不证明编辑器已实际执行；AX证据不代表页面DOM或屏幕状态。窗口画面采集默认关闭，仅在设置中主动开启后对已确认的前台目标窗口进行短时采集，不包含音频或上传。",
+                    windowFrameCapture: frameSnapshot.evidence
                 )
                 menu.update(failureReportResult: "正在编码并保存报告…")
                 try await Task.detached(priority: .utility) {
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 }.value
                 let encodingStarted = DispatchTime.now().uptimeNanoseconds
-                let data = try await Task.detached(priority: .utility) {
+                var data = try await Task.detached(priority: .utility) {
                     try DiagnosticJSON.encoder().encode(preliminaryReport)
                 }.value
-                let encodingMilliseconds = elapsedMilliseconds(since: encodingStarted)
+                var encodingMilliseconds = elapsedMilliseconds(since: encodingStarted)
                 let writingStarted = DispatchTime.now().uptimeNanoseconds
-                try await Task.detached(priority: .utility) {
-                    try data.write(to: destination, options: .atomic)
-                }.value
+                let destination: URL
+                if frameSnapshot.assets.isEmpty {
+                    try await Task.detached(priority: .utility) {
+                        try data.write(to: jsonDestination, options: .atomic)
+                    }.value
+                    destination = jsonDestination
+                } else {
+                    do {
+                        try await Task.detached(priority: .utility) {
+                            try DiagnosticWindowFrameArchiveWriter.write(
+                                reportData: data,
+                                snapshot: frameSnapshot,
+                                destination: archiveDestination
+                            )
+                        }.value
+                        destination = archiveDestination
+                    } catch {
+                        let failedEvidence = preliminaryReport.windowFrameCapture?.replacingArchiveStatus("failed")
+                        let fallbackReport = failedEvidence.map(preliminaryReport.replacingWindowFrameCapture)
+                            ?? preliminaryReport
+                        let fallbackEncodingStarted = DispatchTime.now().uptimeNanoseconds
+                        data = try await Task.detached(priority: .utility) {
+                            try DiagnosticJSON.encoder().encode(fallbackReport)
+                        }.value
+                        encodingMilliseconds += elapsedMilliseconds(since: fallbackEncodingStarted)
+                        try await Task.detached(priority: .utility) {
+                            try data.write(to: jsonDestination, options: .atomic)
+                        }.value
+                        destination = jsonDestination
+                    }
+                }
                 let writingMilliseconds = elapsedMilliseconds(since: writingStarted)
-                let title = captureEnabledAtRequest ? "失效报告已保存" : "已保存诊断；采集未开启"
+                let title = frameSnapshot.assets.isEmpty
+                    ? (captureEnabledAtRequest ? "失效报告已保存" : "已保存诊断；采集未开启")
+                    : (destination.pathExtension == "zip" ? "失效报告与目标窗口画面已保存" : "已保存 JSON；画面压缩失败")
                 menu.update(failureReportResult: title, path: destination.path)
                 sessionLogger.recordDiagnosticAction("input_failure_report_saved", fields: [
                     "reportID": reportID.uuidString,

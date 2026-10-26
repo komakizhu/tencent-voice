@@ -60,7 +60,7 @@ final class AXTextTargetReplayTests: XCTestCase {
         let initial = String(repeating: "甲", count: 138)
         let access = ReplayAXTextTargetAccess(text: initial,
             selection: .init(location: 138, length: 0),
-            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001))
+            application: .init(name: "Editor", bundleIdentifier: "com.example.editor", processIdentifier: 9001))
         access.selectionRangeIsSettable = true
         access.deferNextAXSelectionApplication = true
         let clock = ManualKeyboardPacingClock()
@@ -112,6 +112,44 @@ final class AXTextTargetReplayTests: XCTestCase {
             try XCTUnwrap(UInt64(axReturn.fields["returnMonotonicNanoseconds"] ?? ""))
         )
         XCTAssertEqual(stableReadback.fields["selectionEffectObservation"], "ax_readback_only_not_editor_internal_state")
+    }
+
+    func testCodexContinuousAppendDoesNotQueueAXSelectionThatCanMoveTheNextInsert() async throws {
+        let initial = String(repeating: "甲", count: 51)
+        let access = ReplayAXTextTargetAccess(
+            text: initial,
+            selection: .init(location: initial.utf16.count, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.selectionRangeIsSettable = true
+        access.configureNativeAncestorChain()
+        access.deferNextAXSelectionApplication = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000)
+
+        let snapshot = try target.capture()
+        try target.paste("，那")
+        do {
+            try await target.acknowledgeKeyboardWrite()
+        } catch {
+            XCTFail("the first append should be acknowledged before the delayed selection is applied: \(error)")
+            return
+        }
+        sender.beforeNextAppend = { access.applyDeferredAXSelectionApplication() }
+        try target.paste("必")
+        var secondAppendWasAcknowledged = false
+        do {
+            try await target.acknowledgeKeyboardWrite()
+            secondAppendWasAcknowledged = true
+        } catch { }
+
+        XCTAssertEqual(snapshot.preferredInputStrategy, .acknowledgedKeyboard(reason: "codex_editable_text_control"))
+        XCTAssertTrue(secondAppendWasAcknowledged, "a stale AX selection must not derail the next keyboard append")
+        XCTAssertEqual(access.rawText, initial + "，那必")
+        XCTAssertEqual(access.selection, .init(location: 54, length: 0))
+        XCTAssertEqual(access.selectionSetCalls, 0)
+        XCTAssertEqual(sender.appendPosts, 2, "each recognized update is submitted once")
     }
 
     func testStaleAXSelectionReadsAreDistinguishedFromAppliedEditorSelection() async throws {
@@ -677,7 +715,7 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertFalse(target.drainDiagnostics().contains { $0.event == "keyboard_write_unconfirmed" })
     }
 
-    func testCodexCaretAtParagraphBoundaryIsReseatedBeforeWrite() async throws {
+    func testCodexCaretAtParagraphBoundaryIsPreservedWithoutAXReseating() async throws {
         let access = ReplayAXTextTargetAccess(
             text: "abc\nX",
             selection: .init(location: 3, length: 0),
@@ -685,18 +723,8 @@ final class AXTextTargetReplayTests: XCTestCase {
         )
         access.selectionRangeIsSettable = true
         access.coordinateOverride = "abc\nX"
-        access.writeSnapshots = [
-            .init(
-                rawText: "abcY\n\n\nX",
-                coordinateText: "abcYX",
-                selection: .init(location: 4, length: 0)
-            ),
-            .init(
-                rawText: "abcY\n\n\nZX",
-                coordinateText: "abcYZX",
-                selection: .init(location: 5, length: 0)
-            )
-        ]
+        access.configureNativeAncestorChain()
+        access.simulateCodexParagraphBoundaryExpansion = true
         let sender = ReplayKeyboardEventSender(access: access)
         let target = AXTextTarget(
             access: access,
@@ -713,12 +741,12 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertEqual(access.rawText, "abcY\n\n\nZX")
         XCTAssertEqual(access.coordinateText, "abcYZX")
         XCTAssertEqual(access.selection, .init(location: 5, length: 0))
-        XCTAssertEqual(access.selectionSetCalls, 2)
+        XCTAssertEqual(access.selectionSetCalls, 0)
         XCTAssertEqual(sender.totalPosts, 2)
         let diagnostics = target.drainDiagnostics()
         XCTAssertFalse(diagnostics.contains { $0.event == "keyboard_write_unconfirmed" })
         XCTAssertEqual(
-            diagnostics.filter { $0.event == "keyboard_selection_stabilized" }.count,
+            diagnostics.filter { $0.event == "keyboard_selection_stabilization_skipped" }.count,
             2
         )
     }
@@ -2193,7 +2221,7 @@ final class AXTextTargetReplayTests: XCTestCase {
             XCTAssertTrue(target.drainDiagnostics().contains {
                 $0.event == "safari_keyboard_target_reacquire_rejected"
                     && $0.fields["phase"] == "invalid_element_read"
-                    && $0.fields["reason"] == "stable_editor_identity_unavailable"
+                    && $0.fields["reason"] == "stable_unique_editor_continuity_unverified"
             })
         }
     }
@@ -2439,7 +2467,73 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertEqual(injector.modeDescription, "disabled_after_error")
         XCTAssertTrue(injector.drainDiagnostics().contains {
             $0.event == "safari_keyboard_target_reacquire_rejected"
-                && $0.fields["reason"] == "stable_editor_identity_unavailable"
+                && $0.fields["reason"] == "stable_unique_editor_continuity_unverified"
+        })
+    }
+
+    func testSafariComposerLayoutRebuildReacquiresUniqueSameEditorWithoutResending() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "\n",
+            selection: .init(location: 0, length: 0),
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.proseMirror = true
+        access.coordinateIncludesStructuralSeparators = true
+        access.simulateSafariEditorLayoutRebuild = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let injector = TextInjector(target: AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        ))
+
+        try injector.begin()
+        injector.apply(projection: projection("你好", revision: 1))
+        try await injector.finish(finalText: "你好")
+        access.focusedElementRebuildsBeforeNextWrite = 1
+        injector.apply(projection: projection("你好继续", revision: 2))
+        try await injector.finish(finalText: "你好继续")
+
+        XCTAssertEqual(access.rawText, "你好继续\n")
+        XCTAssertEqual(sender.totalPosts, 2, "the replacement handle must not cause the acknowledged append to be sent twice")
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+        let diagnostics = injector.drainDiagnostics()
+        XCTAssertTrue(diagnostics.contains {
+            $0.event == "safari_keyboard_target_reacquired"
+                && $0.fields["editableEditorCount"] == "1"
+        }, "\(diagnostics.map { ($0.event, $0.fields) })")
+    }
+
+    func testSafariComposerWithMultipleIdenticalEditorsDoesNotReacquireByMatchingText() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "\n",
+            selection: .init(location: 0, length: 0),
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.proseMirror = true
+        access.coordinateIncludesStructuralSeparators = true
+        access.simulateSafariEditorLayoutRebuild = true
+        access.safariEditableEditorCount = 2
+        let sender = ReplayKeyboardEventSender(access: access)
+        let injector = TextInjector(target: AXTextTarget(access: access, keyboardEventSender: sender))
+
+        try injector.begin()
+        injector.apply(projection: projection("相同", revision: 1))
+        try await injector.finish(finalText: "相同")
+        access.focusedElementRebuildsBeforeNextWrite = 1
+        injector.apply(projection: projection("相同后续", revision: 2))
+        try await injector.finish(finalText: "相同后续")
+
+        XCTAssertEqual(sender.totalPosts, 1)
+        XCTAssertEqual(injector.errorCount, 1)
+        let diagnostics = injector.drainDiagnostics()
+        XCTAssertEqual(injector.degradationCode, "text_target_changed")
+        XCTAssertTrue(diagnostics.contains {
+            $0.event == "safari_keyboard_target_reacquire_rejected"
+                && $0.fields["reason"] == "stable_unique_editor_continuity_unverified"
         })
     }
 
@@ -2510,7 +2604,7 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertEqual(injector.modeDescription, "disabled_after_error")
         XCTAssertTrue(injector.drainDiagnostics().contains {
             $0.event == "safari_keyboard_target_reacquire_rejected"
-                && $0.fields["reason"] == "stable_editor_identity_unavailable"
+                && $0.fields["reason"] == "stable_unique_editor_continuity_unverified"
         })
 
         injector.apply(projection: projection("您好继续", revision: 3))
@@ -2691,7 +2785,19 @@ final class AXTextTargetReplayTests: XCTestCase {
             ),
             .acknowledgedKeyboard(reason: "web_editable_text_control")
         )
-        for bundleIdentifier in ["com.openai.codex", "md.obsidian"] {
+        XCTAssertEqual(
+            AXTextInputStrategy.select(
+                application: TextTargetApplication(
+                    name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001
+                ),
+                context: AXTextInputTargetContext(
+                    role: "AXTextArea", hasWebAreaAncestor: true, webURL: nil,
+                    isReadOnly: false, isSecure: false, ancestorScanStatus: .readFailure
+                )
+            ),
+            .acknowledgedKeyboard(reason: "codex_editable_text_control")
+        )
+        for bundleIdentifier in ["md.obsidian"] {
             XCTAssertEqual(
                 AXTextInputStrategy.select(
                     application: TextTargetApplication(
@@ -2705,7 +2811,7 @@ final class AXTextTargetReplayTests: XCTestCase {
                     )
                 ),
                 .accessibility,
-                "specialized route must survive transient classification failure for \(bundleIdentifier)"
+                "Obsidian must keep its specialized route when ancestry cannot be classified"
             )
         }
         let safari = TextTargetApplication(
@@ -2734,6 +2840,50 @@ final class AXTextTargetReplayTests: XCTestCase {
             ),
             .accessibility,
             "confirmed native Safari fields keep the normal AX route"
+        )
+    }
+
+    func testCodexRoutingRequiresReadableEditableTextAndStopsWhenUnclassified() {
+        let codex = TextTargetApplication(
+            name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001
+        )
+        let editable = AXTextInputTargetContext(
+            role: "AXTextArea", hasWebAreaAncestor: false, webURL: nil,
+            isReadOnly: false, isSecure: false, ancestorScanStatus: .completeWithoutWebArea
+        )
+
+        XCTAssertEqual(
+            AXTextInputStrategy.select(application: codex, context: editable),
+            .acknowledgedKeyboard(reason: "codex_editable_text_control")
+        )
+        XCTAssertEqual(
+            AXTextInputStrategy.select(application: codex, context: editable, hasReadableTextState: false),
+            .safeStop(reason: "codex_text_state_unreadable")
+        )
+        XCTAssertEqual(
+            AXTextInputStrategy.select(application: codex, context: nil),
+            .safeStop(reason: "codex_target_unclassified")
+        )
+        XCTAssertEqual(
+            AXTextInputStrategy.select(application: codex, context: AXTextInputTargetContext(
+                role: "AXTextArea", hasWebAreaAncestor: false, webURL: nil,
+                isReadOnly: nil, isSecure: false
+            )),
+            .safeStop(reason: "codex_editability_unknown")
+        )
+        XCTAssertEqual(
+            AXTextInputStrategy.select(application: codex, context: AXTextInputTargetContext(
+                role: "AXTextArea", hasWebAreaAncestor: false, webURL: nil,
+                isReadOnly: false, isSecure: true
+            )),
+            .safeStop(reason: "web_control_not_editable")
+        )
+        XCTAssertEqual(
+            AXTextInputStrategy.select(application: codex, context: AXTextInputTargetContext(
+                role: "AXButton", hasWebAreaAncestor: false, webURL: nil,
+                isReadOnly: false, isSecure: false
+            )),
+            .safeStop(reason: "codex_target_unclassified")
         )
     }
 
@@ -3071,7 +3221,7 @@ final class AXTextTargetReplayTests: XCTestCase {
         }
     }
 
-    func testCodexWithoutReadableAXTextKeepsLegacyKeyboardFallback() throws {
+    func testCodexWithoutReadableAXTextStopsAndKeepsRecognitionForSafeCopy() throws {
         let access = ReplayAXTextTargetAccess(
             text: "草稿",
             application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
@@ -3079,14 +3229,13 @@ final class AXTextTargetReplayTests: XCTestCase {
         access.alwaysFailTextReads = true
         let sender = ReplayKeyboardEventSender(access: access)
         let target = AXTextTarget(access: access, keyboardEventSender: sender)
+        let injector = TextInjector(target: target, safeCopyEnabled: true)
 
-        let snapshot = try target.capture()
-        XCTAssertFalse(snapshot.preferredInputStrategy.prefersAcknowledgedKeyboard)
+        try injector.begin()
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
         XCTAssertFalse(target.requiresKeyboardAcknowledgement)
-        try target.paste("甲")
-
-        XCTAssertEqual(sender.totalPosts, 1)
-        XCTAssertEqual(access.rawText, "草稿甲")
+        XCTAssertEqual(sender.totalPosts, 0)
+        XCTAssertEqual(access.rawText, "草稿")
     }
 
     func testAXWriteMustWaitForReadbackBeforeAdvancingState() async throws {
@@ -3503,6 +3652,42 @@ final class AXTextTargetReplayTests: XCTestCase {
                     && $0.fields["phase"] == "identity_check"
             }
         )
+    }
+
+    func testCodexReplayRetriesTransientFocusReadDuringSelectionStabilization() async throws {
+        let firstRecognizedText = "那跟这个"
+        let fullRecognizedText = "那跟这个后面的整段语音"
+        let access = ReplayAXTextTargetAccess(
+            text: firstRecognizedText,
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.selectionRangeIsSettable = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            preflightTimeoutNanoseconds: 100_000_000,
+            acknowledgementTimeoutNanoseconds: 100_000_000
+        )
+
+        _ = try target.capture()
+        // capture -> preflight's before/after focus reads -> safe-target check;
+        // this is the extra AXFocusedUIElement read in synchronous selection
+        // stabilization immediately before the next keyboard operation.
+        access.failFocusedElementReadAtCount = access.focusedElementReadCount + 4
+
+        try await target.writeKeyboardText(previousText: firstRecognizedText, with: fullRecognizedText)
+        try await target.acknowledgeKeyboardWrite()
+
+        XCTAssertEqual(access.rawText, fullRecognizedText)
+        XCTAssertEqual(sender.replacementPosts, 1, "a transient read must not duplicate the replacement")
+        let diagnostics = target.drainDiagnostics()
+        XCTAssertTrue(diagnostics.contains {
+            $0.event == "keyboard_state_read_retryable"
+                && $0.fields["phase"] == "selection_stabilization"
+        })
+        XCTAssertTrue(diagnostics.contains { $0.event == "keyboard_write_acknowledged" })
+        XCTAssertFalse(diagnostics.contains { $0.event == "keyboard_write_unconfirmed" })
     }
 
     func testRealAXReplayDoesNotStallAtFirstCharacterAfterFinalSegmentBoundary() async throws {
@@ -4022,6 +4207,85 @@ final class AXTextTargetReplayTests: XCTestCase {
                 && $0.fields["coordinateSource"] == "pendingReceiptExactAXValue"
         })
         XCTAssertFalse(diagnostics.contains { $0.event == "keyboard_write_unconfirmed" })
+    }
+
+    func testCodexRecoversWhenExactSingleCharacterAppendLeavesCaretAtInsertionPoint() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "那压",
+            selection: .init(location: 2, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        let sender = ReplayKeyboardEventSender(access: access)
+        sender.appendOverride = { text in
+            access.applyAppend(text)
+            // Reproduce the report: the AX document includes the character,
+            // but AXSelectedTextRange still points to the pre-write caret.
+            access.selection = .init(location: 2, length: 0)
+            access.editorSelection = .init(location: 2, length: 0)
+            access.armPostWriteReplay()
+        }
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000,
+            enableExperimentalCodexCaretRecovery: true
+        )
+
+        _ = try target.capture()
+        try target.paste("抑")
+        try await target.acknowledgeKeyboardWrite()
+
+        XCTAssertEqual(access.rawText, "那压抑")
+        XCTAssertEqual(access.selection, .init(location: 3, length: 0))
+        XCTAssertEqual(sender.caretRecoveryPosts, 1)
+        var diagnostics = target.drainDiagnostics()
+        XCTAssertTrue(diagnostics.contains { $0.event == "keyboard_caret_recovery_submitted" })
+        XCTAssertTrue(diagnostics.contains { $0.event == "keyboard_write_acknowledged" })
+        XCTAssertFalse(diagnostics.contains { $0.event == "keyboard_write_unconfirmed" })
+
+        sender.appendOverride = nil
+        try target.replaceTrailingText("抑", with: "伸展")
+        try await target.acknowledgeKeyboardWrite()
+
+        XCTAssertEqual(access.rawText, "那压伸展")
+        XCTAssertEqual(access.selection, .init(location: 4, length: 0))
+        diagnostics = target.drainDiagnostics()
+        XCTAssertFalse(diagnostics.contains { $0.event == "keyboard_write_unconfirmed" })
+    }
+
+    func testCodexCaretRecoveryIsDisabledByDefaultAndDoesNotRepeatText() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "那压",
+            selection: .init(location: 2, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        let sender = ReplayKeyboardEventSender(access: access)
+        sender.appendOverride = { text in
+            access.applyAppend(text)
+            access.selection = .init(location: 2, length: 0)
+            access.editorSelection = .init(location: 2, length: 0)
+            access.armPostWriteReplay()
+        }
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+
+        _ = try target.capture()
+        try target.paste("抑")
+        do {
+            try await target.acknowledgeKeyboardWrite()
+            XCTFail("the default path must not move an unconfirmed caret")
+        } catch {
+            XCTAssertEqual(access.rawText, "那压抑")
+            XCTAssertEqual(access.selection, .init(location: 2, length: 0))
+            XCTAssertEqual(sender.totalPosts, 1)
+            XCTAssertEqual(sender.caretRecoveryPosts, 0)
+            let diagnostics = target.drainDiagnostics()
+            XCTAssertFalse(diagnostics.contains { $0.event == "keyboard_caret_recovery_submitted" })
+            XCTAssertTrue(diagnostics.contains { $0.event == "keyboard_write_unconfirmed" })
+        }
     }
 
     func testCodexExactAXValueReceiptConfirmsWhenStaleCoordinateEndsBeforeSelection() async throws {
@@ -4604,6 +4868,10 @@ private struct ReplayAXTimingEvent {
 private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     let element = AXUIElementCreateApplication(9001)
     private let otherElement = AXUIElementCreateApplication(9002)
+    private let replayWebArea = AXUIElementCreateApplication(9004)
+    private let replayEditorAnchor = AXUIElementCreateApplication(9005)
+    private var invalidElements: [AXUIElement] = []
+    private var persistsFocusOnRebuiltElement = false
     let application: TextTargetApplication
     var currentApplicationOverride: TextTargetApplication?
     var rawText: String
@@ -4621,6 +4889,7 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var permissionError: TextTargetError?
     var selectionRangeIsSettable = false
     var simulateAXSelectionWriteAcceptedButDoesNotMoveEditor = false
+    var simulateCodexParagraphBoundaryExpansion = false
     var deferNextAXSelectionApplication = false
     var replayTime: () -> UInt64 = { 0 }
     var staleSelectionReadsAfterNextTextWrite = 0
@@ -4640,6 +4909,8 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var onAXTextWrite: (() -> Void)?
     var focusChanged = false
     var focusedElementRebuildsBeforeNextWrite = 0
+    var simulateSafariEditorLayoutRebuild = false
+    var safariEditableEditorCount = 1
     var focusedElementRebuildsAfterNextWrite = 0
     private var focusedElementRebuildCount = 0
     var failFocusedElementReadAtCount: Int?
@@ -4714,8 +4985,13 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
         }
         if focusedElementRebuildsBeforeNextWrite > 0 {
             focusedElementRebuildsBeforeNextWrite -= 1
+            persistsFocusOnRebuiltElement = true
+            if !invalidElements.contains(where: { CFEqual($0, element) }) {
+                invalidElements.append(element)
+            }
             return rebuiltElement
         }
+        if persistsFocusOnRebuiltElement { return rebuiltElement }
         if focusedElementRebuildCount > 0 {
             focusedElementRebuildCount -= 1
             return rebuiltElement
@@ -4726,6 +5002,23 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     private let rebuiltElement = AXUIElementCreateApplication(9003)
 
     func processIdentifier(of element: AXUIElement) -> pid_t? { 9001 }
+
+    func elementValidity(_ element: AXUIElement) -> AXTextElementValidity {
+        invalidElements.contains(where: { CFEqual($0, element) }) ? .invalid : .valid
+    }
+
+    func safariEditorContinuityEvidence(for element: AXUIElement) -> AXSafariEditorContinuityEvidence? {
+        guard simulateSafariEditorLayoutRebuild else { return nil }
+        return AXSafariEditorContinuityEvidence(
+            webArea: replayWebArea,
+            editorAnchor: replayEditorAnchor,
+            editorAnchorRole: "AXGroup",
+            rolesFromEditorToAnchor: ["AXTextArea", "AXGroup"],
+            identifiersFromEditorToAnchor: [nil, nil],
+            editableEditorCount: safariEditableEditorCount,
+            scanComplete: true
+        )
+    }
 
     func textInputContext(for element: AXUIElement) -> AXTextInputTargetContext? {
         if usesAncestorScanner {
@@ -4743,6 +5036,12 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
                 isSecure: false,
                 ancestorScanStatus: scan.status,
                 webAreaDepth: scan.webAreaDepth
+            )
+        }
+        if application.bundleIdentifier == "com.openai.codex" {
+            return AXTextInputTargetContext(
+                role: "AXTextArea", hasWebAreaAncestor: false, webURL: nil,
+                isReadOnly: false, isSecure: false, ancestorScanStatus: .completeWithoutWebArea
             )
         }
         return nil
@@ -4934,6 +5233,26 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
         }
         var rawRange = rawRange(for: range)
         let rawUTF16 = Array(rawText.utf16)
+        if simulateCodexParagraphBoundaryExpansion,
+           range.length == 0,
+           rawRange.length == 0,
+           rawRange.location < rawUTF16.count,
+           rawUTF16[rawRange.location] == 0x0A {
+            let mutable = NSMutableString(string: rawText)
+            mutable.insert(text, at: rawRange.location)
+            let separatorLocation = rawRange.location + text.utf16.count
+            mutable.replaceCharacters(in: NSRange(location: separatorLocation, length: 1), with: "\n\n\n")
+            rawText = mutable as String
+            coordinateOverride = nil
+            simulateCodexParagraphBoundaryExpansion = false
+            let insertedLength = text.filter {
+                $0 != "\n" && $0 != "\r" && $0 != "\u{2028}" && $0 != "\u{2029}"
+            }.utf16.count
+            selection = .init(location: range.location + insertedLength, length: 0)
+            editorSelection = selection
+            placeholderEvidenceValue = .init()
+            return
+        }
         let movesInsertionAfterTrailingNewline = collapseStructuralSeparatorsAfterNextWrite
             && range.length == 0
             && rawRange.length == 0
@@ -4977,6 +5296,10 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     func armPostWriteReplay() {
         focusedElementRebuildCount = focusedElementRebuildsAfterNextWrite
         focusedElementRebuildsAfterNextWrite = 0
+        if focusedElementRebuildCount > 0,
+           !invalidElements.contains(where: { CFEqual($0, element) }) {
+            invalidElements.append(element)
+        }
         queuedTextReadSnapshots = readSnapshotsAfterNextWrite
         readSnapshotsAfterNextWrite.removeAll()
     }
@@ -5024,9 +5347,11 @@ private final class ReplayKeyboardEventSender: AXTextTargetKeyboardEventSending 
     private(set) var appendPosts = 0
     private(set) var selectionPosts = 0
     private(set) var replacementPosts = 0
+    private(set) var caretRecoveryPosts = 0
     var dropNextSelection = false
     var keyboardSelectionOnlyUpdatesAX = false
     var appendOverride: ((String) -> Void)?
+    var beforeNextAppend: (() -> Void)?
     var onReplacement: (() -> Void)?
 
     var totalPosts: Int { appendPosts + replacementPosts }
@@ -5067,10 +5392,23 @@ private final class ReplayKeyboardEventSender: AXTextTargetKeyboardEventSending 
 
     func send(_ text: String, processID: pid_t?) throws {
         appendPosts += 1
+        beforeNextAppend?()
+        beforeNextAppend = nil
         if let appendOverride { appendOverride(text); return }
         access.applyAppend(text)
         access.recordTimingEvent("text_sent")
         access.armPostWriteReplay()
+    }
+
+    func advanceCaretRight(processID: pid_t?) throws {
+        caretRecoveryPosts += 1
+        let next = ReplayTextRange(
+            location: min(access.editorSelection.location + 1, access.coordinateText.utf16.count),
+            length: 0
+        )
+        access.selection = next
+        access.editorSelection = next
+        access.recordTimingEvent("caret_recovery_posted")
     }
 
     func replaceTrailingText(_ previousText: String, with text: String, processID: pid_t?) throws {

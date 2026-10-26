@@ -34,6 +34,7 @@ struct AppSettings: Codable, Equatable, Sendable {
     var saveTextLogs: Bool
     var safeCopyEnabled: Bool
     var hideMenuBarIcon: Bool
+    var captureDiagnosticWindowFrames: Bool
     var prepaidQuotaHoursByModel: [String: Int]
 
     private enum CodingKeys: String, CodingKey {
@@ -42,6 +43,7 @@ struct AppSettings: Codable, Equatable, Sendable {
         case saveTextLogs
         case safeCopyEnabled
         case hideMenuBarIcon
+        case captureDiagnosticWindowFrames
         case prepaidQuotaHoursByModel
     }
 
@@ -51,6 +53,7 @@ struct AppSettings: Codable, Equatable, Sendable {
         saveTextLogs: Bool = false,
         safeCopyEnabled: Bool = false,
         hideMenuBarIcon: Bool = false,
+        captureDiagnosticWindowFrames: Bool = false,
         prepaidQuotaHoursByModel: [String: Int] = [:]
     ) {
         self.shortcut = shortcut
@@ -58,6 +61,7 @@ struct AppSettings: Codable, Equatable, Sendable {
         self.saveTextLogs = saveTextLogs
         self.safeCopyEnabled = safeCopyEnabled
         self.hideMenuBarIcon = hideMenuBarIcon
+        self.captureDiagnosticWindowFrames = captureDiagnosticWindowFrames
         self.prepaidQuotaHoursByModel = prepaidQuotaHoursByModel
     }
 
@@ -68,6 +72,10 @@ struct AppSettings: Codable, Equatable, Sendable {
         saveTextLogs = try container.decode(Bool.self, forKey: .saveTextLogs)
         safeCopyEnabled = try container.decodeIfPresent(Bool.self, forKey: .safeCopyEnabled) ?? false
         hideMenuBarIcon = try container.decodeIfPresent(Bool.self, forKey: .hideMenuBarIcon) ?? false
+        captureDiagnosticWindowFrames = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .captureDiagnosticWindowFrames
+        ) ?? false
         prepaidQuotaHoursByModel = try container.decodeIfPresent(
             [String: Int].self,
             forKey: .prepaidQuotaHoursByModel

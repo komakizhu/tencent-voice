@@ -8,13 +8,18 @@ final class SessionCoordinatorTests: XCTestCase {
         let asr = FakeRealtimeASRClient()
         let audio = FakeAudioCapture()
         let logger = SessionLogger(enabled: { false })
+        var startedSessionID: UUID?
         let coordinator = SessionCoordinator(
             asr: asr, audio: audio, textTarget: FakeTextTarget(text: ""),
             settingsStore: UserDefaultsSettingsStore(suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"),
             credentialStore: InMemoryCredentialStore(TencentCredentials(appID: "app", secretID: "id", secretKey: "key")),
-            logger: logger, keyboardSmoothing: .immediate, onStateChange: { _ in }
+            logger: logger,
+            keyboardSmoothing: .immediate,
+            onSessionStart: { startedSessionID = $0 },
+            onStateChange: { _ in }
         )
         try await coordinator.begin()
+        XCTAssertEqual(startedSessionID, logger.recentEntries().first(where: { $0.event == "audio_capture_started" })?.sessionID)
         audio.emit(Data(repeating: 0, count: 6400))
         audio.emit(Data(repeating: 0, count: 3200))
         asr.emit(ASRUpdate(text: "正文不能进入诊断日志", isFinal: true, sequence: 0))

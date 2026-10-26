@@ -69,7 +69,10 @@ private final class NoOpAXTarget: TextTarget {
                      selection: TencentVoiceMVP.TextRange(location: storage.text.utf16.count, length: 0),
                      supportsAXReplacement: true,
                      targetApplication: TextTargetApplication(name: "Target", bundleIdentifier: bundleIdentifier,
-                                                              processIdentifier: 1))
+                                                              processIdentifier: 1),
+                     preferredInputStrategy: bundleIdentifier == "com.openai.codex"
+                        ? .acknowledgedKeyboard(reason: "codex_editable_text_control")
+                        : .accessibility)
     }
 
     func replace(snapshot: TextSnapshot, range: TencentVoiceMVP.TextRange, expectedText: String,

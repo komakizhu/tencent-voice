@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import CoreGraphics
 
 @MainActor
 final class DelayedHelpStackView: NSStackView, NSPopoverDelegate {
@@ -139,6 +140,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let prepaidHoursPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let shortcutPresetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let logCheckbox = NSButton(checkboxWithTitle: "自动保存诊断日志", target: nil, action: nil)
+    private let captureWindowFramesCheckbox = NSButton(
+        checkboxWithTitle: "故障时采集目标窗口画面（可选）",
+        target: nil,
+        action: nil
+    )
     private let safeCopyCheckbox = NSButton(
         checkboxWithTitle: "Safe Copy（始终复制到剪贴板）",
         target: nil,
@@ -244,6 +250,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         shortcutPresetPopup.action = #selector(shortcutPresetChanged)
         updateShortcutPresetSelection()
         logCheckbox.state = settings.saveTextLogs ? .on : .off
+        captureWindowFramesCheckbox.state = settings.captureDiagnosticWindowFrames ? .on : .off
         safeCopyCheckbox.state = settings.safeCopyEnabled ? .on : .off
         hideMenuBarIconCheckbox.state = settings.hideMenuBarIcon ? .on : .off
         shortcutLabel.stringValue = ShortcutFormatter.string(for: currentShortcut)
@@ -347,7 +354,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         exportDiagnosticLogButton.target = self
         exportDiagnosticLogButton.action = #selector(exportDiagnosticLogPressed)
         exportDiagnosticLogButton.isEnabled = onExportDiagnosticLog != nil
-        exportDiagnosticLogButton.toolTip = "导出点击前最近一分钟的诊断；可能包含完整语音识别文字和目标输入框正文，不包含录音或凭据。"
+        exportDiagnosticLogButton.toolTip = "导出点击前最近一分钟的诊断；可能包含语音识别文字和目标输入框正文。不包含录音或凭据。"
+        captureWindowFramesCheckbox.toolTip = "开启后仅在语音输入会话中采集已确认目标应用窗口，最多每秒5帧，只在内存保留最近60秒；提交报告时随 JSON 一起导出为 ZIP。画面可能包含对话内容，不上传。需要 macOS 屏幕录制权限。"
         safeCopyCheckbox.toolTip = "开启后在会话结束时复制一次完整识别结果；取消或异常中断时保存最新已识别文字。"
         logCheckbox.toolTip = "开启后保存本次会话的识别修订、输入框正文和诊断事件；点击右侧“导出诊断报告”导出。"
         hideMenuBarIconCheckbox.toolTip = "隐藏状态栏图标；隐藏后可从 Dock 中 Rime Voice 的应用菜单重新打开设置。"
@@ -453,12 +461,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func diagnosticLogRow() -> NSView {
-        let row = NSStackView(views: [logCheckbox, NSView(), exportDiagnosticLogButton])
-        row.alignment = .centerY
-        row.spacing = 8
-        row.translatesAutoresizingMaskIntoConstraints = false
+        let reportRow = NSStackView(views: [logCheckbox, NSView(), exportDiagnosticLogButton])
+        reportRow.alignment = .centerY
+        reportRow.spacing = 8
+        reportRow.translatesAutoresizingMaskIntoConstraints = false
         exportDiagnosticLogButton.setContentHuggingPriority(.required, for: .horizontal)
-        return row
+        let frameRow = DelayedHelpStackView(
+            contentView: captureWindowFramesCheckbox,
+            helpText: "关闭时不采集屏幕画面。开启后只观察一个经过 AX 标题/尺寸与 ScreenCaptureKit 窗口列表交叉确认的前台目标窗口；权限不足、多个窗口或焦点变化都会停止画面采集。报告含帧时会导出 ZIP，并在 JSON 中列出帧时间和采集缺口。"
+        )
+        frameRow.alignment = .centerY
+        frameRow.translatesAutoresizingMaskIntoConstraints = false
+        let rows = NSStackView(views: [reportRow, frameRow])
+        rows.orientation = .vertical
+        rows.alignment = .leading
+        rows.spacing = 4
+        rows.translatesAutoresizingMaskIntoConstraints = false
+        return rows
     }
 
     private func storageSection() -> NSView {
@@ -703,6 +722,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             saveTextLogs: logCheckbox.state == .on,
             safeCopyEnabled: safeCopyCheckbox.state == .on,
             hideMenuBarIcon: hideMenuBarIconCheckbox.state == .on,
+            captureDiagnosticWindowFrames: captureWindowFramesCheckbox.state == .on,
             prepaidQuotaHoursByModel: prepaidQuotaHoursByModel
         )
         do {
@@ -712,9 +732,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 "engineModelType": settings.engineModelType,
                 "saveTextLogs": String(settings.saveTextLogs),
                 "safeCopyEnabled": String(settings.safeCopyEnabled),
-                "hideMenuBarIcon": String(settings.hideMenuBarIcon)
+                "hideMenuBarIcon": String(settings.hideMenuBarIcon),
+                "captureDiagnosticWindowFrames": String(settings.captureDiagnosticWindowFrames)
             ])
-            statusLabel.stringValue = "设置已保存"
+            if settings.captureDiagnosticWindowFrames && !CGPreflightScreenCaptureAccess() {
+                let granted = CGRequestScreenCaptureAccess()
+                statusLabel.stringValue = granted
+                    ? "设置已保存；屏幕录制权限已允许，目标窗口采集将在下次输入时开始。"
+                    : "设置已保存；尚未允许屏幕录制，诊断报告仍会导出 JSON。请在系统设置中开启后重启应用。"
+            } else if settings.captureDiagnosticWindowFrames {
+                statusLabel.stringValue = "设置已保存；目标窗口画面将在下次输入时采集，报告可能包含窗口中的对话内容。"
+            } else {
+                statusLabel.stringValue = "设置已保存"
+            }
         } catch {
             onRecordDiagnosticAction?("settings_save_failed", [
                 "errorCode": DiagnosticErrorFormatter.code(for: error),

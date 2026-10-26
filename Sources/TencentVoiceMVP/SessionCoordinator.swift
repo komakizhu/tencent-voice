@@ -53,6 +53,7 @@ final class SessionCoordinator: SessionCoordinating {
     let settingsStore: SettingsStore
     let credentialStore: CredentialStore
     let logger: SessionLogger
+    private let onSessionStart: (UUID) -> Void
     private let onStateChange: (SessionState) -> Void
     private var stateObserver: ((SessionState) -> Void)?
     private(set) var state: SessionState = .idle {
@@ -92,6 +93,7 @@ final class SessionCoordinator: SessionCoordinating {
         finishTimeoutNanoseconds: UInt64 = 3_000_000_000,
         keyboardSmoothing: KeyboardSmoothingConfiguration = .live,
         pacingClock: KeyboardPacingClock? = nil,
+        onSessionStart: @escaping (UUID) -> Void = { _ in },
         onStateChange: @escaping (SessionState) -> Void
     ) {
         self.asr = asr
@@ -103,6 +105,7 @@ final class SessionCoordinator: SessionCoordinating {
         self.finishTimeoutNanoseconds = finishTimeoutNanoseconds
         self.keyboardSmoothing = keyboardSmoothing
         self.pacingClock = pacingClock ?? ContinuousKeyboardPacingClock()
+        self.onSessionStart = onSessionStart
         self.onStateChange = onStateChange
     }
 
@@ -110,6 +113,7 @@ final class SessionCoordinator: SessionCoordinating {
         guard state == .idle else { throw SessionError.busy }
         let id = UUID()
         sessionID = id
+        onSessionStart(id)
         setState(.connecting)
         do {
             guard let credentials = try credentialStore.load() else {
@@ -627,6 +631,8 @@ final class SessionCoordinator: SessionCoordinating {
         }
         let entry = SessionLogEntry(
             timestamp: recognitionObservation?.0 ?? Date(),
+            monotonicTimestampNanoseconds: recognitionObservation.map { $0.1 &* 1_000_000 }
+                ?? DispatchTime.now().uptimeNanoseconds,
             sessionID: sessionID,
             event: event,
             state: stateName,
@@ -661,7 +667,10 @@ final class SessionCoordinator: SessionCoordinating {
             fields.merge(entry.metadata) { _, new in new }
             fields["diagnosticRecordedAt"] = Self.iso8601(Date())
             try? logger.append(SessionLogEntry(
-                timestamp: diagnostic.timestamp, sessionID: sessionID,
+                timestamp: diagnostic.timestamp,
+                monotonicTimestampNanoseconds: diagnostic.monotonicTimestampNanoseconds,
+                sessionID: sessionID,
+                eventID: diagnostic.eventID,
                 event: diagnostic.event, state: stateName, injectionMode: injector?.modeDescription,
                 targetApplicationName: injector?.targetApplication?.name,
                 targetApplicationBundleIdentifier: injector?.targetApplication?.bundleIdentifier,
