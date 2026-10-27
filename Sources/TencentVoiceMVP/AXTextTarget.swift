@@ -2,6 +2,43 @@ import ApplicationServices
 import AppKit
 import Foundation
 
+func boundedContinuityDiagnosticFields(_ fields: [String: String], byteLimit: Int = 8_192) -> [String: String] {
+    var result: [String: String] = [:]
+    var truncated = false
+
+    func encodedSize(_ fields: [String: String]) -> Int {
+        guard JSONSerialization.isValidJSONObject(fields),
+              let data = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]) else {
+            return Int.max
+        }
+        return data.count
+    }
+
+    for key in fields.keys.sorted() {
+        guard key != "diagnosticSummaryTruncated" else { continue }
+        guard let value = fields[key] else { continue }
+        var candidate = result
+        candidate[key] = value
+        guard encodedSize(candidate) <= byteLimit else {
+            truncated = true
+            continue
+        }
+        result = candidate
+    }
+    if truncated {
+        let marker = "diagnosticSummaryTruncated"
+        var candidate = result
+        candidate[marker] = "true"
+        while encodedSize(candidate) > byteLimit, let key = result.keys.sorted().last {
+            result.removeValue(forKey: key)
+            candidate = result
+            candidate[marker] = "true"
+        }
+        if encodedSize(candidate) <= byteLimit { result = candidate }
+    }
+    return result
+}
+
 struct AXAttributeReadFailure: Error {
     let attribute: String
     let status: Int32
@@ -482,6 +519,10 @@ protocol AXTextTargetAccess {
     func processIdentifier(of element: AXUIElement) -> pid_t?
     func elementValidity(_ element: AXUIElement) -> AXTextElementValidity
     func editorContinuityEvidence(for element: AXUIElement) -> AXTextEditorContinuityEvidence?
+    func lastContinuityScanObservationID() -> String?
+    func lastContinuityScanSummary() -> [String: String]?
+    func setContinuityScanObjectGeneration(_ generation: String?)
+    func setContinuityScanBudgetNanoseconds(_ budget: UInt64?)
     func editorContinuityEvidence(
         for element: AXUIElement,
         anchoredAt previous: AXTextEditorContinuityEvidence
@@ -497,6 +538,7 @@ protocol AXTextTargetAccess {
     func setSelectedText(_ text: String, on element: AXUIElement) throws -> Int32
     func setValue(_ text: String, on element: AXUIElement) throws -> Int32
     func drainReadDiagnostics() -> [TextInputDiagnostic]
+    func setContinuityDiagnosticsEnabled(_ enabled: Bool)
 }
 
 extension AXTextTargetAccess {
@@ -504,11 +546,16 @@ extension AXTextTargetAccess {
     func isProseMirrorEditor(_ element: AXUIElement) -> Bool { false }
     func elementValidity(_ element: AXUIElement) -> AXTextElementValidity { .unavailable }
     func editorContinuityEvidence(for element: AXUIElement) -> AXTextEditorContinuityEvidence? { nil }
+    func lastContinuityScanObservationID() -> String? { nil }
+    func lastContinuityScanSummary() -> [String: String]? { nil }
+    func setContinuityScanObjectGeneration(_ generation: String?) {}
+    func setContinuityScanBudgetNanoseconds(_ budget: UInt64?) {}
     func editorContinuityEvidence(
         for element: AXUIElement,
         anchoredAt previous: AXTextEditorContinuityEvidence
     ) -> AXTextEditorContinuityEvidence? { nil }
     func drainReadDiagnostics() -> [TextInputDiagnostic] { [] }
+    func setContinuityDiagnosticsEnabled(_ enabled: Bool) {}
 }
 
 enum AXTextElementValidity: Equatable {
@@ -529,9 +576,29 @@ struct AXTextEditorContinuityEvidence {
 }
 
 enum AXEditorIdentityValidationResult {
-    case confirmed(evidence: AXTextEditorContinuityEvidence, route: String, processID: pid_t)
-    case temporarilyUnavailable(reason: String)
-    case rejected(reason: String)
+    case confirmed(
+        evidence: AXTextEditorContinuityEvidence,
+        route: String,
+        processID: pid_t,
+        identityOutcome: String,
+        diagnosticFields: [String: String]
+    )
+    case temporarilyUnavailable(reason: String, diagnosticFields: [String: String]? = nil)
+    case rejected(reason: String, diagnosticFields: [String: String]? = nil)
+}
+
+struct AXTextEditorContinuityComparison {
+    let matches: Bool
+    let structurallyMatches: Bool
+    let hasMissingIdentifiers: Bool
+    let hasIdentifierConflict: Bool
+    let identityOutcome: String
+    let firstMismatch: String?
+    let fields: [String: String]
+
+    var canConfirmFromCapturedAnchor: Bool {
+        structurallyMatches && hasMissingIdentifiers && !hasIdentifierConflict
+    }
 }
 
 struct AXKeyboardDocumentObservation {
@@ -550,6 +617,21 @@ struct AXAnchoredEditorScanResult {
     let targetFound: Bool
     let rolesFromEditorToAnchor: [String]?
     let identifiersFromEditorToAnchor: [String?]?
+    let visitedNodeCount: Int
+
+    init(
+        editableEditorCount: Int,
+        targetFound: Bool,
+        rolesFromEditorToAnchor: [String]?,
+        identifiersFromEditorToAnchor: [String?]?,
+        visitedNodeCount: Int = 0
+    ) {
+        self.editableEditorCount = editableEditorCount
+        self.targetFound = targetFound
+        self.rolesFromEditorToAnchor = rolesFromEditorToAnchor
+        self.identifiersFromEditorToAnchor = identifiersFromEditorToAnchor
+        self.visitedNodeCount = visitedNodeCount
+    }
 }
 
 struct AXAnchoredEditorScanFailure: Error {
@@ -598,7 +680,8 @@ enum AXAnchoredEditorScanner {
         let deadline = now() &+ timeLimitNanoseconds
         guard try role(anchor) == anchorRole else {
             return .init(editableEditorCount: 0, targetFound: false,
-                rolesFromEditorToAnchor: nil, identifiersFromEditorToAnchor: nil)
+                rolesFromEditorToAnchor: nil, identifiersFromEditorToAnchor: nil,
+                visitedNodeCount: 1)
         }
         var pending: [(node: Node, roles: [String], identifiers: [String?])] = []
         for child in try children(anchor) {
@@ -641,13 +724,15 @@ enum AXAnchoredEditorScanner {
         }
         guard let targetPath else {
             return .init(editableEditorCount: editableCount, targetFound: false,
-                rolesFromEditorToAnchor: nil, identifiersFromEditorToAnchor: nil)
+                rolesFromEditorToAnchor: nil, identifiersFromEditorToAnchor: nil,
+                visitedNodeCount: visited.count)
         }
         return .init(
             editableEditorCount: editableCount,
             targetFound: true,
             rolesFromEditorToAnchor: Array(targetPath.0.reversed()),
-            identifiersFromEditorToAnchor: Array(targetPath.1.reversed())
+            identifiersFromEditorToAnchor: Array(targetPath.1.reversed()),
+            visitedNodeCount: visited.count
         )
     }
 }
@@ -685,34 +770,161 @@ enum AXTextEditorContinuityScanDiagnostic {
 }
 
 enum AXTextEditorContinuity {
+    static func captureOutcome(
+        continuityApplicable: Bool,
+        continuityTargetApplication: Bool,
+        focusedElementAvailable: Bool,
+        evidenceSaved: Bool,
+        scanSummary: [String: String]?
+    ) -> String {
+        if !focusedElementAvailable && continuityTargetApplication { return "focused_element_missing" }
+        guard continuityApplicable else { return "not_applicable" }
+        if evidenceSaved { return "saved" }
+        if scanSummary?["stopReason"] == "no_unique_editable_editor" { return "candidate_not_unique" }
+        if ["deadline_exceeded", "node_limit_reached", "web_area_not_found_before_depth_limit"]
+            .contains(scanSummary?["stopReason"] ?? "") {
+            return "scan_incomplete"
+        }
+        if let scanSummary {
+            return scanSummary["failureAttribute"] != nil || scanSummary["stopReason"] != nil
+                ? "scan_failed" : "scan_incomplete"
+        }
+        return "scan_unavailable"
+    }
+
+    static func compare(
+        _ previous: AXTextEditorContinuityEvidence,
+        _ current: AXTextEditorContinuityEvidence
+    ) -> AXTextEditorContinuityComparison {
+        var fields: [String: String] = [:]
+        func state(_ equal: Bool) -> String { equal ? "equal" : "different" }
+
+        let previousLeafIdentifier = previous.identifiersFromEditorToAnchor.first ?? nil
+        let currentLeafIdentifier = current.identifiersFromEditorToAnchor.first ?? nil
+        fields["leafIdentifierPresence"] = previousLeafIdentifier != nil && currentLeafIdentifier != nil
+            ? "present" : "missing"
+        fields["leafIdentifierComparison"] = if let previousLeafIdentifier, let currentLeafIdentifier {
+            state(previousLeafIdentifier == currentLeafIdentifier)
+        } else { "unavailable" }
+        fields["scanCompleteness"] = state(previous.scanComplete && current.scanComplete)
+        fields["editableEditorCount"] = previous.editableEditorCount == 1 && current.editableEditorCount == 1
+            ? "equal" : "different"
+        fields["anchorRoleComparison"] = state(previous.editorAnchorRole == current.editorAnchorRole)
+        fields["anchorRoleAllowed"] = ["AXGroup", "AXContainer"].contains(current.editorAnchorRole)
+            ? "yes" : "no"
+        fields["webAreaComparison"] = state(CFEqual(previous.webArea, current.webArea))
+        fields["windowPresence"] = previous.window != nil && current.window != nil ? "present" : "missing"
+        fields["windowComparison"] = if let oldWindow = previous.window, let newWindow = current.window {
+            state(CFEqual(oldWindow, newWindow))
+        } else { "unavailable" }
+        fields["containerComparison"] = state(CFEqual(previous.editorAnchor, current.editorAnchor))
+        fields["rolePathComparison"] = state(previous.rolesFromEditorToAnchor == current.rolesFromEditorToAnchor)
+        fields["identifierPathDepth"] = previous.identifiersFromEditorToAnchor.count == current.identifiersFromEditorToAnchor.count
+            ? "equal" : "different"
+        fields["rolePathDepthPrevious"] = String(previous.rolesFromEditorToAnchor.count)
+        fields["rolePathDepthCurrent"] = String(current.rolesFromEditorToAnchor.count)
+        fields["identifierPathDepthPrevious"] = String(previous.identifiersFromEditorToAnchor.count)
+        fields["identifierPathDepthCurrent"] = String(current.identifiersFromEditorToAnchor.count)
+        var identifierComparisons: [String] = []
+        for index in previous.identifiersFromEditorToAnchor.indices {
+            let oldIdentifier = previous.identifiersFromEditorToAnchor[index]
+            guard current.identifiersFromEditorToAnchor.indices.contains(index) else { break }
+            let newIdentifier = current.identifiersFromEditorToAnchor[index]
+            identifierComparisons.append(oldIdentifier == nil || newIdentifier == nil
+                ? "\(index):unavailable"
+                : "\(index):\(oldIdentifier == newIdentifier ? "equal" : "different")")
+        }
+        fields["identifierPathComparisons"] = identifierComparisons.joined(separator: ",")
+
+        let pathDepthMatches = previous.identifiersFromEditorToAnchor.count
+            == current.identifiersFromEditorToAnchor.count
+        var missingIdentifierIndexes: [Int] = []
+        var conflictingIdentifierIndex: Int?
+        if pathDepthMatches {
+            for index in previous.identifiersFromEditorToAnchor.indices {
+                let oldIdentifier = previous.identifiersFromEditorToAnchor[index]
+                let newIdentifier = current.identifiersFromEditorToAnchor[index]
+                if oldIdentifier == nil || newIdentifier == nil {
+                    missingIdentifierIndexes.append(index)
+                } else if oldIdentifier != newIdentifier, conflictingIdentifierIndex == nil {
+                    conflictingIdentifierIndex = index
+                }
+            }
+        }
+        let scanComplete = previous.scanComplete && current.scanComplete
+        let editorCountMatches = previous.editableEditorCount == 1 && current.editableEditorCount == 1
+        let anchorRoleMatches = previous.editorAnchorRole == current.editorAnchorRole
+        let anchorRoleAllowed = ["AXGroup", "AXContainer"].contains(current.editorAnchorRole)
+        let webAreaMatches = CFEqual(previous.webArea, current.webArea)
+        let windowAvailable = previous.window != nil && current.window != nil
+        let windowMatches = previous.window.map { old in current.window.map { CFEqual(old, $0) } ?? false } ?? false
+        let containerMatches = CFEqual(previous.editorAnchor, current.editorAnchor)
+        let rolePathMatches = previous.rolesFromEditorToAnchor == current.rolesFromEditorToAnchor
+        let structureChecks: [(Bool, String)] = [
+            (scanComplete, "scan_incomplete"),
+            (editorCountMatches, "editor_count"),
+            (anchorRoleMatches, "container_role"),
+            (anchorRoleAllowed, "container_role_unsupported"),
+            (webAreaMatches, "web_area"),
+            (windowAvailable, "window_missing"),
+            (windowMatches, "window"),
+            (containerMatches, "container"),
+            (rolePathMatches, "role_path"),
+            (pathDepthMatches, "identifier_path_depth")
+        ]
+        let structuralFailure = structureChecks.first(where: { !$0.0 })?.1
+        let structurallyMatches = structuralFailure == nil
+        // The leaf identifier is the editor's stable identifier. Missing
+        // identifiers on both sides of an ancestor path were already allowed
+        // by the previous matcher and do not weaken an equal leaf identity.
+        let hasMissingIdentifiers = previousLeafIdentifier == nil || currentLeafIdentifier == nil
+        let hasIdentifierConflict = conflictingIdentifierIndex != nil
+        let identifiersMatch = previousLeafIdentifier != nil
+            && previousLeafIdentifier == currentLeafIdentifier
+            && !hasIdentifierConflict
+            && pathDepthMatches
+
+        var firstMismatch = structuralFailure
+        if firstMismatch == nil, hasIdentifierConflict {
+            if let conflictingIdentifierIndex {
+                firstMismatch = conflictingIdentifierIndex == 0
+                    ? "leaf_identifier"
+                    : "identifier_path_\(conflictingIdentifierIndex)"
+            }
+        } else if firstMismatch == nil, hasMissingIdentifiers {
+            firstMismatch = missingIdentifierIndexes.first == 0 ? "leaf_identifier" : "identifier_missing"
+        }
+        let identityOutcome: String
+        if !scanComplete || !windowAvailable {
+            identityOutcome = "temporarily_unavailable"
+        } else if !structurallyMatches || hasIdentifierConflict {
+            identityOutcome = "identity_conflict"
+        } else if identifiersMatch {
+            identityOutcome = "identifier_match"
+        } else {
+            identityOutcome = "identifier_missing_requires_captured_anchor_scan"
+        }
+        fields["firstMismatch"] = firstMismatch ?? "none"
+        fields["identityOutcome"] = identityOutcome
+        fields["missingIdentifierIndexes"] = missingIdentifierIndexes.map(String.init).joined(separator: ",")
+        fields["identifierConflictIndex"] = conflictingIdentifierIndex.map(String.init) ?? "none"
+        fields["structuralComparison"] = structurallyMatches ? "equal" : "different"
+        return AXTextEditorContinuityComparison(
+            matches: structurallyMatches && identifiersMatch,
+            structurallyMatches: structurallyMatches,
+            hasMissingIdentifiers: hasMissingIdentifiers,
+            hasIdentifierConflict: hasIdentifierConflict,
+            identityOutcome: identityOutcome,
+            firstMismatch: firstMismatch,
+            fields: boundedContinuityDiagnosticFields(fields)
+        )
+    }
+
     static func matches(
         _ previous: AXTextEditorContinuityEvidence,
         _ current: AXTextEditorContinuityEvidence
     ) -> Bool {
-        guard let previousEditorIdentifier = previous.identifiersFromEditorToAnchor.first ?? nil,
-              let currentEditorIdentifier = current.identifiersFromEditorToAnchor.first ?? nil,
-              previousEditorIdentifier == currentEditorIdentifier else {
-            return false
-        }
-        guard previous.scanComplete, current.scanComplete,
-              previous.editableEditorCount == 1, current.editableEditorCount == 1,
-              previous.editorAnchorRole == current.editorAnchorRole,
-              ["AXGroup", "AXContainer"].contains(current.editorAnchorRole),
-              CFEqual(previous.webArea, current.webArea),
-              let previousWindow = previous.window,
-              let currentWindow = current.window,
-              CFEqual(previousWindow, currentWindow),
-              CFEqual(previous.editorAnchor, current.editorAnchor),
-              previous.rolesFromEditorToAnchor == current.rolesFromEditorToAnchor,
-              previous.identifiersFromEditorToAnchor.count == current.identifiersFromEditorToAnchor.count else {
-            return false
-        }
-        for index in previous.identifiersFromEditorToAnchor.indices {
-            let oldIdentifier = previous.identifiersFromEditorToAnchor[index]
-            let newIdentifier = current.identifiersFromEditorToAnchor[index]
-            if let oldIdentifier, let newIdentifier, oldIdentifier != newIdentifier { return false }
-        }
-        return true
+        compare(previous, current).matches
     }
 }
 
@@ -773,6 +985,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     }
     private var targetElement: AXUIElement?
     private var editorContinuity: AXTextEditorContinuityEvidence?
+    private var continuityCaptureSummary: [String: String] = [:]
+    private var firstContinuityRejectionDiagnostic: TextInputDiagnostic?
     private var targetProcessID: pid_t?
     private var targetApplicationProcessID: pid_t?
     private var targetApplicationBundleIdentifier: String?
@@ -786,6 +1000,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     private let preflightTimeoutNanoseconds: UInt64
     private let acknowledgementTimeoutNanoseconds: UInt64
     private let enableExperimentalCodexCaretRecovery: Bool
+    private let diagnosticCollectionEnabled: () -> Bool
     private let evidenceObserver: ((TextInputDiagnostic, AXUIElement?, pid_t?) -> Void)?
     private var diagnostics: [TextInputDiagnostic] = []
     private var diagnosticBytes = 0
@@ -806,9 +1021,11 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         writeTiming: AXTextTargetWriteTiming = .init(),
         preflightTimeoutNanoseconds: UInt64 = 5_000_000_000,
         acknowledgementTimeoutNanoseconds: UInt64 = 5_000_000_000,
-        enableExperimentalCodexCaretRecovery: Bool = false
+        enableExperimentalCodexCaretRecovery: Bool = false,
+        diagnosticCollectionEnabled: @escaping () -> Bool = { true }
     ) {
         self.evidenceObserver = evidenceObserver
+        self.diagnosticCollectionEnabled = diagnosticCollectionEnabled
         self.access = access ?? SystemAXTextTargetAccess()
         self.keyboardEventSender = keyboardEventSender
             ?? KeyboardEventSender(stageObserver: operationObserver)
@@ -819,8 +1036,15 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     }
 
     func drainDiagnostics() -> [TextInputDiagnostic] {
+        _ = refreshDiagnosticCollectionState()
         for diagnostic in access.drainReadDiagnostics() {
-            recordDiagnostic(diagnostic.event, diagnostic.fields, context: diagnosticOperationContext ?? previousDiagnosticOperationContext)
+            recordDiagnostic(
+                diagnostic.event,
+                diagnostic.fields,
+                context: diagnosticOperationContext ?? previousDiagnosticOperationContext,
+                timestamp: diagnostic.timestamp,
+                monotonicTimestampNanoseconds: diagnostic.monotonicTimestampNanoseconds
+            )
         }
         defer { diagnostics.removeAll(keepingCapacity: true); diagnosticBytes = 0 }
         var result = diagnostics
@@ -847,14 +1071,36 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         _ event: String,
         _ fields: [String: String] = [:],
         context: TextInputDiagnosticContext? = nil,
-        textEvidence: [DiagnosticTextEvidence] = []
+        textEvidence: [DiagnosticTextEvidence] = [],
+        timestamp: Date = Date(),
+        monotonicTimestampNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) {
+        let diagnosticsEnabled = refreshDiagnosticCollectionState()
+        if !diagnosticsEnabled && Self.continuityDiagnosticOnlyEvents.contains(event) {
+            return
+        }
         var merged = (context ?? diagnosticOperationContext)?.fields ?? [:]
         merged.merge(fields) { _, new in new }
+        if !diagnosticsEnabled {
+            merged = merged.filter { !Self.isContinuityDiagnosticField($0.key) }
+        }
         merged["inputSessionGeneration"] = String(keyboardGeneration)
         merged["keyboardOperationGeneration"] = String(keyboardOperationGeneration)
-        let diagnostic = TextInputDiagnostic(timestamp: Date(), event: event, fields: merged,
-            textEvidence: textEvidence)
+        if diagnosticsEnabled,
+           ["keyboard_editor_continuity_captured", "keyboard_target_reacquire_rejected"].contains(event) {
+            merged = boundedContinuityDiagnosticFields(merged)
+        }
+        let diagnostic = TextInputDiagnostic(
+            timestamp: timestamp,
+            monotonicTimestampNanoseconds: monotonicTimestampNanoseconds,
+            event: event,
+            fields: merged,
+            textEvidence: textEvidence
+        )
+        if diagnosticsEnabled, event == "keyboard_target_reacquire_rejected",
+           firstContinuityRejectionDiagnostic == nil {
+            firstContinuityRejectionDiagnostic = diagnostic
+        }
         evidenceObserver?(diagnostic, targetElement, targetApplicationProcessID ?? targetProcessID)
         diagnostics.append(diagnostic)
         diagnosticBytes += diagnostic.estimatedDiagnosticBytes
@@ -862,11 +1108,72 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             droppedDiagnosticCount += 1
             // Keep terminal outcomes even when read sampling fills the buffer.
             let removable = diagnostics.firstIndex {
-                ["keyboard_document_observed", "ax_text_attribute_read"].contains($0.event)
+                $0.eventID != firstContinuityRejectionDiagnostic?.eventID
+                    && ["keyboard_document_observed", "ax_text_attribute_read"].contains($0.event)
             }
-            diagnosticBytes -= diagnostics.remove(at: removable ?? 0).estimatedDiagnosticBytes
+            let fallback = removable ?? diagnostics.firstIndex {
+                $0.eventID != firstContinuityRejectionDiagnostic?.eventID
+            }
+            guard let fallback else { break }
+            diagnosticBytes -= diagnostics.remove(at: fallback).estimatedDiagnosticBytes
         }
     }
+
+    private func refreshDiagnosticCollectionState() -> Bool {
+        let enabled = diagnosticCollectionEnabled()
+        access.setContinuityDiagnosticsEnabled(enabled)
+        guard !enabled else { return true }
+        continuityCaptureSummary.removeAll(keepingCapacity: false)
+        firstContinuityRejectionDiagnostic = nil
+        diagnostics = diagnostics.compactMap { diagnostic in
+            if Self.continuityDiagnosticOnlyEvents.contains(diagnostic.event) {
+                return nil
+            }
+            let fields = diagnostic.fields.filter { !Self.isContinuityDiagnosticField($0.key) }
+            guard fields != diagnostic.fields else { return diagnostic }
+            return TextInputDiagnostic(
+                eventID: diagnostic.eventID,
+                timestamp: diagnostic.timestamp,
+                monotonicTimestampNanoseconds: diagnostic.monotonicTimestampNanoseconds,
+                event: diagnostic.event,
+                fields: fields,
+                textEvidence: diagnostic.textEvidence
+            )
+        }
+        diagnosticBytes = diagnostics.reduce(0) { $0 + $1.estimatedDiagnosticBytes }
+        return false
+    }
+
+    func refreshDiagnosticCollectionSettings() {
+        _ = refreshDiagnosticCollectionState()
+    }
+
+    private static func isContinuityDiagnosticField(_ key: String) -> Bool {
+        key.hasPrefix("continuity") || key.hasPrefix("captureScan_") || key.hasPrefix("scan_")
+            || key.hasSuffix("ObjectGeneration")
+            || ["firstMismatch", "fallbackRoute", "currentEvidenceSource", "previousEvidence",
+                "ancestorScanOutcome", "ancestorScanID", "currentScanID", "identifierPathComparisons",
+                "leafIdentifierPresence", "leafIdentifierComparison", "scanCompleteness",
+                "editableEditorCount", "anchorRoleComparison", "anchorRoleAllowed",
+                "webAreaComparison", "windowPresence", "windowComparison", "containerComparison",
+                "rolePathComparison", "identifierPathDepth", "rolePathDepthPrevious",
+                "rolePathDepthCurrent", "identifierPathDepthPrevious", "identifierPathDepthCurrent",
+                "diagnosticSummaryTruncated", "objectGeneration", "scanID", "scanPath", "scanComplete",
+                "outcome", "candidateCount", "elapsedMilliseconds", "visitedNodes", "stopStage",
+                "stopReason", "failureAttribute", "failureStatus", "rolePathDepth", "identifierPresence",
+                "capturedApplication", "capturedProcessID", "targetElementObservationID",
+                "identityFailure", "applicationComparison", "processComparison", "candidateProcessComparison",
+                "previousHandleValidity", "captureOutcome", "captureContinuityApplicable",
+                "captureTargetApplication", "captureFocusedElementAvailable", "capturedContinuityEvidence",
+                "capturedContinuityScanID", "readStartedAt", "readFinishedAt",
+                "readStartedMonotonicMilliseconds", "sendState", "confirmationResult"].contains(key)
+    }
+
+    private static let continuityDiagnosticOnlyEvents: Set<String> = [
+        "keyboard_editor_continuity_captured", "editor_continuity_scan_summary",
+        "editor_continuity_scan_diagnostic", "ax_read_diagnostic_queue_summary",
+        "keyboard_document_observation_discarded"
+    ]
 
     func currentApplication() -> TextTargetApplication? {
         access.currentApplication()
@@ -958,6 +1265,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     }
 
     func capture() throws -> TextSnapshot {
+        _ = refreshDiagnosticCollectionState()
         _ = access.drainReadDiagnostics()
         keyboardGeneration &+= 1
         keyboardOperationGeneration = 0
@@ -980,6 +1288,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         diagnostics.removeAll(keepingCapacity: true)
         diagnosticBytes = 0
         droppedDiagnosticCount = 0
+        firstContinuityRejectionDiagnostic = nil
         diagnosticOperationContext = nil
         previousDiagnosticOperationContext = nil
         lastKeyboardDispatch = nil
@@ -990,6 +1299,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         try access.requestInputPermissions()
         targetElement = nil
         editorContinuity = nil
+        continuityCaptureSummary = [:]
         targetProcessID = nil
         targetApplicationBundleIdentifier = nil
         targetElementObservationID = nil
@@ -1034,10 +1344,47 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         isSafariWebEditor = element.map {
             isEligibleSafariWebEditor($0, application: targetApplication, context: inputContext)
         } ?? false
-        editorContinuity = (isSafariWebEditor || (isCodexTarget && inputContext?.ancestorScanStatus == .webArea))
+        let continuityApplicable = isSafariWebEditor || (isCodexTarget && inputContext?.ancestorScanStatus == .webArea)
+        let continuityTargetApplication = targetApplicationBundleIdentifier == "com.apple.Safari" || isCodexTarget
+        access.setContinuityScanObjectGeneration(targetElementObservationID)
+        editorContinuity = continuityApplicable
             ? element.flatMap { access.editorContinuityEvidence(for: $0) }
                 .flatMap { $0.scanComplete && $0.editableEditorCount == 1 ? $0 : nil }
             : nil
+        access.setContinuityScanObjectGeneration(nil)
+        let captureScanID = continuityApplicable ? access.lastContinuityScanObservationID() : nil
+        let captureScanSummary = continuityApplicable ? access.lastContinuityScanSummary() : nil
+        let captureOutcome = AXTextEditorContinuity.captureOutcome(
+            continuityApplicable: continuityApplicable,
+            continuityTargetApplication: continuityTargetApplication,
+            focusedElementAvailable: element != nil,
+            evidenceSaved: editorContinuity != nil,
+            scanSummary: captureScanSummary
+        )
+        var captureFields = [
+            "continuityApplicable": String(continuityApplicable),
+            "continuityTargetApplication": String(continuityTargetApplication),
+            "continuityEvidenceSaved": String(editorContinuity != nil),
+            "captureOutcome": captureOutcome,
+            "targetElementObservationID": targetElementObservationID ?? "unknown",
+            "continuityScanID": captureScanID ?? "not_run",
+            "capturedApplication": targetApplicationBundleIdentifier ?? "unknown",
+            "capturedProcessID": targetApplicationProcessID.map(String.init) ?? "unknown"
+        ]
+        continuityCaptureSummary = [
+            "capturedContinuityEvidence": editorContinuity == nil ? "missing" : "saved",
+            "capturedContinuityScanID": captureScanID ?? "not_run",
+            "captureOutcome": captureOutcome,
+            "captureContinuityApplicable": String(continuityApplicable),
+            "captureTargetApplication": String(continuityTargetApplication),
+            "captureFocusedElementAvailable": String(element != nil)
+        ]
+        for (key, value) in captureScanSummary ?? [:] {
+            captureFields["scan_\(key)"] = value
+            continuityCaptureSummary["captureScan_\(key)"] = value
+        }
+        recordDiagnostic("keyboard_editor_continuity_captured", boundedContinuityDiagnosticFields(captureFields))
+        continuityCaptureSummary = boundedContinuityDiagnosticFields(continuityCaptureSummary)
         let rawText = try element.flatMap { element in
             try captureReadableText(in: element, context: inputContext)
         }
@@ -1985,7 +2332,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 invalidateKeyboardRawInsertionRegion()
                 throw TextTargetError.targetChanged
             }
-            try acceptKeyboardTargetRebuild(element, phase: "\(phase)_before_read")
+            _ = try acceptKeyboardTargetRebuild(element, phase: "\(phase)_before_read")
             // Never use a snapshot produced by the previous handle after
             // accepting its replacement. The next bounded read starts with
             // the newly captured target identity.
@@ -2002,9 +2349,9 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             invalidateKeyboardRawInsertionRegion()
             throw TextTargetError.targetChanged
         }
+        let readStartedAt = Date()
+        let readStartedMonotonic = writeTiming.now() / 1_000_000
         do {
-            let readStartedAt = Date()
-            let readStartedMonotonic = writeTiming.now() / 1_000_000
             let state = try KeyboardWriteAcknowledgement.readObservation {
                 try self.keyboardDocumentState(in: element, confirming: true)
             }
@@ -2015,7 +2362,49 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                     invalidateKeyboardRawInsertionRegion()
                     throw TextTargetError.targetChanged
                 }
-                try acceptKeyboardTargetRebuild(afterElement, phase: "\(phase)_after_read")
+                let readFinishedAt = Date()
+                let candidateGeneration = UUID().uuidString
+                do {
+                    _ = try acceptKeyboardTargetRebuild(
+                        afterElement,
+                        phase: "\(phase)_after_read",
+                        candidateGeneration: candidateGeneration
+                    )
+                } catch {
+                    let recoveryResult: String
+                    if error is KeyboardWriteReadError {
+                        recoveryResult = "temporarily_unavailable"
+                    } else if let targetError = error as? TextTargetError, targetError == .targetChanged {
+                        recoveryResult = "rejected"
+                    } else {
+                        recoveryResult = "failed"
+                    }
+                    recordDiagnostic("keyboard_document_observation_discarded", [
+                        "phase": phase,
+                        "reason": "focused_object_changed_during_read",
+                        "readStartedObjectGeneration": objectGeneration,
+                        "readFinishedObjectGeneration": candidateGeneration,
+                        "readStartedAt": readStartedAt.ISO8601Format(),
+                        "readFinishedAt": readFinishedAt.ISO8601Format(),
+                        "readStartedMonotonicMilliseconds": String(readStartedMonotonic),
+                        "sendState": pendingKeyboardWrite == nil ? "not_in_flight" : "sent_unconfirmed",
+                        "confirmationResult": "discarded_old_object_snapshot",
+                        "reacquireResult": recoveryResult
+                    ])
+                    throw error
+                }
+                recordDiagnostic("keyboard_document_observation_discarded", [
+                    "phase": phase,
+                    "reason": "focused_object_changed_during_read",
+                    "readStartedObjectGeneration": objectGeneration,
+                    "readFinishedObjectGeneration": candidateGeneration,
+                    "readStartedAt": readStartedAt.ISO8601Format(),
+                    "readFinishedAt": readFinishedAt.ISO8601Format(),
+                    "readStartedMonotonicMilliseconds": String(readStartedMonotonic),
+                    "sendState": pendingKeyboardWrite == nil ? "not_in_flight" : "sent_unconfirmed",
+                    "confirmationResult": "discarded_old_object_snapshot",
+                    "reacquireResult": "confirmed"
+                ])
                 // The text and caret above belong to the old element. Discard
                 // both and re-read only after the replacement is installed.
                 throw KeyboardWriteReadError.retryable
@@ -2024,6 +2413,18 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 // A generation changed while AX was being read. Do not let a
                 // snapshot cross that boundary even when AX equality happens
                 // to report the same handle again.
+                let readFinishedAt = Date()
+                recordDiagnostic("keyboard_document_observation_discarded", [
+                    "phase": phase,
+                    "reason": "object_generation_changed_during_read",
+                    "readStartedObjectGeneration": objectGeneration,
+                    "readFinishedObjectGeneration": targetElementObservationID ?? "unknown",
+                    "readStartedAt": readStartedAt.ISO8601Format(),
+                    "readFinishedAt": readFinishedAt.ISO8601Format(),
+                    "readStartedMonotonicMilliseconds": String(readStartedMonotonic),
+                    "sendState": pendingKeyboardWrite == nil ? "not_in_flight" : "sent_unconfirmed",
+                    "confirmationResult": "discarded_old_object_snapshot"
+                ])
                 throw KeyboardWriteReadError.retryable
             }
             let readFinishedAt = Date()
@@ -2045,6 +2446,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 "phase": phase,
                 "editorIdentityMeaning": "captured_handle_not_stable_editor_identity",
                 "objectGeneration": objectGeneration,
+                "readStartedObjectGeneration": objectGeneration,
+                "readFinishedObjectGeneration": targetElementObservationID ?? "unknown",
+                "requestedAt": requestedAt.ISO8601Format(),
+                "readStartedAt": readStartedAt.ISO8601Format(),
+                "readFinishedAt": readFinishedAt.ISO8601Format(),
+                "readStartedMonotonicMilliseconds": String(readStartedMonotonic),
+                "sendState": pendingKeyboardWrite == nil ? "not_in_flight" : "sent_unconfirmed",
+                "confirmationResult": "observed_for_comparison",
                 "coordinateMappingSource": state.mapping.map { String(describing: $0.source) } ?? "unavailable",
                 "coordinateDocumentLengthUTF16": String(state.text.utf16.count),
                 "rawDocumentLengthUTF16": String(state.rawText?.utf16.count ?? 0)
@@ -2054,13 +2463,31 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             return observation
         } catch KeyboardWriteReadError.retryable {
             if !keyboardTargetReacquireRetryIsPending {
-                recordDiagnostic("keyboard_state_read_retryable", ["phase": phase])
+                recordDiagnostic("keyboard_state_read_retryable", [
+                    "phase": phase,
+                    "readStartedObjectGeneration": objectGeneration,
+                    "readFinishedObjectGeneration": targetElementObservationID ?? "unknown",
+                    "readStartedAt": readStartedAt.ISO8601Format(),
+                    "readFinishedAt": Date().ISO8601Format(),
+                    "readStartedMonotonicMilliseconds": String(readStartedMonotonic),
+                    "sendState": pendingKeyboardWrite == nil ? "not_in_flight" : "sent_unconfirmed",
+                    "confirmationResult": "not_confirmed"
+                ])
             }
             keyboardTargetReacquireRetryIsPending = false
             throw KeyboardWriteReadError.retryable
         } catch KeyboardDocumentStateReadError.retryable,
                 KeyboardDocumentStateReadError.unavailable {
-            recordDiagnostic("keyboard_state_read_retryable", ["phase": phase])
+            recordDiagnostic("keyboard_state_read_retryable", [
+                "phase": phase,
+                "readStartedObjectGeneration": objectGeneration,
+                "readFinishedObjectGeneration": targetElementObservationID ?? "unknown",
+                "readStartedAt": readStartedAt.ISO8601Format(),
+                "readFinishedAt": Date().ISO8601Format(),
+                "readStartedMonotonicMilliseconds": String(readStartedMonotonic),
+                "sendState": pendingKeyboardWrite == nil ? "not_in_flight" : "sent_unconfirmed",
+                "confirmationResult": "read_unavailable"
+            ])
             throw KeyboardWriteReadError.retryable
         } catch is CancellationError {
             throw CancellationError()
@@ -3672,7 +4099,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
               ),
               let previous = editorContinuity,
               let current = access.editorContinuityEvidence(for: element, anchoredAt: previous),
-              Self.editorContinuityMatches(previous, current) else {
+              Self.editorContinuityMatches(previous, current, capturedAnchorScan: true) else {
             return false
         }
         editorContinuity = current
@@ -3724,14 +4151,23 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         }
     }
 
-    private func acceptKeyboardTargetRebuild(_ element: AXUIElement, phase: String) throws {
+    @discardableResult
+    private func acceptKeyboardTargetRebuild(
+        _ element: AXUIElement,
+        phase: String,
+        candidateGeneration: String? = nil
+    ) throws -> String {
+        let candidateObjectGeneration = candidateGeneration ?? UUID().uuidString
         func reject(_ reason: String, additionalFields: [String: String] = [:]) throws -> Never {
             var fields = [
                 "phase": phase,
                 "reason": reason,
                 "sameApplication": String(access.currentApplication()?.bundleIdentifier == targetApplicationBundleIdentifier),
-                "targetApplication": targetApplicationBundleIdentifier ?? "unknown"
+                "targetApplication": targetApplicationBundleIdentifier ?? "unknown",
+                "previousObjectGeneration": targetElementObservationID ?? "unknown",
+                "candidateObjectGeneration": candidateObjectGeneration
             ]
+            fields.merge(boundedContinuityDiagnosticFields(continuityCaptureSummary)) { _, new in new }
             fields.merge(additionalFields) { _, new in new }
             recordDiagnostic("keyboard_target_reacquire_rejected", fields)
             keyboardTargetReacquireRetryDiagnosticRecorded = false
@@ -3740,84 +4176,251 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             throw TextTargetError.targetChanged
         }
 
-        func retry(_ reason: String) throws -> Never {
+        func retry(_ reason: String, additionalFields: [String: String] = [:]) throws -> Never {
             if !keyboardTargetReacquireRetryDiagnosticRecorded {
-                recordDiagnostic("keyboard_target_reacquire_retryable", [
+                var fields = [
                     "phase": phase,
                     "reason": reason,
-                    "retryWindow": "existing_operation_deadline"
-                ])
+                    "retryWindow": "existing_operation_deadline",
+                    "previousObjectGeneration": targetElementObservationID ?? "unknown",
+                    "candidateObjectGeneration": candidateObjectGeneration
+                ]
+                fields.merge(boundedContinuityDiagnosticFields(continuityCaptureSummary)) { _, new in new }
+                fields.merge(additionalFields) { _, new in new }
+                recordDiagnostic("keyboard_target_reacquire_retryable", fields)
                 keyboardTargetReacquireRetryDiagnosticRecorded = true
             }
             keyboardTargetReacquireRetryIsPending = true
             throw KeyboardWriteReadError.retryable
         }
 
-        let validation = validateKeyboardTargetRebuild(element)
+        let validation = validateKeyboardTargetRebuild(
+            element,
+            candidateObjectGeneration: candidateObjectGeneration
+        )
         let current: AXTextEditorContinuityEvidence
         let continuityRoute: String
         let expectedPID: pid_t
+        let identityOutcome: String
+        let identityDiagnosticFields: [String: String]
         switch validation {
-        case let .confirmed(evidence, route, processID):
+        case let .confirmed(evidence, route, processID, outcome, diagnosticFields):
             current = evidence
             continuityRoute = route
             expectedPID = processID
-        case let .temporarilyUnavailable(reason):
-            try retry(reason)
-        case let .rejected(reason):
-            try reject(reason)
+            identityOutcome = outcome
+            identityDiagnosticFields = diagnosticFields
+        case let .temporarilyUnavailable(reason, diagnosticFields):
+            try retry(reason, additionalFields: diagnosticFields ?? [:])
+        case let .rejected(reason, diagnosticFields):
+            try reject(reason, additionalFields: diagnosticFields ?? [:])
         }
 
         let previousID = targetElementObservationID
         targetElement = element
         targetProcessID = expectedPID
         editorContinuity = current
-        targetElementObservationID = UUID().uuidString
+        targetElementObservationID = candidateObjectGeneration
         keyboardTargetReacquireRetryDiagnosticRecorded = false
         keyboardTargetReacquireRetryIsPending = false
-        recordDiagnostic("keyboard_target_reacquired", [
+        var reacquireFields = [
             "phase": phase,
             "reason": continuityRoute == "captured_anchor_subtree"
                 ? "unique_focused_editor_under_captured_anchor"
                 : "same_web_area_unique_editor_anchor_and_expected_document",
             "continuityRoute": continuityRoute,
-            "previousHandleObservationID": previousID ?? "unknown",
-            "currentHandleObservationID": targetElementObservationID ?? "unknown",
+            "previousObjectGeneration": previousID ?? "unknown",
+            "currentObjectGeneration": targetElementObservationID ?? "unknown",
             "editableEditorCount": String(current.editableEditorCount),
             "editorAnchorRole": current.editorAnchorRole,
-            "rolePathDepth": String(current.rolesFromEditorToAnchor.count)
-        ])
+            "rolePathDepth": String(current.rolesFromEditorToAnchor.count),
+            "identityOutcome": identityOutcome,
+            "leafIdentifierPresence": (current.identifiersFromEditorToAnchor.first ?? nil) == nil
+                ? "missing" : "present"
+        ]
+        reacquireFields.merge(identityDiagnosticFields) { existing, _ in existing }
+        if let comparisonOutcome = identityDiagnosticFields["identityOutcome"] {
+            reacquireFields["identityComparisonOutcome"] = comparisonOutcome
+        }
+        reacquireFields["identityOutcome"] = identityOutcome
+        recordDiagnostic("keyboard_target_reacquired", reacquireFields)
+        return candidateObjectGeneration
     }
 
     private func validateKeyboardTargetRebuild(
-        _ element: AXUIElement
+        _ element: AXUIElement,
+        candidateObjectGeneration: String
     ) -> AXEditorIdentityValidationResult {
-        guard isSafariWebEditor || isCodexTarget,
-              let currentApplication = access.currentApplication(),
-              currentApplication.bundleIdentifier == targetApplicationBundleIdentifier,
-              let expectedPID = targetApplicationProcessID,
-              currentApplication.processIdentifier == expectedPID,
-              access.processIdentifier(of: element) == expectedPID,
-              let previousElement = targetElement,
-              access.elementValidity(previousElement) == .invalid else {
+        access.setContinuityScanObjectGeneration(targetElementObservationID)
+        access.setContinuityScanBudgetNanoseconds(nil)
+        defer {
+            access.setContinuityScanObjectGeneration(nil)
+            access.setContinuityScanBudgetNanoseconds(nil)
+        }
+        guard isSafariWebEditor || isCodexTarget else {
             return .rejected(reason: "old_handle_or_process_not_verified")
         }
+        guard let currentApplication = access.currentApplication() else {
+            return .rejected(reason: "old_handle_or_process_not_verified", diagnosticFields: [
+                "identityFailure": "frontmost_application_unavailable",
+                "applicationComparison": "unavailable"
+            ])
+        }
+        guard currentApplication.bundleIdentifier == targetApplicationBundleIdentifier else {
+            return .rejected(reason: "old_handle_or_process_not_verified", diagnosticFields: [
+                "identityFailure": "application_changed",
+                "applicationComparison": "different"
+            ])
+        }
+        guard let expectedPID = targetApplicationProcessID else {
+            return .rejected(reason: "old_handle_or_process_not_verified", diagnosticFields: [
+                "identityFailure": "captured_process_unavailable",
+                "processComparison": "unavailable"
+            ])
+        }
+        guard currentApplication.processIdentifier == expectedPID else {
+            return .rejected(reason: "old_handle_or_process_not_verified", diagnosticFields: [
+                "identityFailure": "frontmost_process_changed",
+                "processComparison": "different"
+            ])
+        }
+        guard let candidatePID = access.processIdentifier(of: element) else {
+            return .rejected(reason: "old_handle_or_process_not_verified", diagnosticFields: [
+                "identityFailure": "candidate_process_unavailable",
+                "candidateProcessComparison": "unavailable"
+            ])
+        }
+        guard candidatePID == expectedPID else {
+            return .rejected(reason: "old_handle_or_process_not_verified", diagnosticFields: [
+                "identityFailure": "candidate_process_changed",
+                "candidateProcessComparison": "different"
+            ])
+        }
+        guard let previousElement = targetElement else {
+            return .rejected(reason: "old_handle_or_process_not_verified", diagnosticFields: [
+                "identityFailure": "previous_handle_missing",
+                "previousHandleValidity": "unavailable"
+            ])
+        }
+        let previousHandleValidity = access.elementValidity(previousElement)
+        guard previousHandleValidity == .invalid else {
+            let validity: String = switch previousHandleValidity {
+            case .valid: "valid"
+            case .unavailable: "unavailable"
+            case .invalid: "invalid"
+            }
+            return .rejected(reason: "old_handle_or_process_not_verified", diagnosticFields: [
+                "identityFailure": "previous_handle_not_invalidated",
+                "previousHandleValidity": validity
+            ])
+        }
         guard let previous = editorContinuity else {
-            return .rejected(reason: "stable_unique_editor_continuity_unverified")
+            return .rejected(reason: "stable_unique_editor_continuity_unverified", diagnosticFields: [
+                "continuityFailure": "captured_evidence_missing",
+                "previousEvidence": "missing",
+                "fallbackRoute": "not_attempted_no_captured_anchor"
+            ])
         }
+        access.setContinuityScanBudgetNanoseconds(250_000_000)
+        access.setContinuityScanObjectGeneration(candidateObjectGeneration)
         let scannedContinuity = access.editorContinuityEvidence(for: element)
-        let current = scannedContinuity ?? access.editorContinuityEvidence(
-            for: element,
-            anchoredAt: previous
-        )
+        let ancestorScanID = access.lastContinuityScanObservationID()
+        let ancestorComparison = scannedContinuity.map { AXTextEditorContinuity.compare(previous, $0) }
+        let shouldUseCapturedAnchor = scannedContinuity == nil
+            || ancestorComparison?.canConfirmFromCapturedAnchor == true
+        if let ancestorComparison,
+           !ancestorComparison.matches,
+           !ancestorComparison.canConfirmFromCapturedAnchor {
+            var fields = ancestorComparison.fields
+            fields["continuityFailure"] = "evidence_mismatch"
+            fields["fallbackRoute"] = "not_attempted_ancestor_evidence_conflicts_or_structure_differs"
+            fields["currentEvidenceSource"] = "ancestor_scan"
+            fields["ancestorScanID"] = ancestorScanID ?? "unknown"
+            fields["currentScanID"] = ancestorScanID ?? "unknown"
+            if ancestorComparison.identityOutcome == "temporarily_unavailable" {
+                return .temporarilyUnavailable(
+                    reason: "continuity_evidence_temporarily_unavailable",
+                    diagnosticFields: fields
+                )
+            }
+            return .rejected(
+                reason: "stable_unique_editor_continuity_unverified",
+                diagnosticFields: fields
+            )
+        }
+        let current = shouldUseCapturedAnchor
+            ? access.editorContinuityEvidence(for: element, anchoredAt: previous)
+            : scannedContinuity
+        let currentScanID = shouldUseCapturedAnchor
+            ? access.lastContinuityScanObservationID()
+            : ancestorScanID
         guard let current else {
-            return .temporarilyUnavailable(reason: "continuity_evidence_unavailable")
+            var unavailableFields = [
+                "continuityFailure": "current_evidence_unavailable",
+                "previousEvidence": "saved",
+                "ancestorScanOutcome": scannedContinuity == nil ? "no_evidence" : "identifier_missing",
+                "fallbackRoute": shouldUseCapturedAnchor
+                    ? "attempted_captured_anchor_subtree"
+                    : "not_attempted_identifier_match",
+                "ancestorScanID": ancestorScanID ?? "unknown",
+                "capturedAnchorScanID": currentScanID ?? "unknown"
+            ]
+            if let ancestorComparison {
+                unavailableFields.merge(ancestorComparison.fields) { _, new in new }
+            }
+            return .temporarilyUnavailable(
+                reason: "continuity_evidence_unavailable",
+                diagnosticFields: unavailableFields
+            )
         }
-        guard Self.editorContinuityMatches(previous, current) else {
-            return .rejected(reason: "stable_unique_editor_continuity_unverified")
+        let comparison = AXTextEditorContinuity.compare(previous, current)
+        let confirmedWithoutIdentifier = shouldUseCapturedAnchor
+            && comparison.canConfirmFromCapturedAnchor
+        guard comparison.matches || confirmedWithoutIdentifier else {
+            var fields = comparison.fields
+            fields["continuityFailure"] = "evidence_mismatch"
+            fields["fallbackRoute"] = shouldUseCapturedAnchor
+                ? "attempted_captured_anchor_subtree"
+                : "not_attempted_identifier_match"
+            fields["currentEvidenceSource"] = shouldUseCapturedAnchor ? "captured_anchor_subtree" : "ancestor_scan"
+            fields["ancestorScanID"] = ancestorScanID ?? "unknown"
+            fields["currentScanID"] = currentScanID ?? "unknown"
+            if comparison.identityOutcome == "temporarily_unavailable" {
+                return .temporarilyUnavailable(
+                    reason: "continuity_evidence_temporarily_unavailable",
+                    diagnosticFields: fields
+                )
+            }
+            return .rejected(
+                reason: "stable_unique_editor_continuity_unverified",
+                diagnosticFields: fields
+            )
         }
-        let continuityRoute = scannedContinuity == nil ? "captured_anchor_subtree" : "ancestor_scan"
-        let usedCapturedAnchorFallback = scannedContinuity == nil
+        let continuityRoute = shouldUseCapturedAnchor ? "captured_anchor_subtree" : "ancestor_scan"
+        let usedCapturedAnchorFallback = shouldUseCapturedAnchor
+        guard let latestApplication = access.currentApplication() else {
+            return .temporarilyUnavailable(reason: "frontmost_application_unavailable_after_scan")
+        }
+        guard latestApplication.bundleIdentifier == targetApplicationBundleIdentifier,
+              latestApplication.processIdentifier == expectedPID else {
+            return .rejected(reason: "application_or_process_changed_during_scan", diagnosticFields: [
+                "applicationComparison": String(latestApplication.bundleIdentifier == targetApplicationBundleIdentifier),
+                "processComparison": String(latestApplication.processIdentifier == expectedPID)
+            ])
+        }
+        do {
+            let focusedAfterScan = try access.focusedElement()
+            guard CFEqual(focusedAfterScan, element) else {
+                return .rejected(reason: "focused_editor_changed_during_scan", diagnosticFields: [
+                    "focusedTargetComparison": "different",
+                    "identityOutcome": "focus_changed_after_scan"
+                ])
+            }
+        } catch {
+            return .temporarilyUnavailable(reason: "focused_editor_unavailable_after_scan", diagnosticFields: [
+                "focusedTargetComparison": "unavailable"
+            ])
+        }
         let context = access.textInputContext(for: element)
         if context?.isReadOnly == true || context?.isSecure == true {
             return .rejected(reason: "editor_is_not_writable")
@@ -3830,7 +4433,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         }
         guard isEligibleRebuiltKeyboardEditor(
             element,
-            application: currentApplication,
+            application: latestApplication,
             context: context,
             allowCapturedAnchorFallback: usedCapturedAnchorFallback
         ) else {
@@ -3839,7 +4442,25 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         return .confirmed(
             evidence: current,
             route: continuityRoute,
-            processID: expectedPID
+            processID: expectedPID,
+            identityOutcome: confirmedWithoutIdentifier
+                ? "confirmed_by_captured_anchor_without_identifier"
+                : shouldUseCapturedAnchor
+                    ? "confirmed_by_captured_anchor_with_identifier"
+                    : "confirmed_by_matching_identifier",
+            diagnosticFields: comparison.fields.merging([
+                "fallbackRoute": shouldUseCapturedAnchor
+                    ? "attempted_captured_anchor_subtree"
+                    : "not_attempted_identifier_match",
+                "currentEvidenceSource": shouldUseCapturedAnchor
+                    ? "captured_anchor_subtree"
+                    : "ancestor_scan",
+                "ancestorScanID": ancestorScanID ?? "unknown",
+                "currentScanID": currentScanID ?? "unknown",
+                "focusedTargetComparison": "same",
+                "applicationComparison": "equal",
+                "processComparison": "equal"
+            ]) { _, new in new }
         )
     }
 
@@ -3863,9 +4484,12 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
 
     private static func editorContinuityMatches(
         _ previous: AXTextEditorContinuityEvidence,
-        _ current: AXTextEditorContinuityEvidence
+        _ current: AXTextEditorContinuityEvidence,
+        capturedAnchorScan: Bool = false
     ) -> Bool {
-        AXTextEditorContinuity.matches(previous, current)
+        let comparison = AXTextEditorContinuity.compare(previous, current)
+        return comparison.matches
+            || (capturedAnchorScan && comparison.canConfirmFromCapturedAnchor)
     }
 
     private func isEligibleRebuiltKeyboardEditor(
@@ -4275,8 +4899,29 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
 
     private func ensureTargetApplicationIsFrontmost() throws {
         guard let targetApplicationProcessID else { return }
-        guard access.currentApplication()?.processIdentifier == Int32(targetApplicationProcessID) else {
-            recordDiagnostic("input_application_changed")
+        let currentApplication = access.currentApplication()
+        let applicationComparison: String
+        if let currentBundle = currentApplication?.bundleIdentifier,
+           let targetApplicationBundleIdentifier {
+            applicationComparison = currentBundle == targetApplicationBundleIdentifier ? "equal" : "different"
+        } else {
+            applicationComparison = "unavailable"
+        }
+        let processComparison: String
+        if let currentPID = currentApplication?.processIdentifier {
+            processComparison = currentPID == Int32(targetApplicationProcessID) ? "equal" : "different"
+        } else {
+            processComparison = "unavailable"
+        }
+        guard processComparison == "equal" else {
+            let identityFailure = currentApplication == nil
+                ? "frontmost_application_unavailable"
+                : (applicationComparison == "different" ? "application_changed" : "frontmost_process_changed")
+            recordDiagnostic("input_application_changed", [
+                "identityFailure": identityFailure,
+                "applicationComparison": applicationComparison,
+                "processComparison": processComparison
+            ])
             invalidateKeyboardRawInsertionRegion()
             throw TextTargetError.targetChanged
         }
@@ -4433,10 +5078,129 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
 final class SystemAXTextTargetAccess: AXTextTargetAccess {
     private struct AncestorAttributeReadFailure: Error {}
     private var readDiagnostics: [TextInputDiagnostic] = []
+    private var activeContinuityScanID: String?
+    private var activeContinuityScanObjectGeneration: String?
+    private var activeContinuityScanDeadlineNanoseconds: UInt64?
+    private var activeContinuityScanFailureFields: [String: String]?
+    private var activeContinuityScanSummaryFields: [String: String]?
+    private(set) var lastContinuityScanID: String?
+    private(set) var lastContinuityScanSummaryFields: [String: String]?
+    private var readDiagnosticEvictionCount = 0
+    private var firstReadDiagnosticEvictionAt: Date?
+    private var lastReadDiagnosticEvictionAt: Date?
+    private var firstReadDiagnosticEvictionMonotonicNanoseconds: UInt64?
+    private var lastReadDiagnosticEvictionMonotonicNanoseconds: UInt64?
+    private var coalescedReadDiagnosticCount = 0
+    private var lastReadDiagnosticQueueIncidentAt: Date?
+    private var lastReadDiagnosticQueueIncidentMonotonicNanoseconds: UInt64?
+    private var continuityDiagnosticsEnabled = true
+    struct ContinuityAXReader {
+        var copyAttributeValue: (AXUIElement, String) -> (AXError, CFTypeRef?)
+        var setMessagingTimeout: (AXUIElement, Float) -> Void
+        var processIdentifier: (AXUIElement) -> pid_t?
+        var now: () -> Date
+        var monotonicNanoseconds: () -> UInt64
+
+        static let system = ContinuityAXReader(
+            copyAttributeValue: { element, name in
+                var value: CFTypeRef?
+                let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+                return (status, value)
+            },
+            setMessagingTimeout: { AXUIElementSetMessagingTimeout($0, $1) },
+            processIdentifier: { element in
+                var processID: pid_t = 0
+                guard AXUIElementGetPid(element, &processID) == .success, processID != 0 else { return nil }
+                return processID
+            },
+            now: Date.init,
+            monotonicNanoseconds: { DispatchTime.now().uptimeNanoseconds }
+        )
+    }
+
+    private let continuityAXReader: ContinuityAXReader
+
+    init(continuityAXReader: ContinuityAXReader = .system) {
+        self.continuityAXReader = continuityAXReader
+    }
+
+    func lastContinuityScanObservationID() -> String? { lastContinuityScanID }
+    func lastContinuityScanSummary() -> [String: String]? { lastContinuityScanSummaryFields }
+
+    func setContinuityDiagnosticsEnabled(_ enabled: Bool) {
+        continuityDiagnosticsEnabled = enabled
+        guard !enabled else { return }
+        readDiagnostics.removeAll(keepingCapacity: true)
+        readDiagnosticEvictionCount = 0
+        firstReadDiagnosticEvictionAt = nil
+        lastReadDiagnosticEvictionAt = nil
+        firstReadDiagnosticEvictionMonotonicNanoseconds = nil
+        lastReadDiagnosticEvictionMonotonicNanoseconds = nil
+        coalescedReadDiagnosticCount = 0
+        lastReadDiagnosticQueueIncidentAt = nil
+        lastReadDiagnosticQueueIncidentMonotonicNanoseconds = nil
+        lastContinuityScanID = nil
+        lastContinuityScanSummaryFields = nil
+        activeContinuityScanFailureFields = nil
+        activeContinuityScanSummaryFields = nil
+        activeContinuityScanObjectGeneration = nil
+    }
+
+    func setContinuityScanObjectGeneration(_ generation: String?) {
+        activeContinuityScanObjectGeneration = generation
+    }
+
+    func setContinuityScanBudgetNanoseconds(_ budget: UInt64?) {
+        activeContinuityScanDeadlineNanoseconds = budget.map {
+            continuityAXReader.monotonicNanoseconds() &+ $0
+        }
+    }
+
+    private func continuityScanDeadline() -> Date {
+        guard let deadlineNanoseconds = activeContinuityScanDeadlineNanoseconds else {
+            return continuityAXReader.now().addingTimeInterval(0.25)
+        }
+        let nowNanoseconds = continuityAXReader.monotonicNanoseconds()
+        let remainingNanoseconds = deadlineNanoseconds > nowNanoseconds
+            ? deadlineNanoseconds - nowNanoseconds
+            : 0
+        return continuityAXReader.now().addingTimeInterval(Double(remainingNanoseconds) / 1_000_000_000)
+    }
 
     func drainReadDiagnostics() -> [TextInputDiagnostic] {
-        defer { readDiagnostics.removeAll(keepingCapacity: true) }
-        return readDiagnostics
+        guard continuityDiagnosticsEnabled else {
+            setContinuityDiagnosticsEnabled(false)
+            return []
+        }
+        var result = readDiagnostics
+        if readDiagnosticEvictionCount > 0 || coalescedReadDiagnosticCount > 0 {
+            let now = lastReadDiagnosticQueueIncidentAt ?? continuityAXReader.now()
+            result.append(TextInputDiagnostic(
+                timestamp: now,
+                monotonicTimestampNanoseconds: lastReadDiagnosticQueueIncidentMonotonicNanoseconds
+                    ?? continuityAXReader.monotonicNanoseconds(),
+                event: "ax_read_diagnostic_queue_summary",
+                fields: [
+                    "evictedCount": String(readDiagnosticEvictionCount),
+                    "firstEvictionAt": firstReadDiagnosticEvictionAt.map(DiagnosticReportTime.format) ?? "none",
+                    "lastEvictionAt": lastReadDiagnosticEvictionAt.map(DiagnosticReportTime.format) ?? "none",
+                    "firstEvictionMonotonicNanoseconds": firstReadDiagnosticEvictionMonotonicNanoseconds.map(String.init) ?? "none",
+                    "lastEvictionMonotonicNanoseconds": lastReadDiagnosticEvictionMonotonicNanoseconds.map(String.init) ?? "none",
+                    "coalescedDuplicateCount": String(coalescedReadDiagnosticCount),
+                    "capacity": "16"
+                ]
+            ))
+        }
+        readDiagnostics.removeAll(keepingCapacity: true)
+        readDiagnosticEvictionCount = 0
+        firstReadDiagnosticEvictionAt = nil
+        lastReadDiagnosticEvictionAt = nil
+        firstReadDiagnosticEvictionMonotonicNanoseconds = nil
+        lastReadDiagnosticEvictionMonotonicNanoseconds = nil
+        coalescedReadDiagnosticCount = 0
+        lastReadDiagnosticQueueIncidentAt = nil
+        lastReadDiagnosticQueueIncidentMonotonicNanoseconds = nil
+        return result
     }
 
     private func recordReadStatus(_ status: AXError, attribute: String) {
@@ -4446,9 +5210,38 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
     }
 
     private func appendReadDiagnostic(event: String, fields: [String: String]) {
-        guard readDiagnostics.last?.event != event || readDiagnostics.last?.fields != fields else { return }
-        if readDiagnostics.count >= 16 { readDiagnostics.removeFirst() }
-        readDiagnostics.append(TextInputDiagnostic(timestamp: Date(), event: event, fields: fields))
+        guard continuityDiagnosticsEnabled else { return }
+        let timestamp = continuityAXReader.now()
+        let monotonicTimestamp = continuityAXReader.monotonicNanoseconds()
+        if readDiagnostics.last?.event == event, readDiagnostics.last?.fields == fields {
+            coalescedReadDiagnosticCount += 1
+            lastReadDiagnosticQueueIncidentAt = timestamp
+            lastReadDiagnosticQueueIncidentMonotonicNanoseconds = monotonicTimestamp
+            return
+        }
+        if readDiagnostics.count >= 16 {
+            readDiagnostics.removeFirst()
+            readDiagnosticEvictionCount += 1
+            let evictedAt = timestamp
+            firstReadDiagnosticEvictionAt = firstReadDiagnosticEvictionAt ?? evictedAt
+            lastReadDiagnosticEvictionAt = evictedAt
+            firstReadDiagnosticEvictionMonotonicNanoseconds = firstReadDiagnosticEvictionMonotonicNanoseconds
+                ?? monotonicTimestamp
+            lastReadDiagnosticEvictionMonotonicNanoseconds = monotonicTimestamp
+            lastReadDiagnosticQueueIncidentAt = evictedAt
+            lastReadDiagnosticQueueIncidentMonotonicNanoseconds = monotonicTimestamp
+        }
+        var recordedFields = fields
+        if let activeContinuityScanID { recordedFields["scanID"] = activeContinuityScanID }
+        if let activeContinuityScanObjectGeneration {
+            recordedFields["objectGeneration"] = activeContinuityScanObjectGeneration
+        }
+        readDiagnostics.append(TextInputDiagnostic(
+            timestamp: timestamp,
+            monotonicTimestampNanoseconds: monotonicTimestamp,
+            event: event,
+            fields: recordedFields
+        ))
     }
 
     private func recordEditorContinuityScanDiagnostic(
@@ -4464,7 +5257,7 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
         editableEditorCount: Int? = nil,
         scanStartedAt: UInt64
     ) {
-        let now = DispatchTime.now().uptimeNanoseconds
+        let now = continuityAXReader.monotonicNanoseconds()
         let fields = AXTextEditorContinuityScanDiagnostic.fields(
             stage: stage,
             reason: reason,
@@ -4478,6 +5271,12 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
             editableEditorCount: editableEditorCount,
             elapsedMilliseconds: max(0, now &- scanStartedAt) / 1_000_000
         )
+        if activeContinuityScanID != nil {
+            activeContinuityScanFailureFields = fields
+            for key in ["candidateCount", "visitedNodes", "editableEditorCount"] {
+                if let value = fields[key] { activeContinuityScanSummaryFields?[key] = value }
+            }
+        }
         appendReadDiagnostic(event: AXTextEditorContinuityScanDiagnostic.event, fields: fields)
     }
 
@@ -4522,10 +5321,9 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
     }
 
     func elementValidity(_ element: AXUIElement) -> AXTextElementValidity {
-        let scanStartedAt = DispatchTime.now().uptimeNanoseconds
-        var value: CFTypeRef?
-        AXUIElementSetMessagingTimeout(element, 0.03)
-        let status = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &value)
+        let scanStartedAt = continuityAXReader.monotonicNanoseconds()
+        continuityAXReader.setMessagingTimeout(element, 0.03)
+        let (status, _) = continuityAXReader.copyAttributeValue(element, kAXRoleAttribute as String)
         switch status {
         case .success: return .valid
         case .invalidUIElement:
@@ -4550,8 +5348,58 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
     }
 
     func editorContinuityEvidence(for element: AXUIElement) -> AXTextEditorContinuityEvidence? {
-        let deadline = Date().addingTimeInterval(0.25)
-        let scanStartedAt = DispatchTime.now().uptimeNanoseconds
+        let priorScanID = activeContinuityScanID
+        let priorObjectGeneration = activeContinuityScanObjectGeneration
+        let scanID = UUID().uuidString
+        lastContinuityScanID = scanID
+        let startedAt = continuityAXReader.monotonicNanoseconds()
+        activeContinuityScanID = scanID
+        activeContinuityScanSummaryFields = [:]
+        activeContinuityScanFailureFields = nil
+        let evidence = scanEditorContinuityEvidence(for: element)
+        let failureFields = activeContinuityScanFailureFields
+        let scanMetrics = activeContinuityScanSummaryFields ?? [:]
+        activeContinuityScanID = priorScanID
+        activeContinuityScanObjectGeneration = priorObjectGeneration
+        activeContinuityScanFailureFields = nil
+        activeContinuityScanSummaryFields = nil
+        var fields: [String: String] = [
+            "scanID": scanID,
+            "objectGeneration": priorObjectGeneration ?? "unknown",
+            "scanPath": "ancestor_scan",
+            "scanComplete": String(evidence?.scanComplete == true),
+            "elapsedMilliseconds": String(max(0, continuityAXReader.monotonicNanoseconds() &- startedAt) / 1_000_000)
+        ]
+        fields.merge(scanMetrics) { _, new in new }
+        fields["candidateCount"] = fields["candidateCount"]
+            ?? String(evidence?.editableEditorCount ?? Int(failureFields?["candidateCount"] ?? "") ?? 0)
+        fields["visitedNodes"] = fields["visitedNodes"] ?? failureFields?["visitedNodes"] ?? "unknown"
+        if let evidence {
+            fields["outcome"] = "unique_editor_found"
+            fields["rolePathDepth"] = String(evidence.rolesFromEditorToAnchor.count)
+            fields["identifierPresence"] = evidence.identifiersFromEditorToAnchor.map { $0 == nil ? "missing" : "present" }.joined(separator: ",")
+        } else {
+            fields["outcome"] = "scan_failed"
+            if let failureFields {
+                fields["stopStage"] = failureFields["scanStage"] ?? "unknown"
+                fields["stopReason"] = failureFields["reason"] ?? "unknown"
+                fields["failureAttribute"] = failureFields["axAttribute"] ?? "none"
+                fields["failureStatus"] = failureFields["axStatus"] ?? "none"
+            }
+        }
+        appendReadDiagnostic(event: "editor_continuity_scan_summary", fields: fields)
+        if continuityDiagnosticsEnabled {
+            lastContinuityScanSummaryFields = fields
+        } else {
+            lastContinuityScanID = nil
+            lastContinuityScanSummaryFields = nil
+        }
+        return evidence
+    }
+
+    private func scanEditorContinuityEvidence(for element: AXUIElement) -> AXTextEditorContinuityEvidence? {
+        let deadline = continuityScanDeadline()
+        let scanStartedAt = continuityAXReader.monotonicNanoseconds()
         var node = element
         var roles: [String] = []
         var identifiers: [String?] = []
@@ -4559,7 +5407,7 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
         var webArea: AXUIElement?
 
         for depth in 0..<64 {
-            guard Date() < deadline else {
+            guard continuityAXReader.now() < deadline else {
                 recordEditorContinuityScanDiagnostic(
                     stage: "ancestor_role", reason: "deadline_exceeded",
                     attribute: kAXRoleAttribute as String, depth: depth,
@@ -4608,8 +5456,8 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
             deadline: deadline,
             scanStartedAt: scanStartedAt
         ),
-        let targetProcessID = processIdentifier(of: element),
-        let windowProcessID = processIdentifier(of: window),
+        let targetProcessID = continuityAXReader.processIdentifier(element),
+        let windowProcessID = continuityAXReader.processIdentifier(window),
         windowProcessID == targetProcessID else {
             recordEditorContinuityScanDiagnostic(
                 stage: "target_window", reason: "window_identity_unavailable_or_wrong_process",
@@ -4620,7 +5468,7 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
 
         var scannedCandidateCounts: [Int] = []
         for (candidateIndex, candidate) in candidates.enumerated() {
-            guard Date() < deadline else {
+            guard continuityAXReader.now() < deadline else {
                 recordEditorContinuityScanDiagnostic(
                     stage: "candidate_subtree", reason: "deadline_exceeded",
                     depth: candidate.depth, visitedNodes: 0,
@@ -4629,11 +5477,14 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
                 )
                 return nil
             }
-            guard let (count, complete) = editableEditorCount(
+            guard let (count, complete, visitedNodes) = editableEditorCount(
                 in: candidate.element, deadline: deadline, candidateIndex: candidateIndex,
                 candidateCount: candidates.count, scanStartedAt: scanStartedAt
             ), complete else { return nil }
             scannedCandidateCounts.append(count)
+            activeContinuityScanSummaryFields?["candidateCount"] = String(candidates.count)
+            let nodesVisitedSoFar = Int(activeContinuityScanSummaryFields?["visitedNodes"] ?? "\(roles.count)") ?? roles.count
+            activeContinuityScanSummaryFields?["visitedNodes"] = String(nodesVisitedSoFar + visitedNodes)
             if count == 1 {
                 return AXTextEditorContinuityEvidence(
                     webArea: webArea,
@@ -4654,6 +5505,9 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
             editableEditorCount: scannedCandidateCounts.reduce(0, +),
             scanStartedAt: scanStartedAt
         )
+        activeContinuityScanSummaryFields?["candidateCount"] = String(candidates.count)
+        let priorVisitedNodes = Int(activeContinuityScanSummaryFields?["visitedNodes"] ?? "0") ?? 0
+        activeContinuityScanSummaryFields?["visitedNodes"] = String(roles.count + priorVisitedNodes)
         return nil
     }
 
@@ -4661,8 +5515,61 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
         for element: AXUIElement,
         anchoredAt previous: AXTextEditorContinuityEvidence
     ) -> AXTextEditorContinuityEvidence? {
-        let started = DispatchTime.now().uptimeNanoseconds
-        let deadline = Date().addingTimeInterval(0.25)
+        let priorScanID = activeContinuityScanID
+        let priorObjectGeneration = activeContinuityScanObjectGeneration
+        let scanID = UUID().uuidString
+        lastContinuityScanID = scanID
+        let startedAt = continuityAXReader.monotonicNanoseconds()
+        activeContinuityScanID = scanID
+        activeContinuityScanSummaryFields = [:]
+        activeContinuityScanFailureFields = nil
+        let evidence = scanAnchoredEditorContinuityEvidence(for: element, anchoredAt: previous)
+        let failureFields = activeContinuityScanFailureFields
+        let scanMetrics = activeContinuityScanSummaryFields ?? [:]
+        activeContinuityScanID = priorScanID
+        activeContinuityScanObjectGeneration = priorObjectGeneration
+        activeContinuityScanFailureFields = nil
+        activeContinuityScanSummaryFields = nil
+        var fields: [String: String] = [
+            "scanID": scanID,
+            "objectGeneration": priorObjectGeneration ?? "unknown",
+            "scanPath": "captured_anchor_subtree",
+            "scanComplete": String(evidence?.scanComplete == true),
+            "elapsedMilliseconds": String(max(0, continuityAXReader.monotonicNanoseconds() &- startedAt) / 1_000_000)
+        ]
+        fields.merge(scanMetrics) { _, new in new }
+        fields["candidateCount"] = fields["candidateCount"]
+            ?? String(evidence?.editableEditorCount ?? Int(failureFields?["candidateCount"] ?? "") ?? 0)
+        fields["visitedNodes"] = fields["visitedNodes"] ?? failureFields?["visitedNodes"] ?? "unknown"
+        if let evidence {
+            fields["outcome"] = "unique_editor_found"
+            fields["rolePathDepth"] = String(evidence.rolesFromEditorToAnchor.count)
+            fields["identifierPresence"] = evidence.identifiersFromEditorToAnchor.map { $0 == nil ? "missing" : "present" }.joined(separator: ",")
+        } else {
+            fields["outcome"] = "scan_failed"
+            if let failureFields {
+                fields["stopStage"] = failureFields["scanStage"] ?? "unknown"
+                fields["stopReason"] = failureFields["reason"] ?? "unknown"
+                fields["failureAttribute"] = failureFields["axAttribute"] ?? "none"
+                fields["failureStatus"] = failureFields["axStatus"] ?? "none"
+            }
+        }
+        appendReadDiagnostic(event: "editor_continuity_scan_summary", fields: fields)
+        if continuityDiagnosticsEnabled {
+            lastContinuityScanSummaryFields = fields
+        } else {
+            lastContinuityScanID = nil
+            lastContinuityScanSummaryFields = nil
+        }
+        return evidence
+    }
+
+    private func scanAnchoredEditorContinuityEvidence(
+        for element: AXUIElement,
+        anchoredAt previous: AXTextEditorContinuityEvidence
+    ) -> AXTextEditorContinuityEvidence? {
+        let started = continuityAXReader.monotonicNanoseconds()
+        let deadline = continuityScanDeadline()
         guard let previousWindow = previous.window,
               let currentWindow = requiredAXElement(
                 kAXWindowAttribute as String,
@@ -4672,8 +5579,8 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
                 deadline: deadline,
                 scanStartedAt: started
               ),
-              let elementProcessID = processIdentifier(of: element),
-              let windowProcessID = processIdentifier(of: currentWindow),
+              let elementProcessID = continuityAXReader.processIdentifier(element),
+              let windowProcessID = continuityAXReader.processIdentifier(currentWindow),
               CFEqual(previousWindow, currentWindow),
               windowProcessID == elementProcessID else {
             recordEditorContinuityScanDiagnostic(
@@ -4726,8 +5633,9 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
         }
         func value(_ name: String, in node: AXUIElement, optional: Bool = false) throws -> CFTypeRef? {
             var result: CFTypeRef?
-            AXUIElementSetMessagingTimeout(node, 0.03)
-            let status = AXUIElementCopyAttributeValue(node, name as CFString, &result)
+            continuityAXReader.setMessagingTimeout(node, 0.03)
+            let (status, value) = continuityAXReader.copyAttributeValue(node, name)
+            result = value
             if status == .success { return result }
             if optional && (status == .noValue || status == .attributeUnsupported) { return nil }
             if name == "AXChildren", status == .noValue { return nil }
@@ -4767,6 +5675,8 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
                     return children
                 }
             )
+            activeContinuityScanSummaryFields?["candidateCount"] = String(result.editableEditorCount)
+            activeContinuityScanSummaryFields?["visitedNodes"] = String(result.visitedNodeCount)
             guard result.editableEditorCount == 1,
                   result.targetFound,
                   let roles = result.rolesFromEditorToAnchor,
@@ -4811,19 +5721,21 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
         candidateIndex: Int,
         candidateCount: Int,
         scanStartedAt: UInt64
-    ) -> (Int, Bool)? {
+    ) -> (Int, Bool, Int)? {
         var pending = [root]
         var visited: [AXUIElement] = []
         var editableCount = 0
         while !pending.isEmpty {
-            guard Date() < deadline else {
+            guard continuityAXReader.now() < deadline else {
                 recordEditorContinuityScanDiagnostic(
                     stage: "candidate_subtree", reason: "deadline_exceeded",
                     depth: visited.count, visitedNodes: visited.count,
                     candidateIndex: candidateIndex, candidateCount: candidateCount,
                     editableEditorCount: editableCount, scanStartedAt: scanStartedAt
                 )
-                return (editableCount, false)
+                activeContinuityScanSummaryFields?["candidateCount"] = String(candidateCount)
+                activeContinuityScanSummaryFields?["visitedNodes"] = String(visited.count)
+                return (editableCount, false, visited.count)
             }
             guard visited.count < 160 else {
                 recordEditorContinuityScanDiagnostic(
@@ -4832,7 +5744,9 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
                     candidateIndex: candidateIndex, candidateCount: candidateCount,
                     editableEditorCount: editableCount, scanStartedAt: scanStartedAt
                 )
-                return (editableCount, false)
+                activeContinuityScanSummaryFields?["candidateCount"] = String(candidateCount)
+                activeContinuityScanSummaryFields?["visitedNodes"] = String(visited.count)
+                return (editableCount, false, visited.count)
             }
             let node = pending.removeLast()
             guard !visited.contains(where: { CFEqual($0, node) }) else { continue }
@@ -4842,7 +5756,11 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
                 depth: visited.count - 1, deadline: deadline, scanStartedAt: scanStartedAt,
                 visitedNodes: visited.count, candidateIndex: candidateIndex,
                 candidateCount: candidateCount, editableEditorCount: editableCount
-            ) else { return (editableCount, false) }
+            ) else {
+                activeContinuityScanSummaryFields?["candidateCount"] = String(candidateCount)
+                activeContinuityScanSummaryFields?["visitedNodes"] = String(visited.count)
+                return (editableCount, false, visited.count)
+            }
             if ["AXTextArea", "AXTextField", "AXSearchField"].contains(role) {
                 guard let subrole = optionalAXString(
                     kAXSubroleAttribute as String, in: node, deadline: deadline,
@@ -4850,16 +5768,24 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
                     scanStartedAt: scanStartedAt, visitedNodes: visited.count,
                     candidateIndex: candidateIndex, candidateCount: candidateCount,
                     editableEditorCount: editableCount
-                ), subrole != "AXSecureTextField" else { return (editableCount, false) }
+                ), subrole != "AXSecureTextField" else {
+                    activeContinuityScanSummaryFields?["candidateCount"] = String(candidateCount)
+                    activeContinuityScanSummaryFields?["visitedNodes"] = String(visited.count)
+                    return (editableCount, false, visited.count)
+                }
                 guard requiredAXBoolean(
                     "AXReadOnly", in: node, stage: "candidate_read_only",
                     depth: visited.count - 1, deadline: deadline, scanStartedAt: scanStartedAt,
                     visitedNodes: visited.count, candidateIndex: candidateIndex,
                     candidateCount: candidateCount, editableEditorCount: editableCount
-                ) == false else { return (editableCount, false) }
+                ) == false else {
+                    activeContinuityScanSummaryFields?["candidateCount"] = String(candidateCount)
+                    activeContinuityScanSummaryFields?["visitedNodes"] = String(visited.count)
+                    return (editableCount, false, visited.count)
+                }
                 editableCount += 1
             }
-            guard Date() < deadline else {
+            guard continuityAXReader.now() < deadline else {
                 recordEditorContinuityScanDiagnostic(
                     stage: "candidate_children", reason: "deadline_exceeded",
                     attribute: "AXChildren", depth: visited.count - 1,
@@ -4867,11 +5793,14 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
                     candidateCount: candidateCount, editableEditorCount: editableCount,
                     scanStartedAt: scanStartedAt
                 )
-                return (editableCount, false)
+                activeContinuityScanSummaryFields?["candidateCount"] = String(candidateCount)
+                activeContinuityScanSummaryFields?["visitedNodes"] = String(visited.count)
+                return (editableCount, false, visited.count)
             }
             var childValue: CFTypeRef?
-            AXUIElementSetMessagingTimeout(node, 0.03)
-            let status = AXUIElementCopyAttributeValue(node, "AXChildren" as CFString, &childValue)
+            continuityAXReader.setMessagingTimeout(node, 0.03)
+            let (status, value) = continuityAXReader.copyAttributeValue(node, "AXChildren")
+            childValue = value
             switch status {
             case .success:
                 guard let children = childValue as? [AXUIElement] else {
@@ -4882,7 +5811,9 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
                         candidateIndex: candidateIndex, candidateCount: candidateCount,
                         editableEditorCount: editableCount, scanStartedAt: scanStartedAt
                     )
-                    return (editableCount, false)
+                    activeContinuityScanSummaryFields?["candidateCount"] = String(candidateCount)
+                    activeContinuityScanSummaryFields?["visitedNodes"] = String(visited.count)
+                    return (editableCount, false, visited.count)
                 }
                 pending.append(contentsOf: children)
             case .noValue: break
@@ -4894,10 +5825,14 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
                     candidateIndex: candidateIndex, candidateCount: candidateCount,
                     editableEditorCount: editableCount, scanStartedAt: scanStartedAt
                 )
-                return (editableCount, false)
+                activeContinuityScanSummaryFields?["candidateCount"] = String(candidateCount)
+                activeContinuityScanSummaryFields?["visitedNodes"] = String(visited.count)
+                return (editableCount, false, visited.count)
             }
         }
-        return (editableCount, true)
+        activeContinuityScanSummaryFields?["candidateCount"] = String(candidateCount)
+        activeContinuityScanSummaryFields?["visitedNodes"] = String(visited.count)
+        return (editableCount, true, visited.count)
     }
 
     private func requiredAXString(
@@ -4912,7 +5847,7 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
         candidateCount: Int? = nil,
         editableEditorCount: Int? = nil
     ) -> String? {
-        guard Date() < deadline else {
+        guard continuityAXReader.now() < deadline else {
             recordEditorContinuityScanDiagnostic(
                 stage: stage, reason: "deadline_exceeded", attribute: name,
                 depth: depth, visitedNodes: visitedNodes, candidateIndex: candidateIndex,
@@ -4922,8 +5857,9 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
             return nil
         }
         var value: CFTypeRef?
-        AXUIElementSetMessagingTimeout(element, 0.03)
-        let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        continuityAXReader.setMessagingTimeout(element, 0.03)
+        let (status, copiedValue) = continuityAXReader.copyAttributeValue(element, name)
+        value = copiedValue
         guard status == .success else {
             recordEditorContinuityScanDiagnostic(
                 stage: stage, reason: "read_failed", attribute: name, status: status,
@@ -4957,7 +5893,7 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
         candidateCount: Int? = nil,
         editableEditorCount: Int? = nil
     ) -> String?? {
-        guard Date() < deadline else {
+        guard continuityAXReader.now() < deadline else {
             recordEditorContinuityScanDiagnostic(
                 stage: stage, reason: "deadline_exceeded", attribute: name,
                 depth: depth, visitedNodes: visitedNodes, candidateIndex: candidateIndex,
@@ -4967,8 +5903,9 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
             return nil
         }
         var value: CFTypeRef?
-        AXUIElementSetMessagingTimeout(element, 0.03)
-        let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        continuityAXReader.setMessagingTimeout(element, 0.03)
+        let (status, copiedValue) = continuityAXReader.copyAttributeValue(element, name)
+        value = copiedValue
         switch status {
         case .success:
             guard let value else { return .some(nil) }
@@ -5002,7 +5939,7 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
         deadline: Date,
         scanStartedAt: UInt64
     ) -> AXUIElement? {
-        guard Date() < deadline else {
+        guard continuityAXReader.now() < deadline else {
             recordEditorContinuityScanDiagnostic(
                 stage: stage, reason: "deadline_exceeded", attribute: name,
                 depth: depth, scanStartedAt: scanStartedAt
@@ -5010,8 +5947,9 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
             return nil
         }
         var value: CFTypeRef?
-        AXUIElementSetMessagingTimeout(element, 0.03)
-        let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        continuityAXReader.setMessagingTimeout(element, 0.03)
+        let (status, copiedValue) = continuityAXReader.copyAttributeValue(element, name)
+        value = copiedValue
         guard status == .success else {
             recordEditorContinuityScanDiagnostic(
                 stage: stage, reason: "read_failed", attribute: name, status: status,
@@ -5042,7 +5980,7 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
         candidateCount: Int,
         editableEditorCount: Int
     ) -> Bool? {
-        guard Date() < deadline else {
+        guard continuityAXReader.now() < deadline else {
             recordEditorContinuityScanDiagnostic(
                 stage: stage, reason: "deadline_exceeded", attribute: name,
                 depth: depth, visitedNodes: visitedNodes, candidateIndex: candidateIndex,
@@ -5052,8 +5990,9 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
             return nil
         }
         var value: CFTypeRef?
-        AXUIElementSetMessagingTimeout(element, 0.03)
-        let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        continuityAXReader.setMessagingTimeout(element, 0.03)
+        let (status, copiedValue) = continuityAXReader.copyAttributeValue(element, name)
+        value = copiedValue
         if status == .noValue { return false }
         guard status == .success else {
             recordEditorContinuityScanDiagnostic(

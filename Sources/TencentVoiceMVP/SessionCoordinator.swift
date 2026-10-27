@@ -244,6 +244,10 @@ final class SessionCoordinator: SessionCoordinating {
         stateObserver = observer
     }
 
+    func refreshDiagnosticCollectionSettings() {
+        (textTarget as? AXTextTarget)?.refreshDiagnosticCollectionSettings()
+    }
+
     func end() async throws {
         guard state != .idle else { return }
         if case .error = state {

@@ -1,4 +1,5 @@
 import ApplicationServices
+import Foundation
 import XCTest
 @testable import TencentVoiceMVP
 
@@ -2424,7 +2425,8 @@ final class AXTextTargetReplayTests: XCTestCase {
             XCTAssertEqual(access.selection.location, draft.utf16.count + 2)
             XCTAssertEqual(sender.appendPosts, 1)
             XCTAssertEqual(sender.replacementPosts, 0)
-            XCTAssertTrue(target.drainDiagnostics().contains {
+            let diagnostics = target.drainDiagnostics()
+            XCTAssertTrue(diagnostics.contains {
                 $0.event == "keyboard_target_reacquire_rejected"
                     && $0.fields["phase"] == "invalid_element_read"
                     && $0.fields["reason"] == "stable_unique_editor_continuity_unverified"
@@ -2448,6 +2450,13 @@ final class AXTextTargetReplayTests: XCTestCase {
             XCTFail("Application changes must stop recovery")
         } catch { XCTAssertEqual(error as? TextTargetError, .targetChanged) }
         XCTAssertEqual(sender.totalPosts, 1)
+        let diagnostics = target.drainDiagnostics()
+        XCTAssertTrue(diagnostics.contains {
+            $0.event == "input_application_changed"
+                && $0.fields["identityFailure"] == "application_changed"
+                && $0.fields["applicationComparison"] == "different"
+                && $0.fields["processComparison"] == "different"
+        })
     }
 
     func testSystemAXReadFailureRecordsStatusAndDrainsWithoutContent() throws {
@@ -2459,6 +2468,475 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertNotEqual(diagnostic.fields["axStatus"], "0")
         XCTAssertEqual(diagnostic.fields.count, 2)
         XCTAssertTrue(access.drainReadDiagnostics().isEmpty)
+    }
+
+    func testSystemContinuityScannerUsesInjectableAXReadsAndReportsActualAttributeFailure() throws {
+        struct Node {
+            let handle: AXUIElement
+            var attributes: [String: CFTypeRef]
+        }
+        final class Clock {
+            var date = Date(timeIntervalSince1970: 1_000)
+            var monotonic: UInt64 = 1_000_000
+        }
+        let editor = AXUIElementCreateApplication(70_101)
+        let anchor = AXUIElementCreateApplication(70_102)
+        let webArea = AXUIElementCreateApplication(70_103)
+        let window = AXUIElementCreateApplication(70_104)
+        let nodes = [
+            Node(handle: editor, attributes: [
+                "AXRole": "AXTextArea" as CFString,
+                "AXIdentifier": "PRIVATE_IDENTIFIER_SENTINEL" as CFString,
+                "AXParent": anchor,
+                "AXWindow": window,
+                "AXReadOnly": kCFBooleanFalse,
+                "AXValue": "PRIVATE_PAGE_TEXT_SENTINEL" as CFString
+            ]),
+            Node(handle: anchor, attributes: [
+                "AXRole": "AXGroup" as CFString,
+                "AXChildren": [editor] as CFArray,
+                "AXParent": webArea
+            ]),
+            Node(handle: webArea, attributes: [
+                "AXRole": "AXWebArea" as CFString,
+                "AXParent": window,
+                "AXURL": "PRIVATE_PAGE_URL_SENTINEL" as CFString
+            ]),
+            Node(handle: window, attributes: [
+                "AXRole": "AXWindow" as CFString,
+                "AXTitle": "PRIVATE_WINDOW_TITLE_SENTINEL" as CFString
+            ])
+        ]
+        var failure: (node: AXUIElement, attribute: String, status: AXError)?
+        var deadlineOnParentRead = false
+        var readAttributes: [String] = []
+        let clock = Clock()
+        let reader = SystemAXTextTargetAccess.ContinuityAXReader(
+            copyAttributeValue: { element, attribute in
+                readAttributes.append(attribute)
+                if let failure, CFEqual(failure.node, element), failure.attribute == attribute {
+                    return (failure.status, nil)
+                }
+                guard let node = nodes.first(where: { CFEqual($0.handle, element) }),
+                      let value = node.attributes[attribute] else {
+                    return (attribute == "AXChildren" ? .noValue : .attributeUnsupported, nil)
+                }
+                if attribute == "AXParent", deadlineOnParentRead {
+                    deadlineOnParentRead = false
+                    clock.date.addTimeInterval(1)
+                }
+                return (.success, value)
+            },
+            setMessagingTimeout: { _, _ in },
+            processIdentifier: { element in
+                nodes.first(where: { CFEqual($0.handle, element) }) == nil ? nil : 70_101
+            },
+            now: { clock.date },
+            monotonicNanoseconds: {
+                defer { clock.monotonic += 1_000_000 }
+                return clock.monotonic
+            }
+        )
+        let access = SystemAXTextTargetAccess(continuityAXReader: reader)
+
+        let evidence = try XCTUnwrap(access.editorContinuityEvidence(for: editor))
+        XCTAssertTrue(evidence.scanComplete)
+        XCTAssertEqual(evidence.editableEditorCount, 1)
+        XCTAssertEqual(evidence.identifiersFromEditorToAnchor.first ?? nil, "PRIVATE_IDENTIFIER_SENTINEL")
+
+        failure = (anchor, "AXParent", .cannotComplete)
+        for _ in 0..<10 {
+            XCTAssertNil(access.editorContinuityEvidence(for: editor))
+        }
+        let drainedDiagnostics = access.drainReadDiagnostics()
+        let diagnostic = try XCTUnwrap(drainedDiagnostics.first {
+            $0.event == AXTextEditorContinuityScanDiagnostic.event
+                && $0.fields["axAttribute"] == "AXParent"
+        })
+        XCTAssertEqual(diagnostic.fields["reason"], "read_failed")
+        XCTAssertEqual(diagnostic.fields["axStatus"], String(AXError.cannotComplete.rawValue))
+        XCTAssertEqual(diagnostic.fields["scanStage"], "ancestor_parent")
+        XCTAssertFalse(diagnostic.fields.values.contains { $0.contains("AXTextArea") })
+        XCTAssertFalse(drainedDiagnostics.flatMap { $0.fields.values }.contains {
+            $0.contains("PRIVATE_IDENTIFIER_SENTINEL")
+        })
+        XCTAssertFalse(readAttributes.contains(where: { ["AXValue", "AXURL", "AXTitle"].contains($0) }),
+                       "identity diagnostics must not read page text, URL, or window title")
+        let sessionID = UUID()
+        let exportedEvents = drainedDiagnostics.map { diagnostic in
+            SessionLogEntry(
+                timestamp: diagnostic.timestamp,
+                monotonicTimestampNanoseconds: diagnostic.monotonicTimestampNanoseconds,
+                sessionID: sessionID,
+                eventID: diagnostic.eventID,
+                event: diagnostic.event,
+                metadata: diagnostic.fields
+            )
+        }
+        let reportData = try DiagnosticJSON.encoder().encode(exportedEvents)
+        let reportJSON = String(decoding: reportData, as: UTF8.self)
+        for sentinel in [
+            "PRIVATE_IDENTIFIER_SENTINEL", "PRIVATE_PAGE_TEXT_SENTINEL",
+            "PRIVATE_PAGE_URL_SENTINEL", "PRIVATE_WINDOW_TITLE_SENTINEL"
+        ] {
+            XCTAssertFalse(reportJSON.contains(sentinel), "JSON exported private AX value \(sentinel)")
+        }
+        let archiveRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ContinuityDiagnosticExport-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: archiveRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: archiveRoot) }
+        let archiveURL = archiveRoot.appendingPathComponent("report.zip")
+        let frameTimestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let frameAsset = DiagnosticWindowFrameAsset(
+            relativePath: "frames/000001.jpg",
+            timestamp: frameTimestamp,
+            monotonicNanoseconds: 1,
+            jpegData: Data([0xff, 0xd8, 0xff, 0xd9])
+        )
+        let frameReference = DiagnosticWindowFrameReference(
+            relativePath: frameAsset.relativePath,
+            timestamp: frameTimestamp,
+            monotonicNanoseconds: 1,
+            byteCount: frameAsset.jpegData.count
+        )
+        let frameEvidence = DiagnosticWindowFrameEvidence(
+            enabled: true,
+            status: "captured",
+            permissionGranted: true,
+            sessionID: sessionID,
+            targetPID: 70_101,
+            targetBundleIdentifier: "com.apple.Safari",
+            targetWindowID: 1,
+            startedAt: frameTimestamp,
+            stoppedAt: frameTimestamp,
+            maximumFramesPerSecond: 5,
+            ringDurationSeconds: 60,
+            memoryLimitBytes: 80 * 1_024 * 1_024,
+            ringMemoryLimitBytes: 80 * 1_024 * 1_024,
+            retainedFrameCount: 1,
+            droppedFrameCount: 0,
+            retainedBytes: frameAsset.jpegData.count,
+            frames: [frameReference],
+            archiveStatus: "included"
+        )
+        try DiagnosticWindowFrameArchiveWriter.write(
+            reportData: reportData,
+            snapshot: DiagnosticWindowFrameSnapshot(evidence: frameEvidence, assets: [frameAsset]),
+            destination: archiveURL
+        )
+        let listingProcess = Process()
+        listingProcess.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        listingProcess.arguments = ["-Z1", archiveURL.path]
+        let listingPipe = Pipe()
+        listingProcess.standardOutput = listingPipe
+        try listingProcess.run()
+        listingProcess.waitUntilExit()
+        XCTAssertEqual(listingProcess.terminationStatus, 0)
+        let members = String(decoding: listingPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        let reportMember = try XCTUnwrap(members.split(whereSeparator: \.isNewline).map(String.init)
+            .first { $0.hasSuffix("/report.json") })
+        let extractProcess = Process()
+        extractProcess.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        extractProcess.arguments = ["-p", archiveURL.path, reportMember]
+        let extractPipe = Pipe()
+        extractProcess.standardOutput = extractPipe
+        try extractProcess.run()
+        extractProcess.waitUntilExit()
+        XCTAssertEqual(extractProcess.terminationStatus, 0)
+        let archivedJSON = String(decoding: extractPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        for sentinel in [
+            "PRIVATE_IDENTIFIER_SENTINEL", "PRIVATE_PAGE_TEXT_SENTINEL",
+            "PRIVATE_PAGE_URL_SENTINEL", "PRIVATE_WINDOW_TITLE_SENTINEL"
+        ] {
+            XCTAssertFalse(archivedJSON.contains(sentinel), "ZIP exported private AX value \(sentinel)")
+        }
+        let archivedEvents = try DiagnosticJSON.decoder().decode([SessionLogEntry].self, from: Data(archivedJSON.utf8))
+        XCTAssertTrue(archivedEvents.contains {
+            $0.event == AXTextEditorContinuityScanDiagnostic.event
+                && $0.metadata["axAttribute"] == "AXParent"
+                && $0.metadata["axStatus"] == String(AXError.cannotComplete.rawValue)
+        })
+        let queueSummary = try XCTUnwrap(drainedDiagnostics.first { $0.event == "ax_read_diagnostic_queue_summary" })
+        XCTAssertEqual(queueSummary.fields["capacity"], "16")
+        XCTAssertEqual(queueSummary.fields["evictedCount"], "5")
+        XCTAssertNotEqual(queueSummary.fields["firstEvictionAt"], "none")
+        XCTAssertNotEqual(queueSummary.fields["lastEvictionAt"], "none")
+        XCTAssertNotEqual(queueSummary.fields["firstEvictionMonotonicNanoseconds"], "none")
+        XCTAssertNotEqual(queueSummary.fields["lastEvictionMonotonicNanoseconds"], "none")
+        XCTAssertEqual(queueSummary.timestamp, Date(timeIntervalSince1970: 1_000))
+        XCTAssertTrue(access.drainReadDiagnostics().isEmpty, "draining reports and resets the bounded counters")
+
+        failure = nil
+        deadlineOnParentRead = true
+        XCTAssertNil(access.editorContinuityEvidence(for: editor))
+        let deadlineDiagnostics = access.drainReadDiagnostics()
+        XCTAssertTrue(deadlineDiagnostics.contains {
+            $0.event == AXTextEditorContinuityScanDiagnostic.event
+                && $0.fields["reason"] == "deadline_exceeded"
+                && $0.fields["scanStage"] == "ancestor_role"
+        })
+        access.setContinuityDiagnosticsEnabled(false)
+        XCTAssertNil(access.lastContinuityScanObservationID())
+        XCTAssertNil(access.lastContinuityScanSummary())
+        XCTAssertTrue(access.drainReadDiagnostics().isEmpty)
+    }
+
+    func testSystemContinuityScannerDistinguishesInjectedAXAttributeFailuresAndMissingValues() throws {
+        struct Node {
+            let handle: AXUIElement
+            var attributes: [String: CFTypeRef]
+        }
+        let editor = AXUIElementCreateApplication(70_201)
+        let anchor = AXUIElementCreateApplication(70_202)
+        let webArea = AXUIElementCreateApplication(70_203)
+        let window = AXUIElementCreateApplication(70_204)
+        let nodes = [
+            Node(handle: editor, attributes: [
+                "AXRole": "AXTextArea" as CFString,
+                "AXIdentifier": "PRIVATE_IDENTIFIER_SENTINEL" as CFString,
+                "AXParent": anchor,
+                "AXWindow": window,
+                "AXReadOnly": kCFBooleanFalse
+            ]),
+            Node(handle: anchor, attributes: [
+                "AXRole": "AXGroup" as CFString,
+                "AXChildren": [editor] as CFArray,
+                "AXParent": webArea
+            ]),
+            Node(handle: webArea, attributes: [
+                "AXRole": "AXWebArea" as CFString,
+                "AXParent": window
+            ]),
+            Node(handle: window, attributes: ["AXRole": "AXWindow" as CFString])
+        ]
+        typealias ReadOverride = (node: AXUIElement, attribute: String, status: AXError, value: CFTypeRef?)
+        var override: ReadOverride?
+        var timeoutValues: [Float] = []
+        let reader = SystemAXTextTargetAccess.ContinuityAXReader(
+            copyAttributeValue: { element, attribute in
+                if let override, CFEqual(override.node, element), override.attribute == attribute {
+                    return (override.status, override.value)
+                }
+                guard let node = nodes.first(where: { CFEqual($0.handle, element) }),
+                      let value = node.attributes[attribute] else {
+                    return (attribute == "AXChildren" ? .noValue : .attributeUnsupported, nil)
+                }
+                return (.success, value)
+            },
+            setMessagingTimeout: { _, timeout in timeoutValues.append(timeout) },
+            processIdentifier: { element in
+                nodes.first(where: { CFEqual($0.handle, element) }) == nil ? nil : 70_201
+            },
+            now: Date.init,
+            monotonicNanoseconds: { DispatchTime.now().uptimeNanoseconds }
+        )
+        let access = SystemAXTextTargetAccess(continuityAXReader: reader)
+        let capturedEvidence = try XCTUnwrap(access.editorContinuityEvidence(for: editor))
+        _ = access.drainReadDiagnostics()
+        struct FailureCase {
+            let node: AXUIElement
+            let attribute: String
+            let status: AXError
+            let value: CFTypeRef?
+            let stage: String
+            let reason: String
+            let evidenceExpected: Bool
+        }
+        let cases: [FailureCase] = [
+            .init(node: editor, attribute: "AXRole", status: .cannotComplete, value: nil,
+                  stage: "ancestor_role", reason: "read_failed", evidenceExpected: false),
+            .init(node: editor, attribute: "AXIdentifier", status: .cannotComplete, value: nil,
+                  stage: "ancestor_identifier", reason: "read_failed", evidenceExpected: false),
+            .init(node: anchor, attribute: "AXParent", status: .cannotComplete, value: nil,
+                  stage: "ancestor_parent", reason: "read_failed", evidenceExpected: false),
+            .init(node: editor, attribute: "AXWindow", status: .cannotComplete, value: nil,
+                  stage: "target_window", reason: "read_failed", evidenceExpected: false),
+            .init(node: anchor, attribute: "AXChildren", status: .cannotComplete, value: nil,
+                  stage: "candidate_children", reason: "read_failed", evidenceExpected: false),
+            .init(node: editor, attribute: "AXSubrole", status: .cannotComplete, value: nil,
+                  stage: "candidate_subrole", reason: "read_failed", evidenceExpected: false),
+            .init(node: editor, attribute: "AXReadOnly", status: .cannotComplete, value: nil,
+                  stage: "candidate_read_only", reason: "read_failed", evidenceExpected: false),
+            .init(node: editor, attribute: "AXRole", status: .success, value: NSNumber(value: 7),
+                  stage: "ancestor_role", reason: "unexpected_value_type", evidenceExpected: false),
+            .init(node: anchor, attribute: "AXChildren", status: .success, value: "wrong children type" as CFString,
+                  stage: "candidate_children", reason: "unexpected_value_type", evidenceExpected: false),
+            .init(node: editor, attribute: "AXReadOnly", status: .success, value: "wrong boolean type" as CFString,
+                  stage: "candidate_read_only", reason: "unexpected_value_type", evidenceExpected: false)
+        ]
+
+        for failure in cases {
+            override = (failure.node, failure.attribute, failure.status, failure.value)
+            let evidence = access.editorContinuityEvidence(for: editor)
+            XCTAssertEqual(evidence != nil, failure.evidenceExpected, "\(failure.attribute) / \(failure.reason)")
+            let diagnostics = access.drainReadDiagnostics()
+            let detail = try XCTUnwrap(diagnostics.first {
+                $0.event == AXTextEditorContinuityScanDiagnostic.event
+                    && $0.fields["axAttribute"] == failure.attribute
+            }, "missing diagnostic for \(failure.attribute) / \(failure.reason)")
+            XCTAssertEqual(detail.fields["scanStage"], failure.stage)
+            XCTAssertEqual(detail.fields["reason"], failure.reason)
+            XCTAssertEqual(detail.fields["axStatus"], String(failure.status.rawValue))
+        }
+
+        override = (editor, "AXIdentifier", .noValue, nil)
+        let evidenceWithMissingIdentifier = try XCTUnwrap(access.editorContinuityEvidence(for: editor))
+        XCTAssertNil(evidenceWithMissingIdentifier.identifiersFromEditorToAnchor.first ?? nil)
+        let missingIdentifierSummary = try XCTUnwrap(access.drainReadDiagnostics().first {
+            $0.event == "editor_continuity_scan_summary"
+        })
+        XCTAssertEqual(missingIdentifierSummary.fields["identifierPresence"], "missing")
+
+        let anchoredEvidence = try XCTUnwrap(access.editorContinuityEvidence(
+            for: editor,
+            anchoredAt: capturedEvidence
+        ))
+        XCTAssertTrue(anchoredEvidence.scanComplete)
+        XCTAssertEqual(anchoredEvidence.editableEditorCount, 1)
+        let anchoredComparison = AXTextEditorContinuity.compare(capturedEvidence, anchoredEvidence)
+        XCTAssertTrue(anchoredComparison.canConfirmFromCapturedAnchor)
+        XCTAssertFalse(anchoredComparison.hasIdentifierConflict)
+        XCTAssertNil(anchoredEvidence.identifiersFromEditorToAnchor.first ?? nil)
+
+        override = nil
+        _ = access.editorContinuityEvidence(for: editor)
+        XCTAssertFalse(timeoutValues.isEmpty)
+        XCTAssertTrue(timeoutValues.allSatisfy { $0 == 0.03 }, "scanner AX call timeout must remain 30 ms")
+    }
+
+    func testRebuildAncestorAndCapturedAnchorScansShareTheExistingDeadline() throws {
+        struct Node {
+            let handle: AXUIElement
+            var attributes: [String: CFTypeRef]
+        }
+        let editor = AXUIElementCreateApplication(70_211)
+        let anchor = AXUIElementCreateApplication(70_212)
+        let webArea = AXUIElementCreateApplication(70_213)
+        let window = AXUIElementCreateApplication(70_214)
+        let nodes = [
+            Node(handle: editor, attributes: [
+                "AXRole": "AXTextArea" as CFString,
+                "AXIdentifier": "stable-editor" as CFString,
+                "AXParent": anchor,
+                "AXWindow": window,
+                "AXReadOnly": kCFBooleanFalse
+            ]),
+            Node(handle: anchor, attributes: [
+                "AXRole": "AXGroup" as CFString,
+                "AXChildren": [editor] as CFArray,
+                "AXParent": webArea
+            ]),
+            Node(handle: webArea, attributes: [
+                "AXRole": "AXWebArea" as CFString,
+                "AXParent": window
+            ]),
+            Node(handle: window, attributes: ["AXRole": "AXWindow" as CFString])
+        ]
+        var monotonicNanoseconds: UInt64 = 0
+        var slowReads = false
+        var attributeReadCount = 0
+        let reader = SystemAXTextTargetAccess.ContinuityAXReader(
+            copyAttributeValue: { element, attribute in
+                attributeReadCount += 1
+                if slowReads { monotonicNanoseconds += 100_000_000 }
+                guard let node = nodes.first(where: { CFEqual($0.handle, element) }),
+                      let value = node.attributes[attribute] else {
+                    return (attribute == "AXChildren" ? .noValue : .attributeUnsupported, nil)
+                }
+                return (.success, value)
+            },
+            setMessagingTimeout: { _, _ in },
+            processIdentifier: { element in
+                nodes.first(where: { CFEqual($0.handle, element) }) == nil ? nil : 70_211
+            },
+            now: { Date(timeIntervalSince1970: Double(monotonicNanoseconds) / 1_000_000_000) },
+            monotonicNanoseconds: { monotonicNanoseconds }
+        )
+        let access = SystemAXTextTargetAccess(continuityAXReader: reader)
+        let captured = try XCTUnwrap(access.editorContinuityEvidence(for: editor))
+        access.setContinuityScanBudgetNanoseconds(250_000_000)
+        slowReads = true
+
+        XCTAssertNil(access.editorContinuityEvidence(for: editor))
+        let readsAfterAncestorScan = attributeReadCount
+        XCTAssertGreaterThan(readsAfterAncestorScan, 0)
+        XCTAssertNil(access.editorContinuityEvidence(for: editor, anchoredAt: captured))
+        XCTAssertEqual(
+            attributeReadCount,
+            readsAfterAncestorScan,
+            "the captured-anchor scan must not start a fresh 250 ms window"
+        )
+        XCTAssertTrue(access.drainReadDiagnostics().contains {
+            $0.event == "editor_continuity_scan_summary"
+                && $0.fields["scanPath"] == "captured_anchor_subtree"
+                && $0.fields["scanComplete"] == "false"
+        })
+        access.setContinuityScanBudgetNanoseconds(nil)
+    }
+
+    func testInitialContinuityCaptureOutcomesAreDistinct() {
+        XCTAssertEqual(AXTextEditorContinuity.captureOutcome(
+            continuityApplicable: false,
+            continuityTargetApplication: true,
+            focusedElementAvailable: false,
+            evidenceSaved: false,
+            scanSummary: nil
+        ), "focused_element_missing")
+        XCTAssertEqual(AXTextEditorContinuity.captureOutcome(
+            continuityApplicable: false,
+            continuityTargetApplication: false,
+            focusedElementAvailable: true,
+            evidenceSaved: false,
+            scanSummary: nil
+        ), "not_applicable")
+        XCTAssertEqual(AXTextEditorContinuity.captureOutcome(
+            continuityApplicable: true,
+            continuityTargetApplication: true,
+            focusedElementAvailable: true,
+            evidenceSaved: true,
+            scanSummary: nil
+        ), "saved")
+        XCTAssertEqual(AXTextEditorContinuity.captureOutcome(
+            continuityApplicable: true,
+            continuityTargetApplication: true,
+            focusedElementAvailable: true,
+            evidenceSaved: false,
+            scanSummary: ["stopReason": "no_unique_editable_editor"]
+        ), "candidate_not_unique")
+        XCTAssertEqual(AXTextEditorContinuity.captureOutcome(
+            continuityApplicable: true,
+            continuityTargetApplication: true,
+            focusedElementAvailable: true,
+            evidenceSaved: false,
+            scanSummary: ["stopReason": "deadline_exceeded"]
+        ), "scan_incomplete")
+        XCTAssertEqual(AXTextEditorContinuity.captureOutcome(
+            continuityApplicable: true,
+            continuityTargetApplication: true,
+            focusedElementAvailable: true,
+            evidenceSaved: false,
+            scanSummary: ["failureAttribute": "AXParent", "stopReason": "read_failed"]
+        ), "scan_failed")
+        XCTAssertEqual(AXTextEditorContinuity.captureOutcome(
+            continuityApplicable: true,
+            continuityTargetApplication: true,
+            focusedElementAvailable: true,
+            evidenceSaved: false,
+            scanSummary: nil
+        ), "scan_unavailable")
+    }
+
+    func testContinuityDiagnosticSummaryIsBoundedByEncodedJSONSize() throws {
+        let fields = Dictionary(uniqueKeysWithValues: (0..<200).map { index in
+            ("field\(index)", String(repeating: "界", count: 100))
+        })
+
+        let bounded = boundedContinuityDiagnosticFields(fields)
+        let encoded = try JSONSerialization.data(withJSONObject: bounded, options: [.sortedKeys])
+
+        XCTAssertLessThanOrEqual(encoded.count, 8_192)
+        XCTAssertEqual(bounded["diagnosticSummaryTruncated"], "true")
+        XCTAssertLessThan(bounded.count, fields.count)
     }
 
     func testSafariContinuityScanDiagnosticKeepsAXReadFailureDetailsWithoutText() {
@@ -2745,6 +3223,8 @@ final class AXTextTargetReplayTests: XCTestCase {
         access.proseMirror = true
         access.coordinateIncludesStructuralSeparators = true
         access.simulateSafariEditorLayoutRebuild = true
+        access.anchoredContinuityAvailable = true
+        access.replayEditorIdentifier = nil
         let sender = ReplayKeyboardEventSender(access: access)
         sender.appendOverride = { text in
             access.applyAppend(text)
@@ -2769,6 +3249,11 @@ final class AXTextTargetReplayTests: XCTestCase {
         })
         XCTAssertLessThan(reacquired, observed, "the old-handle read must be discarded before acknowledgement")
         XCTAssertEqual(diagnostics.filter { $0.event == "keyboard_write_acknowledged" }.count, 1)
+        XCTAssertTrue(diagnostics.contains {
+            $0.event == "keyboard_target_reacquired"
+                && $0.fields["identityOutcome"] == "confirmed_by_captured_anchor_without_identifier"
+                && $0.fields["fallbackRoute"] == "attempted_captured_anchor_subtree"
+        })
     }
 
     func testSafariComposerLayoutRebuildRecoversFromAncestorReadFailureWithoutResending() async throws {
@@ -2890,7 +3375,7 @@ final class AXTextTargetReplayTests: XCTestCase {
         injector.apply(projection: projection("你好", revision: 1))
         try await injector.finish(finalText: "你好")
         access.focusedElementRebuildsBeforeNextWrite = 1
-        access.safariContinuityUnavailableReadsBeforeRecovery = 1_000
+        access.replayEditorIdentifier = nil
         injector.apply(projection: projection("你好继续", revision: 2))
         try await injector.finish(finalText: "你好继续")
 
@@ -2903,7 +3388,54 @@ final class AXTextTargetReplayTests: XCTestCase {
             $0.event == "keyboard_target_reacquire_retryable"
                 && $0.fields["retryWindow"] == "existing_operation_deadline"
                 && $0.fields["reason"] == "continuity_evidence_unavailable"
+                && $0.fields["fallbackRoute"] == "attempted_captured_anchor_subtree"
+                && $0.fields["identityOutcome"] == "identifier_missing_requires_captured_anchor_scan"
         }, "\(diagnostics.map { ($0.event, $0.fields) })")
+        XCTAssertEqual(
+            diagnostics.first { $0.event == "safe_copy_updated" }?.textEvidence.first?.text,
+            "你好继续"
+        )
+    }
+
+    func testInitialContinuityEvidenceFailureIsDistinctFromReplacementMismatch() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "\n",
+            selection: .init(location: 0, length: 0),
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.proseMirror = true
+        access.coordinateIncludesStructuralSeparators = true
+        access.simulateSafariEditorLayoutRebuild = true
+        access.safariContinuityUnavailableReadsBeforeRecovery = 1
+        let sender = ReplayKeyboardEventSender(access: access)
+        let injector = TextInjector(target: AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        ))
+
+        try injector.begin()
+        injector.apply(projection: projection("首段", revision: 1))
+        try await injector.finish(finalText: "首段")
+        access.focusedElementRebuildsBeforeNextWrite = 1
+        injector.apply(projection: projection("首段后续", revision: 2))
+        try await injector.finish(finalText: "首段后续")
+
+        let diagnostics = injector.drainDiagnostics()
+        XCTAssertEqual(sender.totalPosts, 1)
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
+        XCTAssertTrue(diagnostics.contains {
+            $0.event == "keyboard_editor_continuity_captured"
+                && $0.fields["continuityApplicable"] == "true"
+                && $0.fields["continuityEvidenceSaved"] == "false"
+                && $0.fields["captureOutcome"] != nil
+        })
+        XCTAssertTrue(diagnostics.contains {
+            $0.event == "keyboard_target_reacquire_rejected"
+                && $0.fields["continuityFailure"] == "captured_evidence_missing"
+                && $0.fields["fallbackRoute"] == "not_attempted_no_captured_anchor"
+        })
     }
 
     func testSafariComposerWithMultipleIdenticalEditorsDoesNotReacquireByMatchingText() async throws {
@@ -2916,6 +3448,8 @@ final class AXTextTargetReplayTests: XCTestCase {
         access.proseMirror = true
         access.coordinateIncludesStructuralSeparators = true
         access.simulateSafariEditorLayoutRebuild = true
+        access.replayEditorIdentifier = nil
+        access.anchoredContinuityAvailable = true
         access.safariEditableEditorCount = 2
         let sender = ReplayKeyboardEventSender(access: access)
         let injector = TextInjector(target: AXTextTarget(access: access, keyboardEventSender: sender))
@@ -2929,6 +3463,7 @@ final class AXTextTargetReplayTests: XCTestCase {
 
         XCTAssertEqual(sender.totalPosts, 1)
         XCTAssertEqual(injector.errorCount, 1)
+        XCTAssertEqual(access.anchoredContinuityScanCount, 0)
         let diagnostics = injector.drainDiagnostics()
         XCTAssertEqual(injector.degradationCode, "text_target_changed")
         XCTAssertTrue(diagnostics.contains {
@@ -2937,7 +3472,7 @@ final class AXTextTargetReplayTests: XCTestCase {
         })
     }
 
-    func testSafariReplacementWithoutStableEditorIdentifierIsRejected() async throws {
+    func testSafariReplacementWithoutStableEditorIdentifierRecoversFromUniqueCapturedAnchor() async throws {
         let access = ReplayAXTextTargetAccess(
             text: "\n",
             selection: .init(location: 0, length: 0),
@@ -2948,6 +3483,7 @@ final class AXTextTargetReplayTests: XCTestCase {
         access.coordinateIncludesStructuralSeparators = true
         access.simulateSafariEditorLayoutRebuild = true
         access.replayEditorIdentifier = nil
+        access.anchoredContinuityAvailable = true
         let sender = ReplayKeyboardEventSender(access: access)
         let injector = TextInjector(target: AXTextTarget(
             access: access,
@@ -2962,18 +3498,61 @@ final class AXTextTargetReplayTests: XCTestCase {
         injector.apply(projection: projection("相同后续", revision: 2))
         try await injector.finish(finalText: "相同后续")
 
-        XCTAssertEqual(access.rawText, "相同\n")
-        XCTAssertEqual(sender.totalPosts, 1, "a replacement with no stable editor identifier must not receive another write")
+        XCTAssertEqual(access.rawText, "相同后续\n")
+        XCTAssertEqual(sender.totalPosts, 2, "the recovered editor should receive only the new suffix")
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+        let diagnostics = injector.drainDiagnostics()
+        let reacquired = try XCTUnwrap(diagnostics.first {
+            $0.event == "keyboard_target_reacquired"
+                && $0.fields["continuityRoute"] == "captured_anchor_subtree"
+        })
+        XCTAssertEqual(reacquired.fields["identityOutcome"], "confirmed_by_captured_anchor_without_identifier")
+        XCTAssertEqual(reacquired.fields["leafIdentifierPresence"], "missing")
+        XCTAssertFalse(diagnostics.contains { $0.event == "keyboard_target_reacquire_rejected" })
+    }
+
+    func testSafariCapturedAnchorRecoveryRejectsChangedIdentifierWithoutScanningFallback() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "\n",
+            selection: .init(location: 0, length: 0),
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.proseMirror = true
+        access.coordinateIncludesStructuralSeparators = true
+        access.simulateSafariEditorLayoutRebuild = true
+        access.anchoredContinuityAvailable = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let injector = TextInjector(target: AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        ))
+
+        try injector.begin()
+        injector.apply(projection: projection("原文", revision: 1))
+        try await injector.finish(finalText: "原文")
+        access.replayEditorIdentifier = "different-editor-identifier"
+        access.focusedElementRebuildsBeforeNextWrite = 1
+        injector.apply(projection: projection("原文后续", revision: 2))
+        try await injector.finish(finalText: "原文后续")
+
+        XCTAssertEqual(access.rawText, "原文\n")
+        XCTAssertEqual(sender.totalPosts, 1)
         XCTAssertEqual(injector.errorCount, 1)
         XCTAssertEqual(injector.modeDescription, "safe_copy")
+        XCTAssertEqual(access.anchoredContinuityScanCount, 0)
         let diagnostics = injector.drainDiagnostics()
         XCTAssertTrue(diagnostics.contains {
             $0.event == "keyboard_target_reacquire_rejected"
-                && $0.fields["reason"] == "stable_unique_editor_continuity_unverified"
+                && $0.fields["identityOutcome"] == "identity_conflict"
+                && $0.fields["firstMismatch"] == "leaf_identifier"
+                && $0.fields["fallbackRoute"] == "not_attempted_ancestor_evidence_conflicts_or_structure_differs"
         })
         XCTAssertEqual(
             diagnostics.first { $0.event == "safe_copy_updated" }?.textEvidence.first?.text,
-            "相同后续"
+            "原文后续"
         )
     }
 
@@ -2986,6 +3565,8 @@ final class AXTextTargetReplayTests: XCTestCase {
         access.configureWebAncestorChain(depth: 4)
         access.coordinateIncludesStructuralSeparators = true
         access.simulateSafariEditorLayoutRebuild = true
+        access.replayEditorIdentifier = nil
+        access.anchoredContinuityAvailable = true
         access.safariEditableEditorCount = 2
         let sender = ReplayKeyboardEventSender(access: access)
         sender.beforeNextAppend = { access.focusedElementRebuildsBeforeNextWrite = 1 }
@@ -3001,6 +3582,7 @@ final class AXTextTargetReplayTests: XCTestCase {
 
         XCTAssertEqual(sender.totalPosts, 1)
         XCTAssertEqual(injector.errorCount, 1)
+        XCTAssertEqual(access.anchoredContinuityScanCount, 0)
         XCTAssertEqual(injector.degradationCode, "text_target_changed")
         XCTAssertEqual(injector.modeDescription, "safe_copy")
         let diagnostics = injector.drainDiagnostics()
@@ -3014,7 +3596,7 @@ final class AXTextTargetReplayTests: XCTestCase {
         )
     }
 
-    func testCodexReplacementWithoutStableEditorIdentifierIsRejected() async throws {
+    func testCodexReplacementWithoutStableEditorIdentifierRecoversFromUniqueCapturedAnchor() async throws {
         let access = ReplayAXTextTargetAccess(
             text: "甲",
             selection: .init(location: 1, length: 0),
@@ -3024,6 +3606,7 @@ final class AXTextTargetReplayTests: XCTestCase {
         access.coordinateIncludesStructuralSeparators = true
         access.simulateSafariEditorLayoutRebuild = true
         access.replayEditorIdentifier = nil
+        access.anchoredContinuityAvailable = true
         let sender = ReplayKeyboardEventSender(access: access)
         let injector = TextInjector(target: AXTextTarget(
             access: access,
@@ -3038,19 +3621,18 @@ final class AXTextTargetReplayTests: XCTestCase {
         injector.apply(projection: projection("乙丙", revision: 2))
         try await injector.finish(finalText: "乙丙")
 
-        XCTAssertEqual(access.rawText, "甲乙")
-        XCTAssertEqual(sender.totalPosts, 1, "a replacement with no stable editor identifier must not receive another write")
-        XCTAssertEqual(injector.errorCount, 1)
-        XCTAssertEqual(injector.modeDescription, "safe_copy")
+        XCTAssertEqual(access.rawText, "甲乙丙")
+        XCTAssertEqual(sender.totalPosts, 2, "the recovered editor should receive only the new suffix")
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
         let diagnostics = injector.drainDiagnostics()
-        XCTAssertTrue(diagnostics.contains {
-            $0.event == "keyboard_target_reacquire_rejected"
-                && $0.fields["reason"] == "stable_unique_editor_continuity_unverified"
+        let reacquired = try XCTUnwrap(diagnostics.first {
+            $0.event == "keyboard_target_reacquired"
+                && $0.fields["continuityRoute"] == "captured_anchor_subtree"
         })
-        XCTAssertEqual(
-            diagnostics.first { $0.event == "safe_copy_updated" }?.textEvidence.first?.text,
-            "乙丙"
-        )
+        XCTAssertEqual(reacquired.fields["identityOutcome"], "confirmed_by_captured_anchor_without_identifier")
+        XCTAssertEqual(reacquired.fields["leafIdentifierPresence"], "missing")
+        XCTAssertFalse(diagnostics.contains { $0.event == "keyboard_target_reacquire_rejected" })
     }
 
     func testCodexReplacementWithStableEditorIdentifierRecoversBeforeNextWrite() async throws {
@@ -5628,6 +6210,7 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var focusedElementRebuildsBeforeNextWrite = 0
     var simulateSafariEditorLayoutRebuild = false
     var anchoredContinuityAvailable = false
+    private(set) var anchoredContinuityScanCount = 0
     var safariContinuityUnavailableReadsBeforeRecovery = 0
     var safariEditableEditorCount = 1
     var replayEditorIdentifier: String? = "replay-composer-editor"
@@ -5752,6 +6335,7 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
         for element: AXUIElement,
         anchoredAt previous: AXTextEditorContinuityEvidence
     ) -> AXTextEditorContinuityEvidence? {
+        anchoredContinuityScanCount += 1
         guard anchoredContinuityAvailable,
               simulateSafariEditorLayoutRebuild else {
             return nil

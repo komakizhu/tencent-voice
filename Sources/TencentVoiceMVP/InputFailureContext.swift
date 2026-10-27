@@ -358,7 +358,7 @@ final class InputFailureContextRecorder {
     private var sampleTask: Task<Void, Never>?
     private var applicationObserver: NSObjectProtocol?
     private let probeQueue = DispatchQueue(label: "local.tencent.voice.mvp.failure-context", qos: .utility)
-    private let probe = InputContextAXProbe()
+    private let probe: any InputContextSampling
     private var previousSample: [String: String]?
     private var lastActivity: Date = .distantPast
     private var generation = 0
@@ -381,18 +381,39 @@ final class InputFailureContextRecorder {
         "keyboard_selection_stabilization_failed", "keyboard_selection_submitted",
         "ax_selected_text_range_set_requested", "ax_selected_text_range_set_returned",
         "ax_selected_text_range_set_threw", "keyboard_document_observed",
-        "keyboard_state_change_observed", "keyboard_write_submitted",
+        "keyboard_state_change_observed", "keyboard_document_observation_discarded", "keyboard_write_submitted",
         "keyboard_write_acknowledged", "keyboard_write_unconfirmed",
         "keyboard_focus_changed", "ax_focus_changed", "keyboard_target_reacquired",
         "keyboard_target_reacquire_retryable", "keyboard_target_reacquire_rejected",
         "safari_keyboard_target_reacquired", "safari_keyboard_target_reacquire_retryable",
         "safari_keyboard_target_reacquire_rejected", "safari_editor_continuity_scan_diagnostic",
+        "keyboard_editor_continuity_captured", "editor_continuity_scan_summary",
+        "ax_read_diagnostic_queue_summary",
         AXTextEditorContinuityScanDiagnostic.event,
         "text_dispatch_returned"
     ]
+    private static let diagnosticOnlyTimelineEvents: Set<String> = [
+        "keyboard_editor_continuity_captured", "editor_continuity_scan_summary",
+        "ax_read_diagnostic_queue_summary", "keyboard_document_observation_discarded",
+        AXTextEditorContinuityScanDiagnostic.event
+    ]
 
-    init(axNotificationObserver: (any InputFailureAXNotificationObserving)? = nil) {
+    static func shouldProbeTarget(
+        event: String,
+        isFailure: Bool,
+        isCapture: Bool,
+        elapsedSinceLastProbe: TimeInterval
+    ) -> Bool {
+        isFailure || isCapture
+            || (!diagnosticOnlyTimelineEvents.contains(event) && elapsedSinceLastProbe >= 1)
+    }
+
+    init(
+        axNotificationObserver: (any InputFailureAXNotificationObserving)? = nil,
+        probe: any InputContextSampling = InputContextAXProbe()
+    ) {
         self.axNotificationObserver = axNotificationObserver ?? SystemInputFailureAXNotificationObserver()
+        self.probe = probe
     }
 
     var latestFailure: InputFailureEvidence? {
@@ -494,7 +515,12 @@ final class InputFailureContextRecorder {
                 monotonicTimestampNanoseconds: diagnostic.monotonicTimestampNanoseconds
             )
         }
-        guard failure || capture || now.timeIntervalSince(lastOperationProbe) >= 1 else { return }
+        guard Self.shouldProbeTarget(
+            event: diagnostic.event,
+            isFailure: failure,
+            isCapture: capture,
+            elapsedSinceLastProbe: now.timeIntervalSince(lastOperationProbe)
+        ) else { return }
         lastOperationProbe = now
         guard let pid else { return }
         let reference = InputContextElementReference(element: element)
@@ -503,7 +529,13 @@ final class InputFailureContextRecorder {
         let queue = probeQueue
         Task { @MainActor [weak self] in
             let details = await withCheckedContinuation { continuation in
-                queue.async { continuation.resume(returning: probe.sample(pid: pid, target: reference.element, includeEditors: true)) }
+                    queue.async {
+                        continuation.resume(returning: probe.sample(
+                            pid: pid,
+                            target: reference.element,
+                            includeEditors: true
+                        ))
+                    }
             }
             guard let self, self.isEnabled, self.generation == token else { return }
             var fields = DiagnosticLogSanitizer.fields(diagnostic.fields)
@@ -783,7 +815,9 @@ final class InputFailureContextRecorder {
            let pid = app?.processIdentifier {
             let probe = self.probe
             let details = await withCheckedContinuation { continuation in
-                probeQueue.async { continuation.resume(returning: probe.sample(pid: pid, includeEditors: true)) }
+                probeQueue.async {
+                    continuation.resume(returning: probe.sample(pid: pid, target: nil, includeEditors: true))
+                }
             }
             guard isEnabled, generation == token else { return }
             // Do not attribute a slow AX result to an app that is no longer active.
