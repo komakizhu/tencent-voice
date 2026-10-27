@@ -2937,6 +2937,46 @@ final class AXTextTargetReplayTests: XCTestCase {
         })
     }
 
+    func testSafariReplacementWithoutStableEditorIdentifierIsRejected() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "\n",
+            selection: .init(location: 0, length: 0),
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.proseMirror = true
+        access.coordinateIncludesStructuralSeparators = true
+        access.simulateSafariEditorLayoutRebuild = true
+        access.safariEditorIdentifier = nil
+        let sender = ReplayKeyboardEventSender(access: access)
+        let injector = TextInjector(target: AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        ))
+
+        try injector.begin()
+        injector.apply(projection: projection("相同", revision: 1))
+        try await injector.finish(finalText: "相同")
+        access.focusedElementRebuildsBeforeNextWrite = 1
+        injector.apply(projection: projection("相同后续", revision: 2))
+        try await injector.finish(finalText: "相同后续")
+
+        XCTAssertEqual(access.rawText, "相同\n")
+        XCTAssertEqual(sender.totalPosts, 1, "a replacement with no stable editor identifier must not receive another write")
+        XCTAssertEqual(injector.errorCount, 1)
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
+        let diagnostics = injector.drainDiagnostics()
+        XCTAssertTrue(diagnostics.contains {
+            $0.event == "keyboard_target_reacquire_rejected"
+                && $0.fields["reason"] == "stable_unique_editor_continuity_unverified"
+        })
+        XCTAssertEqual(
+            diagnostics.first { $0.event == "safe_copy_updated" }?.textEvidence.first?.text,
+            "相同后续"
+        )
+    }
+
     func testCodexComposerWithMultipleIdenticalEditorsDoesNotReacquireByMatchingText() async throws {
         let access = ReplayAXTextTargetAccess(
             text: "\n",
@@ -5516,6 +5556,7 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var anchoredContinuityAvailable = false
     var safariContinuityUnavailableReadsBeforeRecovery = 0
     var safariEditableEditorCount = 1
+    var safariEditorIdentifier: String? = "replay-composer-editor"
     var focusedElementRebuildsAfterNextWrite = 0
     private var focusedElementRebuildCount = 0
     var failFocusedElementReadAtCount: Int?
@@ -5627,7 +5668,7 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
             editorAnchor: replayEditorAnchor,
             editorAnchorRole: "AXGroup",
             rolesFromEditorToAnchor: ["AXTextArea", "AXGroup"],
-            identifiersFromEditorToAnchor: [nil, nil],
+            identifiersFromEditorToAnchor: [safariEditorIdentifier, nil],
             editableEditorCount: safariEditableEditorCount,
             scanComplete: true
         )
@@ -5647,7 +5688,7 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
             editorAnchor: previous.editorAnchor,
             editorAnchorRole: previous.editorAnchorRole,
             rolesFromEditorToAnchor: ["AXTextArea", "AXGroup"],
-            identifiersFromEditorToAnchor: [nil, nil],
+            identifiersFromEditorToAnchor: [safariEditorIdentifier, nil],
             editableEditorCount: safariEditableEditorCount,
             scanComplete: true
         )

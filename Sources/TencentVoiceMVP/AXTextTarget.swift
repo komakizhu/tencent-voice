@@ -689,6 +689,11 @@ enum AXTextEditorContinuity {
         _ previous: AXTextEditorContinuityEvidence,
         _ current: AXTextEditorContinuityEvidence
     ) -> Bool {
+        guard let previousEditorIdentifier = previous.identifiersFromEditorToAnchor.first ?? nil,
+              let currentEditorIdentifier = current.identifiersFromEditorToAnchor.first ?? nil,
+              previousEditorIdentifier == currentEditorIdentifier else {
+            return false
+        }
         guard previous.scanComplete, current.scanComplete,
               previous.editableEditorCount == 1, current.editableEditorCount == 1,
               previous.editorAnchorRole == current.editorAnchorRole,
