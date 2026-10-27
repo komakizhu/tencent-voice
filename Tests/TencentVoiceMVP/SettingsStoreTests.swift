@@ -29,7 +29,7 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(settings.shortcut, .defaultCommand0)
         XCTAssertEqual(settings.engineModelType, "16k_zh")
         XCTAssertFalse(settings.saveTextLogs)
-        XCTAssertFalse(settings.safeCopyEnabled)
+        XCTAssertFalse(settings.alwaysSaveVoiceContent)
         XCTAssertFalse(settings.captureDiagnosticWindowFrames)
         XCTAssertTrue(settings.prepaidQuotaHoursByModel.isEmpty)
     }
@@ -82,12 +82,32 @@ final class SettingsStoreTests: XCTestCase {
             shortcut: Shortcut(keyCode: UInt32(kVK_F5), modifiers: UInt32(optionKey)),
             engineModelType: "16k_zh_en_2.0",
             saveTextLogs: true,
-            safeCopyEnabled: true,
+            alwaysSaveVoiceContent: true,
             hideMenuBarIcon: true,
             prepaidQuotaHoursByModel: ["16k_zh_en_2.0": 60]
         )
         store.save(settings)
         XCTAssertEqual(store.load(), settings)
+    }
+
+    func testLegacySafeCopySettingMigratesToAlwaysSaveVoiceContent() throws {
+        let data = Data("""
+        {
+            "shortcut": {"keyCode": 29, "modifiers": 1048576},
+            "engineModelType": "16k_zh",
+            "saveTextLogs": false,
+            "safeCopyEnabled": true
+        }
+        """.utf8)
+
+        let settings = try JSONDecoder().decode(AppSettings.self, from: data)
+        XCTAssertTrue(settings.alwaysSaveVoiceContent)
+
+        let encoded = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(settings)) as? [String: Any]
+        )
+        XCTAssertEqual(encoded["alwaysSaveVoiceContent"] as? Bool, true)
+        XCTAssertNil(encoded["safeCopyEnabled"])
     }
 
     func testOlderSettingsWithoutPrepaidQuotaDecodeWithEmptyQuota() throws {
@@ -101,7 +121,7 @@ final class SettingsStoreTests: XCTestCase {
 
         let settings = try JSONDecoder().decode(AppSettings.self, from: data)
         XCTAssertTrue(settings.prepaidQuotaHoursByModel.isEmpty)
-        XCTAssertFalse(settings.safeCopyEnabled)
+        XCTAssertFalse(settings.alwaysSaveVoiceContent)
         XCTAssertFalse(settings.hideMenuBarIcon)
         XCTAssertFalse(settings.captureDiagnosticWindowFrames)
     }

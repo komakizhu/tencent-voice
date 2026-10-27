@@ -6,7 +6,7 @@ final class BuildConfigurationTests: XCTestCase {
         XCTAssertEqual(AppSettings().engineModelType, "16k_zh")
         XCTAssertEqual(AppSettings().shortcut, .defaultCommand0)
         XCTAssertFalse(AppSettings().saveTextLogs)
-        XCTAssertFalse(AppSettings().safeCopyEnabled)
+        XCTAssertFalse(AppSettings().alwaysSaveVoiceContent)
         XCTAssertFalse(AppSettings().hideMenuBarIcon)
     }
 

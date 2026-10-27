@@ -383,8 +383,12 @@ final class InputFailureContextRecorder {
         "ax_selected_text_range_set_threw", "keyboard_document_observed",
         "keyboard_state_change_observed", "keyboard_write_submitted",
         "keyboard_write_acknowledged", "keyboard_write_unconfirmed",
-        "keyboard_focus_changed", "ax_focus_changed", "safari_keyboard_target_reacquired",
-        "safari_keyboard_target_reacquire_rejected", "text_dispatch_returned"
+        "keyboard_focus_changed", "ax_focus_changed", "keyboard_target_reacquired",
+        "keyboard_target_reacquire_retryable", "keyboard_target_reacquire_rejected",
+        "safari_keyboard_target_reacquired", "safari_keyboard_target_reacquire_retryable",
+        "safari_keyboard_target_reacquire_rejected", "safari_editor_continuity_scan_diagnostic",
+        AXTextEditorContinuityScanDiagnostic.event,
+        "text_dispatch_returned"
     ]
 
     init(axNotificationObserver: (any InputFailureAXNotificationObserving)? = nil) {
@@ -667,6 +671,11 @@ final class InputFailureContextRecorder {
             "sessionOperationAndTargetIDsIncludedWhenAvailable": "true",
             "editorProbeNodeLimit": "160", "editorProbeDepthLimit": "64",
             "editorProbeTraversal": "reverse_depth_first", "editorProbeBudgetMilliseconds": "250"]
+        window.collectionStatus["safariContinuityDiagnosticScope"] = "AX_editor_rebuild_scan_and_previous_handle_role_read_only"
+        window.collectionStatus["safariContinuityDiagnosticTextCaptured"] = "false"
+        window.collectionStatus["safariContinuityDiagnosticAudioCaptured"] = "false"
+        window.collectionStatus["safariContinuityDiagnosticPermission"] = "existing_accessibility_permission"
+        window.collectionStatus["safariContinuityDiagnosticRetention"] = "same_bounded_input_failure_window"
         window.collectionStatus["localMonitorInstalled"] = String(localMonitor != nil)
         window.collectionStatus["axNotificationCaptureScope"] = "focused_target_value_selection_and_application_focus_only"
         window.collectionStatus["axNotificationIsIndependentPageEvidence"] = "false"

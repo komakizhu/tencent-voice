@@ -145,8 +145,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         target: nil,
         action: nil
     )
-    private let safeCopyCheckbox = NSButton(
-        checkboxWithTitle: "Safe Copy（始终复制到剪贴板）",
+    private let alwaysSaveVoiceContentCheckbox = NSButton(
+        checkboxWithTitle: "始终保存语音内容",
         target: nil,
         action: nil
     )
@@ -251,7 +251,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         updateShortcutPresetSelection()
         logCheckbox.state = settings.saveTextLogs ? .on : .off
         captureWindowFramesCheckbox.state = settings.captureDiagnosticWindowFrames ? .on : .off
-        safeCopyCheckbox.state = settings.safeCopyEnabled ? .on : .off
+        alwaysSaveVoiceContentCheckbox.state = settings.alwaysSaveVoiceContent ? .on : .off
         hideMenuBarIconCheckbox.state = settings.hideMenuBarIcon ? .on : .off
         shortcutLabel.stringValue = ShortcutFormatter.string(for: currentShortcut)
         buildView()
@@ -356,10 +356,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         exportDiagnosticLogButton.isEnabled = onExportDiagnosticLog != nil
         exportDiagnosticLogButton.toolTip = "导出点击前最近一分钟的诊断；可能包含语音识别文字和目标输入框正文。不包含录音或凭据。"
         captureWindowFramesCheckbox.toolTip = "开启后仅在语音输入会话中采集已确认目标应用窗口，最多每秒5帧，只在内存保留最近60秒；提交报告时随 JSON 一起导出为 ZIP。画面可能包含对话内容，不上传。需要 macOS 屏幕录制权限。"
-        safeCopyCheckbox.toolTip = "开启后在会话结束时复制一次完整识别结果；取消或异常中断时保存最新已识别文字。"
+        alwaysSaveVoiceContentCheckbox.toolTip = "开启后，每次正常结束语音输入时都会复制完整识别结果。取消或输入异常时，应用始终会自动保存最新已识别文字。"
         logCheckbox.toolTip = "开启后保存本次会话的识别修订、输入框正文和诊断事件；点击右侧“导出诊断报告”导出。"
         hideMenuBarIconCheckbox.toolTip = "隐藏状态栏图标；隐藏后可从 Dock 中 Rime Voice 的应用菜单重新打开设置。"
-        saveButton.toolTip = "保存腾讯云凭证和设置；日志开关、Safe Copy 与快捷键也在此生效。"
+        saveButton.toolTip = "保存腾讯云凭证和设置；日志开关、始终保存语音内容和快捷键也在此生效。"
         shortcutPresetPopup.toolTip = "选择常用快捷键预设；F5 会在 Rime Voice 运行期间屏蔽 macOS 原生听写。"
         shortcutPresetPopup.setAccessibilityLabel("快捷键预设")
         permissionResetButton.target = self
@@ -452,7 +452,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func safeCopyRow() -> NSView {
         let row = DelayedHelpStackView(
-            contentView: safeCopyCheckbox,
+            contentView: alwaysSaveVoiceContentCheckbox,
             helpText: "正常输出到输入框，并在会话结束时同步复制最终识别结果；发生输入错误时作为回退；保存后生效"
         )
         row.alignment = .centerY
@@ -720,7 +720,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             engineModelType: enginePopup.selectedItem?.representedObject as? String
                 ?? TencentEnginePreset.defaultPreset.rawValue,
             saveTextLogs: logCheckbox.state == .on,
-            safeCopyEnabled: safeCopyCheckbox.state == .on,
+            alwaysSaveVoiceContent: alwaysSaveVoiceContentCheckbox.state == .on,
             hideMenuBarIcon: hideMenuBarIconCheckbox.state == .on,
             captureDiagnosticWindowFrames: captureWindowFramesCheckbox.state == .on,
             prepaidQuotaHoursByModel: prepaidQuotaHoursByModel
@@ -731,7 +731,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             onRecordDiagnosticAction?("settings_saved", [
                 "engineModelType": settings.engineModelType,
                 "saveTextLogs": String(settings.saveTextLogs),
-                "safeCopyEnabled": String(settings.safeCopyEnabled),
+                "alwaysSaveVoiceContent": String(settings.alwaysSaveVoiceContent),
                 "hideMenuBarIcon": String(settings.hideMenuBarIcon),
                 "captureDiagnosticWindowFrames": String(settings.captureDiagnosticWindowFrames)
             ])

@@ -152,7 +152,7 @@ enum InputReplay {
         }
 
         let target = AXTextTarget(operationObserver: { recorder.observe($0) })
-        let injector = TextInjector(target: target, keyboardSmoothing: .live, safeCopyEnabled: false)
+        let injector = TextInjector(target: target, keyboardSmoothing: .live, alwaysSaveVoiceContent: false)
         defer { injector.cancel() }
         do {
             try injector.begin()

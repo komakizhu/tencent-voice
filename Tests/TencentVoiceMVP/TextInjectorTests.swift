@@ -5,7 +5,7 @@ import XCTest
 final class TextInjectorTests: XCTestCase {
     func testSafeCopyCopiesLatestThousandCharactersOnlyOnCancel() throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
-        let injector = TextInjector(target: target, safeCopyEnabled: true)
+        let injector = TextInjector(target: target, alwaysSaveVoiceContent: true)
         try injector.begin()
         injector.apply(projection: projection(committed: "", active: "第一句。", id: 1, revision: 1))
         XCTAssertTrue(target.copiedTexts.isEmpty)
@@ -21,7 +21,7 @@ final class TextInjectorTests: XCTestCase {
 
     func testSafeCopyCopiesFinalResultAfterTargetStopsAcceptingInput() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
-        let injector = TextInjector(target: target, safeCopyEnabled: true)
+        let injector = TextInjector(target: target, alwaysSaveVoiceContent: true)
         try injector.begin()
         injector.apply(projection: projection(committed: "", active: "第一句", id: 1, revision: 1))
         target.text = "用户编辑后的文档"
@@ -38,7 +38,7 @@ final class TextInjectorTests: XCTestCase {
     func testSafeCopyPublishesOnlyFinalSessionTextAcrossRevisionsAndSentenceFinals() async throws {
         for supportsAX in [true, false] {
             let target = FakeTextTarget(text: "", supportsAXReplacement: supportsAX)
-            let injector = TextInjector(target: target, safeCopyEnabled: true)
+            let injector = TextInjector(target: target, alwaysSaveVoiceContent: true)
             try injector.begin()
             for revision in 1...20 {
                 injector.apply(projection: projection(
@@ -179,7 +179,7 @@ final class TextInjectorTests: XCTestCase {
 
     func testEnabledSafeCopyWritesToTextTargetAndClipboard() async throws {
         let target = FakeTextTarget(text: "已有文字", supportsAXReplacement: false)
-        let injector = TextInjector(target: target, safeCopyEnabled: true)
+        let injector = TextInjector(target: target, alwaysSaveVoiceContent: true)
 
         try injector.begin()
         injector.apply(projection: projection(
@@ -200,7 +200,7 @@ final class TextInjectorTests: XCTestCase {
 
     func testEnabledSafeCopyUsesAXReplacementAndClipboard() async throws {
         let target = FakeTextTarget(text: "已有文字", supportsAXReplacement: true)
-        let injector = TextInjector(target: target, safeCopyEnabled: true)
+        let injector = TextInjector(target: target, alwaysSaveVoiceContent: true)
 
         try injector.begin()
         injector.apply(projection: projection(
@@ -222,7 +222,7 @@ final class TextInjectorTests: XCTestCase {
 
     func testEnabledSafeCopyDoesNotReplaceClipboardForEmptyResult() async throws {
         let target = FakeTextTarget(text: "已有文字", supportsAXReplacement: false)
-        let injector = TextInjector(target: target, safeCopyEnabled: true)
+        let injector = TextInjector(target: target, alwaysSaveVoiceContent: true)
 
         try injector.begin()
         try await injector.finish(finalText: "")
@@ -233,7 +233,7 @@ final class TextInjectorTests: XCTestCase {
 
     func testEnabledSafeCopyFallsBackAfterInputFailureAndCopiesFinalResult() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
-        let injector = TextInjector(target: target, safeCopyEnabled: true)
+        let injector = TextInjector(target: target, alwaysSaveVoiceContent: true)
 
         try injector.begin()
         injector.apply(projection: projection(
@@ -257,7 +257,7 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertEqual(injector.degradationCode, "text_target_changed")
     }
 
-    func testSafeCopyDisabledStopsAfterInputFailureWithoutCopyingToClipboard() async throws {
+    func testInputFailureAlwaysFallsBackToSafeCopyWhenAlwaysSaveIsOff() async throws {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let injector = TextInjector(target: target)
 
@@ -278,9 +278,37 @@ final class TextInjectorTests: XCTestCase {
         try await injector.finish(finalText: "第二段")
 
         XCTAssertEqual(target.text, "用户已经编辑了目标")
-        XCTAssertNil(target.copiedText)
-        XCTAssertEqual(injector.modeDescription, "disabled_after_error")
+        XCTAssertEqual(target.copiedText, "第二段")
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
         XCTAssertEqual(injector.degradationCode, "text_target_changed")
+    }
+
+    func testCancellationAfterInputFailureCopiesLatestRecognitionWhenAlwaysSaveIsOff() throws {
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection(committed: "", active: "已识别内容", id: 1, revision: 1))
+        target.text = "用户编辑过的正文"
+        injector.apply(projection: projection(committed: "", active: "最终识别内容", id: 1, revision: 2))
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
+
+        injector.cancel()
+
+        XCTAssertEqual(target.copiedText, "最终识别内容")
+    }
+
+    func testSuccessfulCompletionDoesNotCopyWhenAlwaysSaveIsOff() async throws {
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let injector = TextInjector(target: target)
+
+        try injector.begin()
+        injector.apply(projection: projection(committed: "", active: "正常识别内容", id: 1, revision: 1))
+        try await injector.finish(finalText: "正常识别内容")
+
+        XCTAssertEqual(target.text, "正常识别内容")
+        XCTAssertNil(target.copiedText)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
     }
 
     func testKeyboardDeepPartialRevisionIsImmediatelyReplacedWithoutBackspaces() throws {

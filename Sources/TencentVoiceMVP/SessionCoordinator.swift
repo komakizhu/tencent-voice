@@ -126,7 +126,7 @@ final class SessionCoordinator: SessionCoordinating {
                 target: textTarget,
                 keyboardSmoothing: keyboardSmoothing,
                 pacingClock: pacingClock,
-                safeCopyEnabled: settings.safeCopyEnabled
+                alwaysSaveVoiceContent: settings.alwaysSaveVoiceContent
             )
             do {
                 try newInjector.begin()
@@ -377,11 +377,11 @@ final class SessionCoordinator: SessionCoordinating {
         projection: ASRProjection? = nil
     ) {
         guard let injector,
-              ["safe_copy", "disabled_after_error"].contains(injector.modeDescription),
+              injector.modeDescription == "safe_copy",
               !degradationWasLogged else { return }
         degradationWasLogged = true
         log(
-            event: injector.modeDescription == "safe_copy" ? "safe_copy" : "input_error",
+            event: "safe_copy",
             update: update,
             projection: projection,
             failureCode: injector.degradationCode,

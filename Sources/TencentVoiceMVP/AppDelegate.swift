@@ -726,7 +726,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     latestFailure: scopedFailureEvidence.0,
                     sessionEvidenceSummaries: scopedFailureEvidence.2,
                     firstFailure: scopedFailureEvidence.1,
-                    evidenceScopeNote: "主时间线严格限定为点击前60秒；另附最近故障点之前60秒的关联快照（若早于主窗口则会标注原始时间）。采集未开启、截断、权限不足、节流或读取失败时，报告会标明缺口。键盘事件提交、AX调用返回和AX通知都不证明编辑器已实际执行；AX证据不代表页面DOM或屏幕状态。窗口画面采集默认关闭，仅在设置中主动开启后对已确认的前台目标窗口进行短时采集，不包含音频或上传。",
+                    evidenceScopeNote: "主时间线严格限定为点击前60秒；另附最近故障点之前60秒的关联快照（若早于主窗口则会标注原始时间）。采集未开启、截断、权限不足、节流或读取失败时，报告会标明缺口。键盘事件提交、AX调用返回和AX通知都不证明编辑器已实际执行；AX证据不代表页面DOM或屏幕状态。Safari编辑器重建诊断只记录旧句柄和连续性扫描的阶段、AX属性名、返回码、遍历深度、候选数量和耗时；不记录网页文字、音频或凭据。需要现有辅助功能权限，并且故障采集已开启；每次扫描成功或失败后即结束，目标期限250毫秒、单次AX调用超时30毫秒、祖先最多64层、子树最多160个对象。记录随现有有界故障窗口保留；停止采集后不再新增。窗口画面采集默认关闭，仅在设置中主动开启后对已确认的前台目标窗口进行短时采集，不包含音频或上传。",
                     windowFrameCapture: frameSnapshot.evidence
                 )
                 menu.update(failureReportResult: "正在编码并保存报告…")

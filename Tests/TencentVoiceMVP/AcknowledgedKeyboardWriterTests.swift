@@ -9,7 +9,7 @@ final class AcknowledgedKeyboardWriterTests: XCTestCase {
         try injector.begin()
         injector.apply(projection: projection("first"))
         injector.apply(projection: projection("first next"))
-        XCTAssertEqual(injector.modeDescription, "disabled_after_error")
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
         XCTAssertEqual(target.posts, 1)
         XCTAssertEqual(target.text, "Draft: ")
     }
@@ -209,7 +209,7 @@ final class AcknowledgedKeyboardWriterTests: XCTestCase {
         try await injector.finish(finalText: "识别回头覆盖")
 
         XCTAssertEqual(target.text, "草稿：原始语音手动")
-        XCTAssertEqual(injector.modeDescription, "disabled_after_error")
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
         XCTAssertEqual(injector.degradationCode, "text_target_changed")
     }
 
@@ -227,7 +227,7 @@ final class AcknowledgedKeyboardWriterTests: XCTestCase {
 
         XCTAssertTrue(target.text.hasPrefix("草稿：原手动"))
         XCTAssertFalse(target.text.contains("继续"))
-        XCTAssertEqual(injector.modeDescription, "disabled_after_error")
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
         XCTAssertEqual(injector.degradationCode, "text_target_changed")
     }
 
