@@ -2947,7 +2947,7 @@ final class AXTextTargetReplayTests: XCTestCase {
         access.proseMirror = true
         access.coordinateIncludesStructuralSeparators = true
         access.simulateSafariEditorLayoutRebuild = true
-        access.safariEditorIdentifier = nil
+        access.replayEditorIdentifier = nil
         let sender = ReplayKeyboardEventSender(access: access)
         let injector = TextInjector(target: AXTextTarget(
             access: access,
@@ -3012,6 +3012,80 @@ final class AXTextTargetReplayTests: XCTestCase {
             diagnostics.first { $0.event == "safe_copy_updated" }?.textEvidence.first?.text,
             "相同后续"
         )
+    }
+
+    func testCodexReplacementWithoutStableEditorIdentifierIsRejected() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "甲",
+            selection: .init(location: 1, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.coordinateIncludesStructuralSeparators = true
+        access.simulateSafariEditorLayoutRebuild = true
+        access.replayEditorIdentifier = nil
+        let sender = ReplayKeyboardEventSender(access: access)
+        let injector = TextInjector(target: AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        ))
+
+        try injector.begin()
+        injector.apply(projection: projection("乙", revision: 1))
+        try await injector.finish(finalText: "乙")
+        access.focusedElementRebuildsBeforeNextWrite = 1
+        injector.apply(projection: projection("乙丙", revision: 2))
+        try await injector.finish(finalText: "乙丙")
+
+        XCTAssertEqual(access.rawText, "甲乙")
+        XCTAssertEqual(sender.totalPosts, 1, "a replacement with no stable editor identifier must not receive another write")
+        XCTAssertEqual(injector.errorCount, 1)
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
+        let diagnostics = injector.drainDiagnostics()
+        XCTAssertTrue(diagnostics.contains {
+            $0.event == "keyboard_target_reacquire_rejected"
+                && $0.fields["reason"] == "stable_unique_editor_continuity_unverified"
+        })
+        XCTAssertEqual(
+            diagnostics.first { $0.event == "safe_copy_updated" }?.textEvidence.first?.text,
+            "乙丙"
+        )
+    }
+
+    func testCodexReplacementWithStableEditorIdentifierRecoversBeforeNextWrite() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "甲",
+            selection: .init(location: 1, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.coordinateIncludesStructuralSeparators = true
+        access.simulateSafariEditorLayoutRebuild = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let injector = TextInjector(target: AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        ))
+
+        try injector.begin()
+        injector.apply(projection: projection("乙", revision: 1))
+        try await injector.finish(finalText: "乙")
+        access.focusedElementRebuildsBeforeNextWrite = 1
+        injector.apply(projection: projection("乙丙", revision: 2))
+        try await injector.finish(finalText: "乙丙")
+
+        XCTAssertEqual(access.rawText, "甲乙丙")
+        XCTAssertEqual(sender.totalPosts, 2, "the confirmed replacement should receive only the pending suffix")
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+        let diagnostics = injector.drainDiagnostics()
+        XCTAssertTrue(diagnostics.contains {
+            $0.event == "keyboard_target_reacquired"
+                && $0.fields["reason"] == "same_web_area_unique_editor_anchor_and_expected_document"
+        })
+        XCTAssertFalse(diagnostics.contains { $0.event == "keyboard_target_reacquire_rejected" })
     }
 
     func testCodexRebuildAfterApplicationSwitchIsRejectedBeforeAnotherWrite() async throws {
@@ -5556,7 +5630,7 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var anchoredContinuityAvailable = false
     var safariContinuityUnavailableReadsBeforeRecovery = 0
     var safariEditableEditorCount = 1
-    var safariEditorIdentifier: String? = "replay-composer-editor"
+    var replayEditorIdentifier: String? = "replay-composer-editor"
     var focusedElementRebuildsAfterNextWrite = 0
     private var focusedElementRebuildCount = 0
     var failFocusedElementReadAtCount: Int?
@@ -5668,7 +5742,7 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
             editorAnchor: replayEditorAnchor,
             editorAnchorRole: "AXGroup",
             rolesFromEditorToAnchor: ["AXTextArea", "AXGroup"],
-            identifiersFromEditorToAnchor: [safariEditorIdentifier, nil],
+            identifiersFromEditorToAnchor: [replayEditorIdentifier, nil],
             editableEditorCount: safariEditableEditorCount,
             scanComplete: true
         )
@@ -5688,7 +5762,7 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
             editorAnchor: previous.editorAnchor,
             editorAnchorRole: previous.editorAnchorRole,
             rolesFromEditorToAnchor: ["AXTextArea", "AXGroup"],
-            identifiersFromEditorToAnchor: [safariEditorIdentifier, nil],
+            identifiersFromEditorToAnchor: [replayEditorIdentifier, nil],
             editableEditorCount: safariEditableEditorCount,
             scanComplete: true
         )

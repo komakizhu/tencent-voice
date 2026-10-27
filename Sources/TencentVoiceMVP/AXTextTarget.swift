@@ -3998,14 +3998,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
 
     func reconcileKeyboardStateForUserEdit() throws -> KeyboardReconciliation {
         guard requiresKeyboardAcknowledgement, isCodexTarget else { return .matched }
-        try ensureTargetApplicationIsFrontmost()
-        guard let targetElement else { return .matched }
-        let currentElement = try focusedElement()
-        guard CFEqual(currentElement, targetElement) else {
-            invalidateKeyboardRawInsertionRegion()
-            recordDiagnostic("keyboard_focus_changed")
-            throw TextTargetError.targetChanged
-        }
+        guard targetElement != nil else { return .matched }
         guard pendingKeyboardWrite == nil, pendingKeyboardReplacement == nil else {
             recordDiagnostic("own_write_in_flight", [
                 "pendingReplacement": String(pendingKeyboardReplacement != nil),
@@ -4017,14 +4010,15 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         let requestedAt = Date()
         let monotonic = writeTiming.now() / 1_000_000
         do {
-            currentState = try KeyboardWriteAcknowledgement.readObservation {
-                try keyboardDocumentState(in: currentElement)
-            }
+            currentState = try readKeyboardDocumentObservation(
+                generation: keyboardGeneration,
+                phase: "reconciliation"
+            ).state
         } catch KeyboardDocumentStateReadError.retryable,
                 KeyboardWriteReadError.retryable {
-            // The atomic writer performs the same preflight with its bounded
-            // retry loop. A transient AX snapshot here must not be mistaken
-            // for an external edit before that loop gets a chance to recover.
+            // The atomic writer performs a fresh preflight with its existing
+            // bounded retry loop. A changed AX handle or transient snapshot
+            // must not be treated as an external edit or reused as evidence.
             recordDiagnostic("keyboard_state_read_retryable", ["phase": "reconciliation"])
             return .matched
         } catch {
