@@ -143,8 +143,14 @@ final class AppSmokeTests: XCTestCase {
         let connectingBeforeCapture = StatusButtonPresentation.make(
             mode: .timer, state: .connecting, isCapturing: false, duration: 0
         )
-        XCTAssertEqual(connectingBeforeCapture.title, "00:00")
-        XCTAssertEqual(connectingBeforeCapture.imageStyle, .none)
+        XCTAssertEqual(connectingBeforeCapture.title, "")
+        XCTAssertEqual(connectingBeforeCapture.imageStyle, .application)
+        XCTAssertTrue(connectingBeforeCapture.toolTip.contains("准备录音中"))
+        let connectingWhileCapturing = StatusButtonPresentation.make(
+            mode: .timer, state: .connecting, isCapturing: true, duration: 0
+        )
+        XCTAssertEqual(connectingWhileCapturing.title, "00:00")
+        XCTAssertEqual(connectingWhileCapturing.imageStyle, .none)
 
         let circleIdle = StatusButtonPresentation.make(
             mode: .icon, state: .connecting, isCapturing: false, duration: 0
@@ -171,6 +177,12 @@ final class AppSmokeTests: XCTestCase {
             mode: .waveform, state: .listening, isCapturing: true, duration: 1
         ).imageStyle, .waveform)
         XCTAssertEqual(StatusButtonPresentation.make(
+            mode: .waveform, state: .connecting, isCapturing: false, duration: 0
+        ).imageStyle, .application)
+        XCTAssertEqual(StatusButtonPresentation.make(
+            mode: .waveform, state: .connecting, isCapturing: true, duration: 0
+        ).imageStyle, .symbol("mic.waiting"))
+        XCTAssertEqual(StatusButtonPresentation.make(
             mode: .waveform, state: .recovering, isCapturing: false, duration: 1
         ).imageStyle, .symbol("mic.slash.fill"))
         XCTAssertEqual(StatusButtonPresentation.make(
@@ -183,7 +195,7 @@ final class AppSmokeTests: XCTestCase {
 
     func testWaveformGateGainAttackReleaseAndStaleResetAreDeterministic() {
         XCTAssertEqual(WaveformDisplayModel.amplitude(forRMS: 0.005), 0)
-        XCTAssertEqual(WaveformDisplayModel.amplitude(forRMS: 0.008), 0.305, accuracy: 0.015)
+        XCTAssertEqual(WaveformDisplayModel.amplitude(forRMS: 0.008), 0.291, accuracy: 0.015)
         XCTAssertLessThan(
             WaveformDisplayModel.amplitude(forRMS: 0.02),
             WaveformDisplayModel.amplitude(forRMS: 0.05)
@@ -199,8 +211,12 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertEqual(initial, Array(repeating: 0, count: 5))
         let afterAttack = model.update(snapshot: loud, now: 100_000_000)
         XCTAssertGreaterThanOrEqual(afterAttack[2], WaveformDisplayModel.amplitude(forRMS: 0.05) * 0.99)
-        XCTAssertEqual(afterAttack[0] / afterAttack[2], 0.55, accuracy: 0.000_001)
-        XCTAssertEqual(afterAttack[1] / afterAttack[2], 0.8, accuracy: 0.000_001)
+        XCTAssertGreaterThan(afterAttack[0] / afterAttack[2], 0.36)
+        XCTAssertLessThan(afterAttack[0] / afterAttack[2], 0.38)
+        XCTAssertGreaterThan(afterAttack[1] / afterAttack[2], 0.73)
+        XCTAssertLessThan(afterAttack[1] / afterAttack[2], 0.74)
+        XCTAssertEqual(afterAttack[0], afterAttack[4])
+        XCTAssertEqual(afterAttack[1], afterAttack[3])
 
         let quiet = makeDisplaySnapshot(
             sessionID: sessionID, rms: 0.005, sequence: 2, timestamp: 100_000_000, duration: 0.1
@@ -221,6 +237,42 @@ final class AppSmokeTests: XCTestCase {
             sessionID: sessionID, state: .recovering, audio: loudAgain.audio, isCapturing: false
         )
         XCTAssertEqual(model.update(snapshot: interrupted, now: 610_000_000), Array(repeating: 0, count: 5))
+    }
+
+    func testAggressiveWaveformEndsMoveWithVolumeAndContinuousSilenceClearsAllBars() {
+        let sessionID = UUID()
+        var model = WaveformDisplayModel()
+        let weak = makeDisplaySnapshot(
+            sessionID: sessionID, rms: 0.02, sequence: 1, timestamp: 0, duration: 0.1
+        )
+        _ = model.update(snapshot: weak, now: 0)
+        let weakLevels = model.update(snapshot: weak, now: 100_000_000)
+        let strong = makeDisplaySnapshot(
+            sessionID: sessionID, rms: 0.1, sequence: 2, timestamp: 150_000_000, duration: 0.1
+        )
+        let strongLevels = model.update(snapshot: strong, now: 200_000_000)
+        XCTAssertEqual(strongLevels.count, 5)
+        for index in 0..<5 {
+            XCTAssertGreaterThan(strongLevels[index], weakLevels[index])
+        }
+        XCTAssertLessThan(strongLevels[0], strongLevels[1])
+        XCTAssertLessThan(strongLevels[1], strongLevels[2])
+
+        // Frequent quiet input must not keep restarting the silence deadline.
+        var quietLevels: [Double] = []
+        for step in 0...3 {
+            let time = UInt64(250_000_000 + step * 50_000_000)
+            let quiet = makeDisplaySnapshot(
+                sessionID: sessionID, rms: 0.005, sequence: UInt64(3 + step), timestamp: time, duration: 0.05
+            )
+            quietLevels = model.update(snapshot: quiet, now: time)
+        }
+        XCTAssertEqual(quietLevels, Array(repeating: 0, count: 5))
+
+        let nextSession = makeDisplaySnapshot(
+            sessionID: UUID(), rms: 0.1, sequence: 1, timestamp: 450_000_000, duration: 0.1
+        )
+        XCTAssertEqual(model.update(snapshot: nextSession, now: 450_000_000), Array(repeating: 0, count: 5))
     }
 
     func testPCMMeasurementDistinguishesSilenceNoiseWeakAndStrongSignals() {

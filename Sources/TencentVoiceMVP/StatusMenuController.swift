@@ -281,7 +281,7 @@ final class StatusMenuController: NSObject {
         let currentState = displaySnapshot?.state ?? sessionState
         let isCapturing = displaySnapshot?.isCapturing ?? false
         switch (menuBarDisplayMode, currentState, isCapturing) {
-        case (.timer, .connecting, _), (.timer, .listening, _), (.timer, .recovering, _), (.timer, .stopping, _):
+        case (.timer, .connecting, true), (.timer, .listening, true), (.timer, .recovering, true):
             interval = 1
         case (.waveform, .listening, true):
             interval = 0.05
@@ -508,21 +508,20 @@ final class StatusMenuController: NSObject {
     private func waveformImage() -> NSImage {
         let image = NSImage(size: NSSize(width: 18, height: 18))
         image.lockFocus()
-        NSColor.white.setFill()
         let levels = statusButtonWaveformLevels.map { min(1, max(0, $0)) }
-        if levels.allSatisfy({ $0 == 0 }) {
-            NSBezierPath(roundedRect: NSRect(x: 1.5, y: 8.5, width: 15, height: 1), xRadius: 0.5, yRadius: 0.5).fill()
-        } else {
-            for index in 0..<5 {
-                let height = levels[index] * 14.0
-                let x = 1.5 + Double(index) * 3.2
-                let y = (18.0 - height) / 2
-                NSBezierPath(
-                    roundedRect: NSRect(x: x, y: y, width: 2.2, height: height),
-                    xRadius: 1.1,
-                    yRadius: 1.1
-                ).fill()
-            }
+        // Match the approved 24 × 20 HTML preview inside an 18-point icon.
+        let width = 2.6 * 0.75
+        for index in 0..<5 {
+            let envelope = levels[index] / WaveformDisplayModel.barWeights[index]
+            guard envelope >= 0.001 else { continue }
+            NSColor.white.withAlphaComponent(min(1, envelope / 0.06)).setFill()
+            let height = width + (17 * 0.75 - width) * levels[index]
+            let x = 9 + Double(index - 2) * 3.8 * 0.75 - width / 2
+            NSBezierPath(
+                roundedRect: NSRect(x: x, y: (18 - height) / 2, width: width, height: height),
+                xRadius: width / 2,
+                yRadius: width / 2
+            ).fill()
         }
         image.unlockFocus()
         image.isTemplate = true

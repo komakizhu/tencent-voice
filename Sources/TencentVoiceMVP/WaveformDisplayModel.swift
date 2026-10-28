@@ -37,7 +37,7 @@ struct StatusButtonPresentation: Equatable {
         let detail: String
         switch state {
         case .idle: detail = "已就绪"
-        case .connecting: detail = "正在连接语音识别"
+        case .connecting: detail = isCapturing ? "正在连接语音识别" : "准备录音中"
         case .listening: detail = isCapturing ? "正在录音" : "录音已暂停"
         case .recovering: detail = "麦克风恢复中"
         case .stopping: detail = "语音收尾中"
@@ -60,6 +60,13 @@ struct StatusButtonPresentation: Equatable {
                     imageStyle: .application,
                     toolTip: failureText.map { "Rime Voice · \($0)" } ?? "Rime Voice · \(detail)",
                     accessibilityLabel: failureText.map { "Rime Voice，\($0)" } ?? "Rime Voice，\(detail)"
+                )
+            case .connecting where !isCapturing:
+                return Self(
+                    title: "",
+                    imageStyle: .application,
+                    toolTip: "Rime Voice · \(detail)",
+                    accessibilityLabel: "Rime Voice，\(detail)"
                 )
             case .connecting, .listening, .recovering, .stopping:
                 return Self(
@@ -88,7 +95,7 @@ struct StatusButtonPresentation: Equatable {
             case .idle:
                 style = statusFeedback == nil ? .application : .symbol("exclamationmark.triangle.fill")
             case .connecting:
-                style = .symbol("mic.waiting")
+                style = isCapturing ? .symbol("mic.waiting") : .application
             case .listening:
                 style = isCapturing ? .waveform : .application
             case .recovering:
@@ -115,18 +122,18 @@ struct StatusButtonPresentation: Equatable {
     }
 }
 
-/// Converts only numeric microphone levels into a single display envelope.
+/// Converts numeric microphone levels into five fixed-position display envelopes.
 /// It never retains audio or a rolling history of past sound.
 struct WaveformDisplayModel {
     static let openThreshold = 0.008
     static let closeThreshold = 0.006
-    static let attackTimeConstant: TimeInterval = 0.020
-    static let releaseTimeConstant: TimeInterval = 0.050
+    static let attackTimeConstant: TimeInterval = 0.018
+    static let releaseTimeConstant: TimeInterval = 0.045
     static let silenceResetNanoseconds: UInt64 = 120_000_000
     static let staleMinimumNanoseconds: UInt64 = 300_000_000
-    static let barWeights = [0.55, 0.8, 1.0, 0.8, 0.55]
+    static let barWeights = [0.38, 0.74, 1.0, 0.74, 0.38]
 
-    private(set) var amplitude = 0.0
+    private var envelopes = Array(repeating: 0.0, count: 5)
     private var targetAmplitude = 0.0
     private var isGateOpen = false
     private var belowOpenSince: UInt64?
@@ -138,7 +145,7 @@ struct WaveformDisplayModel {
     private var lastTickAt: UInt64?
 
     var barLevels: [Double] {
-        Self.barWeights.map { amplitude * $0 }
+        zip(envelopes, Self.barWeights).map { $0.0 * $0.1 }
     }
 
     mutating func update(
@@ -181,21 +188,26 @@ struct WaveformDisplayModel {
         if let gateClosedSince,
            now >= gateClosedSince,
            now - gateClosedSince >= Self.silenceResetNanoseconds {
-            amplitude = 0
+            envelopes = Array(repeating: 0, count: 5)
         } else if let lastTickAt {
             let elapsed = Double(now >= lastTickAt ? now - lastTickAt : 0) / 1_000_000_000
-            amplitude = Self.smoothedLevel(
-                current: amplitude,
-                target: targetAmplitude,
-                elapsed: elapsed
-            )
+            for index in envelopes.indices {
+                // The outer bars follow the same current input more gently;
+                // these are smoothing states, not a rolling audio history.
+                envelopes[index] = Self.smoothedLevel(
+                    current: envelopes[index],
+                    target: targetAmplitude,
+                    elapsed: elapsed,
+                    responseScale: 1 + Double(abs(index - 2)) * 0.22
+                )
+            }
         }
         lastTickAt = now
         return barLevels
     }
 
     mutating func reset() {
-        amplitude = 0
+        envelopes = Array(repeating: 0, count: 5)
         targetAmplitude = 0
         isGateOpen = false
         belowOpenSince = nil
@@ -228,7 +240,7 @@ struct WaveformDisplayModel {
             if level <= Self.closeThreshold {
                 isGateOpen = false
                 belowOpenSince = nil
-                gateClosedSince = timestamp
+                gateClosedSince = gateClosedSince ?? timestamp
             } else if isGateOpen {
                 belowOpenSince = belowOpenSince ?? timestamp
             }
@@ -240,7 +252,7 @@ struct WaveformDisplayModel {
     }
 
     private mutating func clearEnvelope() {
-        amplitude = 0
+        envelopes = Array(repeating: 0, count: 5)
         targetAmplitude = 0
         isGateOpen = false
         belowOpenSince = nil
@@ -262,15 +274,15 @@ struct WaveformDisplayModel {
         let ceilingDB = -18.0
         let decibels = 20 * log10(min(1, max(closeThreshold, rms)))
         let linear = min(1, max(0, (decibels - floorDB) / (ceilingDB - floorDB)))
-        return sqrt(linear)
+        return pow(linear, 0.52)
     }
 
-    static func smoothedLevel(current: Double, target: Double, elapsed: TimeInterval) -> Double {
+    static func smoothedLevel(current: Double, target: Double, elapsed: TimeInterval, responseScale: Double = 1) -> Double {
         let current = min(1, max(0, current))
         let target = min(1, max(0, target))
         let delta = min(0.25, max(0, elapsed))
         guard delta > 0 else { return current }
-        let timeConstant = target > current ? attackTimeConstant : releaseTimeConstant
+        let timeConstant = (target > current ? attackTimeConstant : releaseTimeConstant) * responseScale
         return current + (target - current) * (1 - exp(-delta / timeConstant))
     }
 }
