@@ -155,6 +155,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         target: nil,
         action: nil
     )
+    private let menuBarDisplayModePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let shortcutLabel = NSTextField(labelWithString: "")
     private let versionLabel = NSTextField(labelWithString: AppVersion.displayText)
     private let statusLabel = NSTextField(labelWithString: "凭证优先保存在本机 YAML")
@@ -253,6 +254,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         captureWindowFramesCheckbox.state = settings.captureDiagnosticWindowFrames ? .on : .off
         alwaysSaveVoiceContentCheckbox.state = settings.alwaysSaveVoiceContent ? .on : .off
         hideMenuBarIconCheckbox.state = settings.hideMenuBarIcon ? .on : .off
+        for mode in MenuBarDisplayMode.allCases {
+            menuBarDisplayModePopup.addItem(withTitle: mode.displayName)
+            menuBarDisplayModePopup.lastItem?.representedObject = mode.rawValue
+        }
+        menuBarDisplayModePopup.selectItem(withTitle: settings.menuBarDisplayMode.displayName)
+        menuBarDisplayModePopup.setAccessibilityLabel("状态栏录音显示模式")
         shortcutLabel.stringValue = ShortcutFormatter.string(for: currentShortcut)
         buildView()
         refreshPermissionReport()
@@ -319,6 +326,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             testButton,
             safeCopyRow(),
             logRow,
+            labeled(
+                "状态栏录音显示",
+                view: menuBarDisplayModePopup,
+                toolTip: "选择录音时状态栏显示图标、已录时长或真实麦克风音量波形；修改后点击“保存设置”。"
+            ),
             hideMenuBarIconCheckbox,
             storageSection()
         ])
@@ -722,6 +734,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             saveTextLogs: logCheckbox.state == .on,
             alwaysSaveVoiceContent: alwaysSaveVoiceContentCheckbox.state == .on,
             hideMenuBarIcon: hideMenuBarIconCheckbox.state == .on,
+            menuBarDisplayMode: MenuBarDisplayMode(
+                persistedValue: menuBarDisplayModePopup.selectedItem?.representedObject as? String
+            ),
             captureDiagnosticWindowFrames: captureWindowFramesCheckbox.state == .on,
             prepaidQuotaHoursByModel: prepaidQuotaHoursByModel
         )

@@ -24,21 +24,46 @@ final class StatusMenuController: NSObject {
     private var failureContextMenuItem: NSMenuItem?
     private var failureResultMenuItem: NSMenuItem?
     private var archiveMenuItems: [NSMenuItem] = []
+    private var displayRefreshTimer: Timer?
+    private var snapshotProvider: (() -> RecordingDisplaySnapshot?)?
+    private var sessionState: SessionState = .idle
+    private var displaySnapshot: RecordingDisplaySnapshot?
+    private var statusFeedback: String?
+    private var waveformDisplayModel = WaveformDisplayModel()
+    private let monotonicClock: () -> UInt64
+    private(set) var menuBarDisplayMode: MenuBarDisplayMode = .defaultMode
+    private(set) var statusButtonTitle = ""
+    private(set) var statusButtonToolTip = "Rime Voice"
+    private(set) var statusButtonAccessibilityLabel = "Rime Voice"
+    private(set) var statusButtonWaveformLevels = Array(repeating: 0.0, count: 5)
+    private(set) var statusButtonImageStyle: StatusButtonImageStyle = .application
     private(set) var statusText = "就绪"
     private(set) var installedMenu: NSMenu?
+
+    init(monotonicClock: @escaping () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }) {
+        self.monotonicClock = monotonicClock
+        super.init()
+    }
 
     func install() {
         guard statusItem == nil else { return }
 
+        waveformDisplayModel.reset()
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.title = ""
-        item.button?.image = statusImage()
+        item.button?.image = statusImage(for: .application)
         item.button?.imageScaling = .scaleProportionallyDown
         item.button?.setAccessibilityLabel("Rime Voice")
         item.button?.toolTip = "Rime Voice"
 
         item.menu = makeMenu()
         statusItem = item
+        if let snapshotProvider {
+            displaySnapshot = snapshotProvider()
+        }
+        updateRecordMenuItem()
+        renderStatusButton()
+        updateDisplayRefreshTimer()
     }
 
     func setVisible(_ visible: Bool) {
@@ -123,13 +148,49 @@ final class StatusMenuController: NSObject {
 
     func update(status: String) {
         statusText = status
-        let isIdle = status.contains("就绪")
-        let isError = status.hasPrefix("错误：") || status.hasPrefix("无法开始录音：")
-        let isStopping = status.contains("收尾中")
-        recordMenuItem?.title = isStopping
-            ? "收尾中…"
-            : (isIdle || isError ? "开始录音" : "停止录音")
-        recordMenuItem?.isEnabled = !isStopping
+        if status.hasPrefix("错误：") || status.hasPrefix("无法开始录音：") {
+            statusFeedback = status
+        } else {
+            statusFeedback = nil
+        }
+        renderStatusButton()
+    }
+
+    func configureRecordingDisplay(snapshotProvider: @escaping () -> RecordingDisplaySnapshot?) {
+        self.snapshotProvider = snapshotProvider
+        displaySnapshot = snapshotProvider()
+        renderStatusButton()
+        updateDisplayRefreshTimer()
+    }
+
+    func update(menuBarDisplayMode: MenuBarDisplayMode) {
+        guard self.menuBarDisplayMode != menuBarDisplayMode else { return }
+        self.menuBarDisplayMode = menuBarDisplayMode
+        waveformDisplayModel.reset()
+        if let snapshotProvider {
+            displaySnapshot = snapshotProvider()
+        }
+        renderStatusButton()
+        updateDisplayRefreshTimer()
+    }
+
+    func update(recordingState: SessionState) {
+        let changed = sessionState != recordingState
+        sessionState = recordingState
+        if changed {
+            switch recordingState {
+            case .idle, .recovering, .stopping, .error:
+                waveformDisplayModel.reset()
+            case .connecting, .listening:
+                break
+            }
+        }
+        if let snapshotProvider {
+            displaySnapshot = snapshotProvider()
+        }
+        updateRecordMenuItem()
+        renderStatusButton()
+        updateDisplayRefreshTimer()
     }
 
     func update(shortcut: Shortcut) {
@@ -195,6 +256,111 @@ final class StatusMenuController: NSObject {
     @objc private func reportInputFailurePressed() { onReportInputFailure?() }
     @objc private func openFailureReportsPressed() { onOpenFailureReports?() }
 
+    private func updateRecordMenuItem() {
+        let isStopping: Bool
+        switch sessionState {
+        case .idle, .error:
+            recordMenuItem?.title = "开始录音"
+            isStopping = false
+        case .connecting, .listening, .recovering:
+            recordMenuItem?.title = "停止录音"
+            isStopping = false
+        case .stopping:
+            recordMenuItem?.title = "收尾中…"
+            isStopping = true
+        }
+        recordMenuItem?.isEnabled = !isStopping
+    }
+
+    private func updateDisplayRefreshTimer() {
+        displayRefreshTimer?.invalidate()
+        displayRefreshTimer = nil
+        guard statusItem != nil else { return }
+
+        let interval: TimeInterval?
+        let currentState = displaySnapshot?.state ?? sessionState
+        let isCapturing = displaySnapshot?.isCapturing ?? false
+        switch (menuBarDisplayMode, currentState, isCapturing) {
+        case (.timer, .connecting, _), (.timer, .listening, _), (.timer, .recovering, _), (.timer, .stopping, _):
+            interval = 1
+        case (.waveform, .listening, true):
+            interval = 0.05
+        default:
+            interval = nil
+        }
+        guard let interval else { return }
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshDisplaySnapshot()
+            }
+        }
+        displayRefreshTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func refreshDisplaySnapshot() {
+        guard let snapshot = snapshotProvider?() else { return }
+        let stateChanged = sessionState != snapshot.state
+        let sessionChanged = displaySnapshot?.sessionID != snapshot.sessionID
+        let captureChanged = displaySnapshot?.isCapturing != snapshot.isCapturing
+        if stateChanged {
+            sessionState = snapshot.state
+            updateRecordMenuItem()
+        }
+        if sessionChanged {
+            waveformDisplayModel.reset()
+        }
+        displaySnapshot = snapshot
+        renderStatusButton()
+        if stateChanged || sessionChanged || captureChanged {
+            updateDisplayRefreshTimer()
+        }
+    }
+
+    private func renderStatusButton() {
+        let snapshot = displaySnapshot ?? RecordingDisplaySnapshot(
+            sessionID: nil,
+            state: sessionState,
+            audio: .empty
+        )
+        let presentation = StatusButtonPresentation.make(
+            mode: menuBarDisplayMode,
+            state: snapshot.state,
+            isCapturing: snapshot.isCapturing,
+            duration: snapshot.audio.durationSeconds,
+            statusFeedback: statusFeedback
+        )
+        statusButtonTitle = presentation.title
+        statusButtonToolTip = presentation.toolTip
+        statusButtonAccessibilityLabel = presentation.accessibilityLabel
+        statusButtonImageStyle = presentation.imageStyle
+
+        if presentation.imageStyle == .waveform {
+            statusButtonWaveformLevels = waveformDisplayModel.update(snapshot: snapshot, now: monotonicClock())
+        } else {
+            waveformDisplayModel.reset()
+            statusButtonWaveformLevels = Array(repeating: 0, count: 5)
+        }
+
+        guard let button = statusItem?.button else { return }
+        button.title = presentation.title
+        button.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+        if presentation.imageStyle == .none {
+            button.image = nil
+            button.imagePosition = .noImage
+        } else {
+            button.image = statusImage(for: presentation.imageStyle)
+            button.imagePosition = presentation.title.isEmpty ? .imageOnly : .imageLeading
+        }
+        button.toolTip = presentation.toolTip
+        button.setAccessibilityLabel(presentation.accessibilityLabel)
+        statusItem?.length = presentation.title.isEmpty ? NSStatusItem.squareLength : NSStatusItem.variableLength
+    }
+
+    static func formattedDuration(_ duration: Double) -> String {
+        RecordingDurationFormatter.string(from: duration)
+    }
+
     func update(rimeThemes snapshot: RimeThemeSnapshot) {
         guard let submenu = rimeThemeMenuItem?.submenu else { return }
         submenu.removeAllItems()
@@ -254,6 +420,9 @@ final class StatusMenuController: NSObject {
     }
 
     func uninstall() {
+        displayRefreshTimer?.invalidate()
+        displayRefreshTimer = nil
+        snapshotProvider = nil
         removeStatusItem()
         onSettings = nil
         onToggleRecording = nil
@@ -268,6 +437,10 @@ final class StatusMenuController: NSObject {
     }
 
     private func removeStatusItem() {
+        displayRefreshTimer?.invalidate()
+        displayRefreshTimer = nil
+        waveformDisplayModel.reset()
+        statusButtonWaveformLevels = Array(repeating: 0, count: 5)
         if let statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
         }
@@ -284,7 +457,30 @@ final class StatusMenuController: NSObject {
         failureResultMenuItem = nil
     }
 
-    private func statusImage() -> NSImage {
+    private func statusImage(for style: StatusButtonImageStyle) -> NSImage? {
+        switch style {
+        case .none:
+            return nil
+        case .application:
+            return applicationStatusImage()
+        case .waveform:
+            return waveformImage()
+        case let .symbol(symbolName):
+            if symbolName == "mic.waiting" { return connectingImage() }
+            guard let symbol = NSImage(
+                systemSymbolName: symbolName,
+                accessibilityDescription: statusButtonAccessibilityLabel
+            ) else { return applicationStatusImage() }
+            let configured = symbol.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+            ) ?? symbol
+            configured.size = NSSize(width: 18, height: 18)
+            configured.isTemplate = true
+            return configured
+        }
+    }
+
+    private func applicationStatusImage() -> NSImage {
         if let path = Bundle.main.path(forResource: "statusbar-matched", ofType: "png"),
            let image = NSImage(contentsOfFile: path) {
             image.size = NSSize(width: 18, height: 18)
@@ -303,6 +499,48 @@ final class StatusMenuController: NSObject {
         NSColor.white.setFill()
         for (x, height) in [(4.6, 5.0), (7.2, 9.4), (9.8, 6.7), (12.4, 10.4)] {
             NSBezierPath(roundedRect: NSRect(x: x, y: 4.3, width: 1.3, height: height), xRadius: 0.65, yRadius: 0.65).fill()
+        }
+        image.unlockFocus()
+        image.isTemplate = true
+        return image
+    }
+
+    private func waveformImage() -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 18))
+        image.lockFocus()
+        NSColor.white.setFill()
+        let levels = statusButtonWaveformLevels.map { min(1, max(0, $0)) }
+        if levels.allSatisfy({ $0 == 0 }) {
+            NSBezierPath(roundedRect: NSRect(x: 1.5, y: 8.5, width: 15, height: 1), xRadius: 0.5, yRadius: 0.5).fill()
+        } else {
+            for index in 0..<5 {
+                let height = levels[index] * 14.0
+                let x = 1.5 + Double(index) * 3.2
+                let y = (18.0 - height) / 2
+                NSBezierPath(
+                    roundedRect: NSRect(x: x, y: y, width: 2.2, height: height),
+                    xRadius: 1.1,
+                    yRadius: 1.1
+                ).fill()
+            }
+        }
+        image.unlockFocus()
+        image.isTemplate = true
+        return image
+    }
+
+    private func connectingImage() -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 18))
+        image.lockFocus()
+        if let microphone = NSImage(
+            systemSymbolName: "mic.fill",
+            accessibilityDescription: statusButtonAccessibilityLabel
+        )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)) {
+            microphone.draw(in: NSRect(x: 0, y: 0, width: 15, height: 15))
+        }
+        NSColor.white.setFill()
+        for x in [12.0, 14.0, 16.0] {
+            NSBezierPath(ovalIn: NSRect(x: x, y: 3.0, width: 1.2, height: 1.2)).fill()
         }
         image.unlockFocus()
         image.isTemplate = true

@@ -23,6 +23,26 @@ enum TencentEnginePreset: String, CaseIterable, Sendable {
     }
 }
 
+enum MenuBarDisplayMode: String, CaseIterable, Sendable {
+    case icon
+    case timer
+    case waveform
+
+    static let defaultMode: Self = .timer
+
+    var displayName: String {
+        switch self {
+        case .icon: "录音图标"
+        case .timer: "录音计时"
+        case .waveform: "音量波形"
+        }
+    }
+
+    init(persistedValue: String?) {
+        self = persistedValue.flatMap(Self.init(rawValue:)) ?? Self.defaultMode
+    }
+}
+
 protocol SettingsStore: AnyObject {
     func load() -> AppSettings
     func save(_ settings: AppSettings)
@@ -34,6 +54,7 @@ struct AppSettings: Codable, Equatable, Sendable {
     var saveTextLogs: Bool
     var alwaysSaveVoiceContent: Bool
     var hideMenuBarIcon: Bool
+    var menuBarDisplayMode: MenuBarDisplayMode
     var captureDiagnosticWindowFrames: Bool
     var prepaidQuotaHoursByModel: [String: Int]
 
@@ -44,6 +65,7 @@ struct AppSettings: Codable, Equatable, Sendable {
         case alwaysSaveVoiceContent
         case legacySafeCopyEnabled = "safeCopyEnabled"
         case hideMenuBarIcon
+        case menuBarDisplayMode
         case captureDiagnosticWindowFrames
         case prepaidQuotaHoursByModel
     }
@@ -54,6 +76,7 @@ struct AppSettings: Codable, Equatable, Sendable {
         saveTextLogs: Bool = false,
         alwaysSaveVoiceContent: Bool = false,
         hideMenuBarIcon: Bool = false,
+        menuBarDisplayMode: MenuBarDisplayMode = .defaultMode,
         captureDiagnosticWindowFrames: Bool = false,
         prepaidQuotaHoursByModel: [String: Int] = [:]
     ) {
@@ -62,6 +85,7 @@ struct AppSettings: Codable, Equatable, Sendable {
         self.saveTextLogs = saveTextLogs
         self.alwaysSaveVoiceContent = alwaysSaveVoiceContent
         self.hideMenuBarIcon = hideMenuBarIcon
+        self.menuBarDisplayMode = menuBarDisplayMode
         self.captureDiagnosticWindowFrames = captureDiagnosticWindowFrames
         self.prepaidQuotaHoursByModel = prepaidQuotaHoursByModel
     }
@@ -75,6 +99,8 @@ struct AppSettings: Codable, Equatable, Sendable {
             ?? container.decodeIfPresent(Bool.self, forKey: .legacySafeCopyEnabled)
             ?? false
         hideMenuBarIcon = try container.decodeIfPresent(Bool.self, forKey: .hideMenuBarIcon) ?? false
+        let persistedDisplayMode = try? container.decode(String.self, forKey: .menuBarDisplayMode)
+        menuBarDisplayMode = MenuBarDisplayMode(persistedValue: persistedDisplayMode)
         captureDiagnosticWindowFrames = try container.decodeIfPresent(
             Bool.self,
             forKey: .captureDiagnosticWindowFrames
@@ -92,6 +118,7 @@ struct AppSettings: Codable, Equatable, Sendable {
         try container.encode(saveTextLogs, forKey: .saveTextLogs)
         try container.encode(alwaysSaveVoiceContent, forKey: .alwaysSaveVoiceContent)
         try container.encode(hideMenuBarIcon, forKey: .hideMenuBarIcon)
+        try container.encode(menuBarDisplayMode.rawValue, forKey: .menuBarDisplayMode)
         try container.encode(captureDiagnosticWindowFrames, forKey: .captureDiagnosticWindowFrames)
         try container.encode(prepaidQuotaHoursByModel, forKey: .prepaidQuotaHoursByModel)
     }

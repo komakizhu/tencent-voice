@@ -4,6 +4,86 @@ import XCTest
 @testable import TencentVoiceMVP
 
 final class AudioCaptureTests: XCTestCase {
+    func testLevelArrivesBeforeChunkAndObserverDoesNotChangeRecognizedPCM() async throws {
+        let measuredEngine = FakeAudioEngineAdapter(format: makeFormat(sampleRate: 48_000))
+        let measuredCapture = SystemAudioCapture(engineFactory: { measuredEngine })
+        let measuredChunks = LockedDataBox()
+        let levels = LockedAudioLevelBox()
+        try await measuredCapture.start(
+            sessionID: UUID(),
+            onChunk: { measuredChunks.append($0) },
+            onLevel: { levels.append($0) },
+            onEvent: { _ in }
+        )
+        measuredEngine.emitBuffer(frameCount: 4_800, sampleValue: 0.02)
+        await settleAudioCapture()
+
+        XCTAssertEqual(levels.values.count, 1)
+        let observedLevel = try XCTUnwrap(levels.values.first)
+        XCTAssertEqual(observedLevel.rms, 0.02, accuracy: 0.000_02)
+        XCTAssertGreaterThan(observedLevel.durationSeconds, 0)
+        XCTAssertLessThan(observedLevel.durationSeconds, 0.2)
+        XCTAssertGreaterThan(observedLevel.timestampUptimeNanoseconds, 0)
+        XCTAssertEqual(measuredChunks.totalCount, 0, "小于识别分片的声音也应先更新音量")
+        measuredCapture.stop()
+        let expectedOutputBytes = Int((observedLevel.durationSeconds * 16_000).rounded()) * 2
+
+        let plainEngine = FakeAudioEngineAdapter(format: makeFormat(sampleRate: 48_000))
+        let plainCapture = SystemAudioCapture(engineFactory: { plainEngine })
+        let plainChunks = LockedDataBox()
+        try await plainCapture.start(
+            sessionID: UUID(),
+            onChunk: { plainChunks.append($0) },
+            onEvent: { _ in }
+        )
+        plainEngine.emitBuffer(frameCount: 4_800, sampleValue: 0.02)
+        await settleAudioCapture()
+        plainCapture.stop()
+
+        XCTAssertEqual(measuredChunks.dataSnapshot(), plainChunks.dataSnapshot())
+        XCTAssertEqual(measuredChunks.totalCount, expectedOutputBytes)
+    }
+
+    func testLevelObservationPreservesFullChunkBoundariesAndOrder() async throws {
+        func captureChunks(observeLevels: Bool) async throws -> [Data] {
+            let engine = FakeAudioEngineAdapter(format: makeFormat(sampleRate: 48_000))
+            let capture = SystemAudioCapture(engineFactory: { engine })
+            let chunks = LockedChunksBox()
+            let levels = LockedAudioLevelBox()
+            if observeLevels {
+                try await capture.start(
+                    sessionID: UUID(),
+                    onChunk: { chunks.append($0) },
+                    onLevel: { levels.append($0) },
+                    onEvent: { _ in }
+                )
+            } else {
+                try await capture.start(
+                    sessionID: UUID(),
+                    onChunk: { chunks.append($0) },
+                    onEvent: { _ in }
+                )
+            }
+            for _ in 0..<6 {
+                engine.emitBuffer(frameCount: 4_800, sampleValue: 0.03)
+            }
+            await settleAudioCapture()
+            capture.stop()
+            if observeLevels { XCTAssertEqual(levels.values.count, 6) }
+            return chunks.values
+        }
+
+        let observed = try await captureChunks(observeLevels: true)
+        let plain = try await captureChunks(observeLevels: false)
+        XCTAssertEqual(observed, plain)
+        XCTAssertGreaterThanOrEqual(observed.count, 2)
+        XCTAssertEqual(observed.first?.count, 6_400)
+        XCTAssertTrue(observed.dropLast().allSatisfy { $0.count == 6_400 })
+        let finalChunk = try XCTUnwrap(observed.last)
+        XCTAssertGreaterThan(finalChunk.count, 0)
+        XCTAssertLessThanOrEqual(finalChunk.count, 6_400)
+    }
+
     func testInitialCaptureUsesNilTapAndConverts24KHz() async throws {
         let first = FakeAudioEngineAdapter(format: makeFormat(sampleRate: 24_000))
         let factory = AudioEngineFactoryBox(adapters: [first])
@@ -350,16 +430,17 @@ private final class FakeAudioEngineAdapter: AudioEngineAdapter {
         onConfigurationChange?()
     }
 
-    func emitBuffer(frameCount: AVAudioFrameCount) {
-        emitBuffer(frameCount: frameCount, using: tapHandler)
+    func emitBuffer(frameCount: AVAudioFrameCount, sampleValue: Float = 0) {
+        emitBuffer(frameCount: frameCount, sampleValue: sampleValue, using: tapHandler)
     }
 
     func emitStaleBuffer(frameCount: AVAudioFrameCount) {
-        emitBuffer(frameCount: frameCount, using: staleTapHandler)
+        emitBuffer(frameCount: frameCount, sampleValue: 0, using: staleTapHandler)
     }
 
     private func emitBuffer(
         frameCount: AVAudioFrameCount,
+        sampleValue: Float,
         using handler: ((AVAudioPCMBuffer) -> Void)?
     ) {
         guard let buffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: frameCount) else {
@@ -367,6 +448,13 @@ private final class FakeAudioEngineAdapter: AudioEngineAdapter {
             return
         }
         buffer.frameLength = frameCount
+        if let channels = buffer.floatChannelData {
+            for channel in 0..<Int(inputFormat.channelCount) {
+                for index in 0..<Int(frameCount) {
+                    channels[channel][index] = sampleValue
+                }
+            }
+        }
         handler?(buffer)
     }
 }
@@ -437,9 +525,49 @@ private final class LockedDataBox: @unchecked Sendable {
         return data.count
     }
 
+    func dataSnapshot() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return data
+    }
+
     func append(_ value: Data) {
         lock.lock()
         data.append(value)
+        lock.unlock()
+    }
+}
+
+private final class LockedAudioLevelBox: @unchecked Sendable {
+    private var storedValues: [AudioCaptureLevel] = []
+    private let lock = NSLock()
+
+    var values: [AudioCaptureLevel] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValues
+    }
+
+    func append(_ value: AudioCaptureLevel) {
+        lock.lock()
+        storedValues.append(value)
+        lock.unlock()
+    }
+}
+
+private final class LockedChunksBox: @unchecked Sendable {
+    private var storedValues: [Data] = []
+    private let lock = NSLock()
+
+    var values: [Data] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValues
+    }
+
+    func append(_ value: Data) {
+        lock.lock()
+        storedValues.append(value)
         lock.unlock()
     }
 }

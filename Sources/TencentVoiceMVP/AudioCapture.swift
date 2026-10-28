@@ -79,7 +79,52 @@ protocol AudioCapture: AnyObject {
         onChunk: @escaping @Sendable (Data) -> Void,
         onEvent: @escaping @Sendable (AudioCaptureEvent) -> Void
     ) async throws
+    func start(
+        sessionID: UUID,
+        onChunk: @escaping @Sendable (Data) -> Void,
+        onLevel: @escaping @Sendable (AudioCaptureLevel) -> Void,
+        onEvent: @escaping @Sendable (AudioCaptureEvent) -> Void
+    ) async throws
     func stop()
+}
+
+extension AudioCapture {
+    func start(
+        sessionID: UUID,
+        onChunk: @escaping @Sendable (Data) -> Void,
+        onLevel: @escaping @Sendable (AudioCaptureLevel) -> Void,
+        onEvent: @escaping @Sendable (AudioCaptureEvent) -> Void
+    ) async throws {
+        // Keep older and test audio engines source-compatible. Captures that
+        // can observe levels override this entry point.
+        try await start(sessionID: sessionID, onChunk: onChunk, onEvent: onEvent)
+    }
+}
+
+struct AudioCaptureLevel: Equatable, Sendable {
+    let rms: Double
+    let durationSeconds: TimeInterval
+    let timestampUptimeNanoseconds: UInt64
+}
+
+enum AudioCaptureLevelMeasurement {
+    static func rms(in pcm: Data) -> Double {
+        let sampleCount = pcm.count / MemoryLayout<Int16>.size
+        guard sampleCount > 0 else { return 0 }
+        let sumOfSquares = pcm.withUnsafeBytes { bytes -> Double in
+            var sum = 0.0
+            for index in 0..<sampleCount {
+                let sample = Int16(littleEndian: bytes.loadUnaligned(
+                    fromByteOffset: index * MemoryLayout<Int16>.size,
+                    as: Int16.self
+                ))
+                let normalized = Double(sample) / 32_768
+                sum += normalized * normalized
+            }
+            return sum
+        }
+        return sqrt(sumOfSquares / Double(sampleCount))
+    }
 }
 
 protocol AudioEngineAdapter: AnyObject {
@@ -235,6 +280,7 @@ final class SystemAudioCapture: AudioCapture, @unchecked Sendable {
     private var converterInputFormat: AudioCaptureFormat?
     private var chunker = PCMChunker()
     private var onChunk: (@Sendable (Data) -> Void)?
+    private var onLevel: (@Sendable (AudioCaptureLevel) -> Void)?
     private var onEvent: (@Sendable (AudioCaptureEvent) -> Void)?
     private var sessionID: UUID?
     private var generation: UInt64 = 0
@@ -273,6 +319,15 @@ final class SystemAudioCapture: AudioCapture, @unchecked Sendable {
         onChunk: @escaping @Sendable (Data) -> Void,
         onEvent: @escaping @Sendable (AudioCaptureEvent) -> Void
     ) async throws {
+        try await start(sessionID: sessionID, onChunk: onChunk, onLevel: { _ in }, onEvent: onEvent)
+    }
+
+    func start(
+        sessionID: UUID,
+        onChunk: @escaping @Sendable (Data) -> Void,
+        onLevel: @escaping @Sendable (AudioCaptureLevel) -> Void,
+        onEvent: @escaping @Sendable (AudioCaptureEvent) -> Void
+    ) async throws {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 guard self.phase == .idle else {
@@ -281,6 +336,7 @@ final class SystemAudioCapture: AudioCapture, @unchecked Sendable {
                 }
                 self.sessionID = sessionID
                 self.onChunk = onChunk
+                self.onLevel = onLevel
                 self.onEvent = onEvent
                 self.generation &+= 1
                 do {
@@ -476,6 +532,13 @@ final class SystemAudioCapture: AudioCapture, @unchecked Sendable {
 
         let byteCount = Int(outputBuffer.frameLength) * MemoryLayout<Int16>.size
         let data = Data(bytes: samples, count: byteCount)
+        if let onLevel {
+            onLevel(AudioCaptureLevel(
+                rms: AudioCaptureLevelMeasurement.rms(in: data),
+                durationSeconds: Double(outputBuffer.frameLength) / outputFormat.sampleRate,
+                timestampUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+            ))
+        }
         for chunk in chunker.append(data) {
             onChunk?(chunk)
         }
@@ -490,6 +553,7 @@ final class SystemAudioCapture: AudioCapture, @unchecked Sendable {
         phase = .idle
         emit(.failed(error))
         onChunk = nil
+        onLevel = nil
         onEvent = nil
         sessionID = nil
     }
@@ -513,6 +577,7 @@ final class SystemAudioCapture: AudioCapture, @unchecked Sendable {
         tearDownEngine(flush: flush)
         phase = .idle
         onChunk = nil
+        onLevel = nil
         onEvent = nil
         sessionID = nil
         recoveryStartedAt = nil
