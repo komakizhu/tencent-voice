@@ -1,7 +1,7 @@
 import AVFoundation
 import Foundation
 
-enum SessionState: Equatable {
+enum SessionState: Equatable, Sendable {
     case idle
     case connecting
     case listening
@@ -164,7 +164,7 @@ final class SessionCoordinator: SessionCoordinating {
                 sessionID: id,
                 onChunk: { [weak self, weak buffer] chunk in
                 guard let buffer else { return }
-                progress.captured(byteCount: chunk.count)
+                progress.captured(pcm: chunk)
                 forwarder.submit { [weak self, weak buffer] in
                     guard let buffer else { return }
                     do {
@@ -173,6 +173,9 @@ final class SessionCoordinator: SessionCoordinating {
                         await self?.handleAudioError(error, sessionID: id)
                     }
                 }
+                },
+                onLevel: { level in
+                    progress.observed(level: level)
                 },
                 onEvent: { [weak self] event in
                     Task { @MainActor [weak self] in
@@ -184,6 +187,8 @@ final class SessionCoordinator: SessionCoordinating {
             guard sessionID == id,
                   state == .connecting || state == .recovering || state == .listening
             else { throw SessionError.cancelled }
+            progress.setCapturing(true)
+            stateObserver?(state)
 
             let stream = try await asr.start(configuration: configuration)
             log(event: "asr_started")
@@ -244,6 +249,15 @@ final class SessionCoordinator: SessionCoordinating {
         stateObserver = observer
     }
 
+    func recordingDisplaySnapshot() -> RecordingDisplaySnapshot {
+        RecordingDisplaySnapshot(
+            sessionID: sessionID,
+            state: state,
+            audio: audioProgress?.captureMetrics() ?? .empty,
+            isCapturing: audioProgress?.captureState() ?? false
+        )
+    }
+
     func refreshDiagnosticCollectionSettings() {
         (textTarget as? AXTextTarget)?.refreshDiagnosticCollectionSettings()
     }
@@ -274,6 +288,10 @@ final class SessionCoordinator: SessionCoordinating {
         let currentAudioForwarder = audioForwarder
         audio.stop()
         log(event: "audio_capture_stop_requested")
+        audioProgress?.setCapturing(false)
+        // AudioCapture.stop() synchronously flushes the final partial PCM chunk.
+        // Publish the refreshed counters while the finalizing state is still visible.
+        stateObserver?(state)
         currentAudioForwarder?.stopAccepting()
         await currentAudioForwarder?.drain()
         log(event: "audio_capture_drained")
@@ -335,6 +353,7 @@ final class SessionCoordinator: SessionCoordinating {
         logAudioProgress()
         audioForwarder?.cancel()
         audio.stop()
+        audioProgress?.setCapturing(false)
         asr.cancel()
         eventTask?.cancel()
         eventTask = nil
@@ -399,6 +418,7 @@ final class SessionCoordinator: SessionCoordinating {
         asrFinalizationPhase = .hardStopped
         audioForwarder?.cancel()
         audio.stop()
+        audioProgress?.setCapturing(false)
         asr.cancel()
         errorCount += 1
         log(event: "error", error: error)
@@ -428,8 +448,12 @@ final class SessionCoordinator: SessionCoordinating {
         case let .interrupted(previousFormat):
             guard state == .connecting || state == .listening || state == .recovering else { return }
             audioRecovering = true
+            audioProgress?.setCapturing(false)
+            audioProgress?.resetWaveformWindow()
             if state != .recovering {
                 setState(.recovering)
+            } else {
+                stateObserver?(state)
             }
             log(
                 event: "audio_capture_interrupted",
@@ -440,8 +464,12 @@ final class SessionCoordinator: SessionCoordinating {
         case let .recovering(attempt):
             guard state == .connecting || state == .listening || state == .recovering else { return }
             audioRecovering = true
+            audioProgress?.setCapturing(false)
+            audioProgress?.resetWaveformWindow()
             if state != .recovering {
                 setState(.recovering)
+            } else {
+                stateObserver?(state)
             }
             log(
                 event: "audio_capture_recovery_attempt",
@@ -451,8 +479,11 @@ final class SessionCoordinator: SessionCoordinating {
         case let .recovered(format, durationNanoseconds):
             guard state == .recovering else { return }
             audioRecovering = false
+            audioProgress?.setCapturing(true)
             if asrReady {
                 setState(.listening)
+            } else {
+                stateObserver?(state)
             }
             var metadata = format.metadata
             metadata["duration_ms"] = String(durationNanoseconds / 1_000_000)

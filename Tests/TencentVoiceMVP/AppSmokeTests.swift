@@ -83,6 +83,265 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertNil(menu.items.first { $0.title == "停止录音" })
     }
 
+    func testStatusMenuDisplaysSelectedRecordingModeAndResetsWhenIdle() {
+        let controller = StatusMenuController()
+        let menu = controller.makeMenu()
+        let now = DispatchTime.now().uptimeNanoseconds
+        var snapshot = RecordingDisplaySnapshot(
+            sessionID: UUID(),
+            state: .listening,
+            audio: AudioCaptureMetricsSnapshot(
+                durationSeconds: 61.9,
+                latestRMS: 0.5,
+                sampleSequence: 1,
+                latestLevelAtUptimeNanoseconds: now,
+                latestLevelDurationSeconds: 0.2
+            ),
+            isCapturing: true
+        )
+        controller.configureRecordingDisplay { snapshot }
+
+        controller.update(menuBarDisplayMode: .timer)
+        controller.update(recordingState: .listening)
+        XCTAssertEqual(controller.statusButtonTitle, "01:01")
+        XCTAssertTrue(controller.statusButtonAccessibilityLabel.contains("已录 01:01"))
+        XCTAssertEqual(menu.items.first { $0.title == "停止录音" }?.title, "停止录音")
+
+        controller.update(menuBarDisplayMode: .waveform)
+        XCTAssertEqual(controller.statusButtonWaveformLevels, Array(repeating: 0, count: 5))
+        XCTAssertEqual(controller.statusButtonAccessibilityLabel, "正在录音，显示麦克风输入音量")
+
+        snapshot = RecordingDisplaySnapshot(
+            sessionID: snapshot.sessionID,
+            state: .stopping,
+            audio: snapshot.audio,
+            isCapturing: false
+        )
+        controller.update(recordingState: .stopping)
+        XCTAssertEqual(menu.items.first { $0.title == "收尾中…" }?.title, "收尾中…")
+        XCTAssertFalse(menu.items.first { $0.title == "收尾中…" }?.isEnabled ?? true)
+        controller.update(menuBarDisplayMode: .timer)
+        XCTAssertEqual(controller.statusButtonImageStyle, .none)
+        XCTAssertEqual(controller.statusButtonTitle, "01:01")
+
+        XCTAssertEqual(StatusMenuController.formattedDuration(3_599.99), "59:59")
+        XCTAssertEqual(StatusMenuController.formattedDuration(3_600), "1:00:00")
+        snapshot = RecordingDisplaySnapshot(sessionID: nil, state: .idle, audio: .empty)
+        controller.update(recordingState: .idle)
+        XCTAssertEqual(controller.statusButtonTitle, "")
+        XCTAssertEqual(controller.statusButtonAccessibilityLabel, "Rime Voice，已就绪")
+        XCTAssertEqual(menu.items.first { $0.title == "开始录音" }?.title, "开始录音")
+    }
+
+    func testStatusPresentationKeepsTimerIconAndWaveformShapesDistinct() {
+        let timer = StatusButtonPresentation.make(
+            mode: .timer, state: .listening, isCapturing: true, duration: 61.9
+        )
+        XCTAssertEqual(timer.title, "01:01")
+        XCTAssertEqual(timer.imageStyle, .none)
+
+        let connectingBeforeCapture = StatusButtonPresentation.make(
+            mode: .timer, state: .connecting, isCapturing: false, duration: 0
+        )
+        XCTAssertEqual(connectingBeforeCapture.title, "")
+        XCTAssertEqual(connectingBeforeCapture.imageStyle, .application)
+        XCTAssertTrue(connectingBeforeCapture.toolTip.contains("准备录音中"))
+        let connectingWhileCapturing = StatusButtonPresentation.make(
+            mode: .timer, state: .connecting, isCapturing: true, duration: 0
+        )
+        XCTAssertEqual(connectingWhileCapturing.title, "00:00")
+        XCTAssertEqual(connectingWhileCapturing.imageStyle, .none)
+
+        let circleIdle = StatusButtonPresentation.make(
+            mode: .icon, state: .connecting, isCapturing: false, duration: 0
+        )
+        let circleRecording = StatusButtonPresentation.make(
+            mode: .icon, state: .connecting, isCapturing: true, duration: 0
+        )
+        let circleRecovering = StatusButtonPresentation.make(
+            mode: .icon, state: .recovering, isCapturing: false, duration: 1
+        )
+        let circleStopping = StatusButtonPresentation.make(
+            mode: .icon, state: .stopping, isCapturing: false, duration: 1
+        )
+        let circleStoppingCaptureActive = StatusButtonPresentation.make(
+            mode: .icon, state: .stopping, isCapturing: true, duration: 1
+        )
+        XCTAssertEqual(circleIdle.imageStyle, .application)
+        XCTAssertEqual(circleRecording.imageStyle, .symbol("record.circle.fill"))
+        XCTAssertEqual(circleRecovering.imageStyle, .application)
+        XCTAssertEqual(circleStopping.imageStyle, .application)
+        XCTAssertEqual(circleStoppingCaptureActive.imageStyle, .symbol("record.circle.fill"))
+
+        XCTAssertEqual(StatusButtonPresentation.make(
+            mode: .waveform, state: .listening, isCapturing: true, duration: 1
+        ).imageStyle, .waveform)
+        XCTAssertEqual(StatusButtonPresentation.make(
+            mode: .waveform, state: .connecting, isCapturing: false, duration: 0
+        ).imageStyle, .application)
+        XCTAssertEqual(StatusButtonPresentation.make(
+            mode: .waveform, state: .connecting, isCapturing: true, duration: 0
+        ).imageStyle, .symbol("mic.waiting"))
+        XCTAssertEqual(StatusButtonPresentation.make(
+            mode: .waveform, state: .recovering, isCapturing: false, duration: 1
+        ).imageStyle, .symbol("mic.slash.fill"))
+        XCTAssertEqual(StatusButtonPresentation.make(
+            mode: .waveform, state: .stopping, isCapturing: false, duration: 1
+        ).imageStyle, .symbol("hourglass"))
+        XCTAssertEqual(StatusButtonPresentation.make(
+            mode: .waveform, state: .error("failure"), isCapturing: false, duration: 0
+        ).imageStyle, .symbol("exclamationmark.triangle.fill"))
+    }
+
+    func testWaveformGateGainAttackReleaseAndStaleResetAreDeterministic() {
+        XCTAssertEqual(WaveformDisplayModel.amplitude(forRMS: 0.005), 0)
+        XCTAssertEqual(WaveformDisplayModel.amplitude(forRMS: 0.008), 0.291, accuracy: 0.015)
+        XCTAssertLessThan(
+            WaveformDisplayModel.amplitude(forRMS: 0.02),
+            WaveformDisplayModel.amplitude(forRMS: 0.05)
+        )
+        XCTAssertEqual(WaveformDisplayModel.amplitude(forRMS: 1), 1)
+
+        let sessionID = UUID()
+        var model = WaveformDisplayModel()
+        let loud = makeDisplaySnapshot(
+            sessionID: sessionID, rms: 0.05, sequence: 1, timestamp: 0, duration: 0.1
+        )
+        let initial = model.update(snapshot: loud, now: 0)
+        XCTAssertEqual(initial, Array(repeating: 0, count: 5))
+        let afterAttack = model.update(snapshot: loud, now: 100_000_000)
+        XCTAssertGreaterThanOrEqual(afterAttack[2], WaveformDisplayModel.amplitude(forRMS: 0.05) * 0.99)
+        XCTAssertGreaterThan(afterAttack[0] / afterAttack[2], 0.36)
+        XCTAssertLessThan(afterAttack[0] / afterAttack[2], 0.38)
+        XCTAssertGreaterThan(afterAttack[1] / afterAttack[2], 0.73)
+        XCTAssertLessThan(afterAttack[1] / afterAttack[2], 0.74)
+        XCTAssertEqual(afterAttack[0], afterAttack[4])
+        XCTAssertEqual(afterAttack[1], afterAttack[3])
+
+        let quiet = makeDisplaySnapshot(
+            sessionID: sessionID, rms: 0.005, sequence: 2, timestamp: 100_000_000, duration: 0.1
+        )
+        _ = model.update(snapshot: quiet, now: 100_000_000)
+        let afterSilence = model.update(snapshot: quiet, now: 250_000_000)
+        XCTAssertEqual(afterSilence, Array(repeating: 0, count: 5))
+
+        let loudAgain = makeDisplaySnapshot(
+            sessionID: sessionID, rms: 0.2, sequence: 3, timestamp: 300_000_000, duration: 0.1
+        )
+        _ = model.update(snapshot: loudAgain, now: 300_000_000)
+        XCTAssertGreaterThan(model.update(snapshot: loudAgain, now: 350_000_000)[2], 0)
+        let stale = model.update(snapshot: loudAgain, now: 600_000_001)
+        XCTAssertEqual(stale, Array(repeating: 0, count: 5))
+
+        let interrupted = RecordingDisplaySnapshot(
+            sessionID: sessionID, state: .recovering, audio: loudAgain.audio, isCapturing: false
+        )
+        XCTAssertEqual(model.update(snapshot: interrupted, now: 610_000_000), Array(repeating: 0, count: 5))
+    }
+
+    func testAggressiveWaveformEndsMoveWithVolumeAndContinuousSilenceClearsAllBars() {
+        let sessionID = UUID()
+        var model = WaveformDisplayModel()
+        let weak = makeDisplaySnapshot(
+            sessionID: sessionID, rms: 0.02, sequence: 1, timestamp: 0, duration: 0.1
+        )
+        _ = model.update(snapshot: weak, now: 0)
+        let weakLevels = model.update(snapshot: weak, now: 100_000_000)
+        let strong = makeDisplaySnapshot(
+            sessionID: sessionID, rms: 0.1, sequence: 2, timestamp: 150_000_000, duration: 0.1
+        )
+        let strongLevels = model.update(snapshot: strong, now: 200_000_000)
+        XCTAssertEqual(strongLevels.count, 5)
+        for index in 0..<5 {
+            XCTAssertGreaterThan(strongLevels[index], weakLevels[index])
+        }
+        XCTAssertLessThan(strongLevels[0], strongLevels[1])
+        XCTAssertLessThan(strongLevels[1], strongLevels[2])
+
+        // Frequent quiet input must not keep restarting the silence deadline.
+        var quietLevels: [Double] = []
+        for step in 0...3 {
+            let time = UInt64(250_000_000 + step * 50_000_000)
+            let quiet = makeDisplaySnapshot(
+                sessionID: sessionID, rms: 0.005, sequence: UInt64(3 + step), timestamp: time, duration: 0.05
+            )
+            quietLevels = model.update(snapshot: quiet, now: time)
+        }
+        XCTAssertEqual(quietLevels, Array(repeating: 0, count: 5))
+
+        let nextSession = makeDisplaySnapshot(
+            sessionID: UUID(), rms: 0.1, sequence: 1, timestamp: 450_000_000, duration: 0.1
+        )
+        XCTAssertEqual(model.update(snapshot: nextSession, now: 450_000_000), Array(repeating: 0, count: 5))
+    }
+
+    func testPCMMeasurementDistinguishesSilenceNoiseWeakAndStrongSignals() {
+        let cases: [(Int16, Double)] = [
+            (0, 0),
+            (164, 164.0 / 32_768),
+            (655, 655.0 / 32_768),
+            (1_638, 1_638.0 / 32_768),
+            (Int16.max, Double(Int16.max) / 32_768)
+        ]
+        var displayedLevels: [Double] = []
+        for (sample, expectedRMS) in cases {
+            var pcm = Data()
+            for _ in 0..<1_600 {
+                let bits = UInt16(bitPattern: sample)
+                pcm.append(UInt8(truncatingIfNeeded: bits))
+                pcm.append(UInt8(truncatingIfNeeded: bits >> 8))
+            }
+            let measuredRMS = AudioCaptureLevelMeasurement.rms(in: pcm)
+            XCTAssertEqual(measuredRMS, expectedRMS, accuracy: 0.000_001)
+            displayedLevels.append(WaveformDisplayModel.amplitude(forRMS: measuredRMS))
+        }
+        XCTAssertEqual(displayedLevels[0], 0)
+        XCTAssertEqual(displayedLevels[1], 0, "RMS 0.005 底噪必须回平")
+        XCTAssertLessThan(displayedLevels[2], displayedLevels[3])
+        XCTAssertEqual(displayedLevels[4], 1)
+    }
+
+    private func makeDisplaySnapshot(
+        sessionID: UUID,
+        rms: Double,
+        sequence: UInt64,
+        timestamp: UInt64,
+        duration: TimeInterval
+    ) -> RecordingDisplaySnapshot {
+        RecordingDisplaySnapshot(
+            sessionID: sessionID,
+            state: .listening,
+            audio: AudioCaptureMetricsSnapshot(
+                durationSeconds: 0.3,
+                latestRMS: rms,
+                sampleSequence: sequence,
+                latestLevelAtUptimeNanoseconds: timestamp,
+                latestLevelDurationSeconds: duration
+            ),
+            isCapturing: true
+        )
+    }
+
+    func testSettingsSavePersistsSelectedMenuBarDisplayMode() throws {
+        var savedSettings: AppSettings?
+        let controller = SettingsWindowController(
+            settings: AppSettings(),
+            credentials: TencentCredentials(appID: "app", secretID: "id", secretKey: "key"),
+            onSave: { settings, _ in savedSettings = settings }
+        )
+        let controls = flatten(controller.window?.contentView)
+        let modePopup = try XCTUnwrap(controls.compactMap { $0 as? NSPopUpButton }.first {
+            $0.itemTitles.contains("音量波形") && $0.itemTitles.contains("录音计时")
+        })
+        XCTAssertEqual(modePopup.itemTitles, ["录音图标", "录音计时", "音量波形"])
+        modePopup.selectItem(withTitle: "音量波形")
+
+        let saveButton = try XCTUnwrap(controls.compactMap { $0 as? NSButton }.first { $0.title == "保存设置" })
+        saveButton.performClick(nil)
+
+        XCTAssertEqual(savedSettings?.menuBarDisplayMode, .waveform)
+    }
+
     func testStatusMenuHasNoSharedSyncStatusRow() {
         let controller = StatusMenuController()
         let menu = controller.makeMenu()
@@ -270,7 +529,7 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertTrue(credentialFields.allSatisfy { !($0.toolTip ?? "").isEmpty })
 
         let popups = flatten(contentView).compactMap { $0 as? NSPopUpButton }
-        XCTAssertEqual(popups.count, 3)
+        XCTAssertEqual(popups.count, 4)
         XCTAssertTrue(popups.allSatisfy { !($0.toolTip ?? "").isEmpty })
         guard let shortcutPresetPopup = popups.first(where: { popup in
             popup.itemArray.contains { $0.title == "F5（屏蔽 macOS 听写）" }

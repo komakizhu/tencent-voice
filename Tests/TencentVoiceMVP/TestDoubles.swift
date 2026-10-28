@@ -259,6 +259,8 @@ final class FakeRealtimeASRClient: RealtimeASRClient {
 final class FakeAudioCapture: AudioCapture {
     private let stateLock = NSLock()
     private var handler: (@Sendable (Data) -> Void)?
+    private var levelHandler: (@Sendable (AudioCaptureLevel) -> Void)?
+    private var previousLevelHandler: (@Sendable (AudioCaptureLevel) -> Void)?
     private var eventHandler: (@Sendable (AudioCaptureEvent) -> Void)?
     private var pendingStarts: [CheckedContinuation<Void, Error>] = []
     private var storedStartCallCount = 0
@@ -273,9 +275,20 @@ final class FakeAudioCapture: AudioCapture {
         onChunk: @escaping @Sendable (Data) -> Void,
         onEvent: @escaping @Sendable (AudioCaptureEvent) -> Void
     ) async throws {
+        try await start(sessionID: sessionID, onChunk: onChunk, onLevel: { _ in }, onEvent: onEvent)
+    }
+
+    func start(
+        sessionID: UUID,
+        onChunk: @escaping @Sendable (Data) -> Void,
+        onLevel: @escaping @Sendable (AudioCaptureLevel) -> Void,
+        onEvent: @escaping @Sendable (AudioCaptureEvent) -> Void
+    ) async throws {
         let shouldHold = holdsStarts
         withStateLock {
             handler = onChunk
+            previousLevelHandler = levelHandler
+            levelHandler = onLevel
             eventHandler = onEvent
             storedLastSessionID = sessionID
             if !shouldHold { storedStartCallCount += 1 }
@@ -301,6 +314,14 @@ final class FakeAudioCapture: AudioCapture {
 
     func emit(_ event: AudioCaptureEvent) {
         withStateLock { eventHandler }?(event)
+    }
+
+    func emit(_ level: AudioCaptureLevel) {
+        withStateLock { levelHandler }?(level)
+    }
+
+    func emitStale(_ level: AudioCaptureLevel) {
+        withStateLock { previousLevelHandler }?(level)
     }
 
     func releaseNextStart() {

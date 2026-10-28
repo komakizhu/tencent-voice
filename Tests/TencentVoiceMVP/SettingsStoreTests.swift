@@ -32,6 +32,69 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertFalse(settings.alwaysSaveVoiceContent)
         XCTAssertFalse(settings.captureDiagnosticWindowFrames)
         XCTAssertTrue(settings.prepaidQuotaHoursByModel.isEmpty)
+        XCTAssertEqual(settings.menuBarDisplayMode, .timer)
+    }
+
+    func testMenuBarDisplayModesRoundTrip() throws {
+        for mode in MenuBarDisplayMode.allCases {
+            let suiteName = "TencentVoiceMVPTests.\(UUID().uuidString)"
+            let store = UserDefaultsSettingsStore(suiteName: suiteName)
+            store.save(AppSettings(menuBarDisplayMode: mode))
+            XCTAssertEqual(store.load().menuBarDisplayMode, mode)
+        }
+    }
+
+    func testUnknownMenuBarDisplayModeDefaultsWithoutLosingOtherSettings() throws {
+        let data = Data("""
+        {
+            "shortcut": {"keyCode": 29, "modifiers": 1048576},
+            "engineModelType": "16k_zh_en",
+            "saveTextLogs": true,
+            "menuBarDisplayMode": "future-mode",
+            "hideMenuBarIcon": true
+        }
+        """.utf8)
+
+        let settings = try JSONDecoder().decode(AppSettings.self, from: data)
+        XCTAssertEqual(settings.menuBarDisplayMode, .timer)
+        XCTAssertTrue(settings.saveTextLogs)
+        XCTAssertTrue(settings.hideMenuBarIcon)
+        XCTAssertEqual(settings.engineModelType, "16k_zh_en")
+    }
+
+    func testLegacySettingsWithoutMenuBarDisplayModeUseTimerAndKeepOtherValues() throws {
+        let data = Data("""
+        {
+            "shortcut": {"keyCode": 29, "modifiers": 1048576},
+            "engineModelType": "16k_zh_en",
+            "saveTextLogs": true,
+            "hideMenuBarIcon": true
+        }
+        """.utf8)
+
+        let settings = try JSONDecoder().decode(AppSettings.self, from: data)
+        XCTAssertEqual(settings.menuBarDisplayMode, .timer)
+        XCTAssertTrue(settings.saveTextLogs)
+        XCTAssertTrue(settings.hideMenuBarIcon)
+        XCTAssertEqual(settings.engineModelType, "16k_zh_en")
+    }
+
+    func testMalformedMenuBarDisplayModeDefaultsWithoutResettingSettings() throws {
+        let data = Data("""
+        {
+            "shortcut": {"keyCode": 29, "modifiers": 1048576},
+            "engineModelType": "16k_zh_en_2.0",
+            "saveTextLogs": true,
+            "menuBarDisplayMode": 42,
+            "hideMenuBarIcon": true
+        }
+        """.utf8)
+
+        let settings = try JSONDecoder().decode(AppSettings.self, from: data)
+        XCTAssertEqual(settings.menuBarDisplayMode, .timer)
+        XCTAssertTrue(settings.saveTextLogs)
+        XCTAssertTrue(settings.hideMenuBarIcon)
+        XCTAssertEqual(settings.engineModelType, "16k_zh_en_2.0")
     }
 
     func testLegacyF5MigratesToCommand0OnlyOnce() {

@@ -34,6 +34,91 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertFalse(progress.metadata.values.contains { $0.contains("正文") })
     }
 
+    func testRecordingDisplaySnapshotTracksRecoveryStopAndFreshSessionState() async throws {
+        let asr = FakeRealtimeASRClient()
+        let audio = FakeAudioCapture()
+        let coordinator = makeCoordinator(asr: asr, audio: audio, target: FakeTextTarget(text: ""))
+        try await coordinator.begin()
+        let sessionID = try XCTUnwrap(coordinator.recordingDisplaySnapshot().sessionID)
+        XCTAssertTrue(coordinator.recordingDisplaySnapshot().isCapturing)
+
+        audio.emit(Data(repeating: 0x40, count: 3_200))
+        audio.emit(AudioCaptureLevel(rms: 0.5, durationSeconds: 0.1, timestampUptimeNanoseconds: 10))
+        let captured = coordinator.recordingDisplaySnapshot()
+        XCTAssertEqual(captured.state, .listening)
+        XCTAssertEqual(captured.audio.durationSeconds, 0.1, accuracy: 0.000_001)
+        XCTAssertEqual(captured.audio.sampleSequence, 1)
+
+        audio.emit(AudioCaptureEvent(
+            sessionID: sessionID,
+            kind: .interrupted(previousFormat: nil)
+        ))
+        await settleCoordinator()
+        let recovering = coordinator.recordingDisplaySnapshot()
+        XCTAssertEqual(recovering.state, .recovering)
+        XCTAssertFalse(recovering.isCapturing)
+        XCTAssertEqual(recovering.audio.durationSeconds, captured.audio.durationSeconds)
+        XCTAssertEqual(recovering.audio.latestRMS, 0)
+        XCTAssertNil(recovering.audio.latestLevelAtUptimeNanoseconds)
+
+        audio.emit(AudioCaptureEvent(
+            sessionID: sessionID,
+            kind: .recovered(
+                format: AudioCaptureFormat(sampleRate: 16_000, channelCount: 1),
+                durationNanoseconds: 250_000_000
+            )
+        ))
+        await settleCoordinator()
+        XCTAssertEqual(coordinator.recordingDisplaySnapshot().state, .listening)
+        XCTAssertTrue(coordinator.recordingDisplaySnapshot().isCapturing)
+
+        audio.emit(Data(repeating: 0, count: 3_200))
+        audio.emit(AudioCaptureLevel(rms: 0, durationSeconds: 0.1, timestampUptimeNanoseconds: 20))
+        let resumed = coordinator.recordingDisplaySnapshot()
+        XCTAssertEqual(resumed.audio.durationSeconds, 0.2, accuracy: 0.000_001)
+        XCTAssertEqual(resumed.audio.sampleSequence, 3)
+        XCTAssertEqual(resumed.audio.latestRMS, 0)
+        XCTAssertEqual(resumed.audio.latestLevelAtUptimeNanoseconds, 20)
+
+        try await coordinator.end()
+        let ended = coordinator.recordingDisplaySnapshot()
+        XCTAssertNil(ended.sessionID)
+        XCTAssertEqual(ended.state, .idle)
+        XCTAssertFalse(ended.isCapturing)
+        XCTAssertEqual(ended.audio, .empty)
+    }
+
+    func testRecordingDisplayIncludesStopFlushAndResetsForNextSession() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        let audio = FakeAudioCapture()
+        audio.dataToEmitOnStop = Data(repeating: 0x40, count: 6_400)
+        let coordinator = makeCoordinator(asr: asr, audio: audio, target: FakeTextTarget(text: ""))
+        try await coordinator.begin()
+        audio.emit(Data(repeating: 0, count: 3_200))
+
+        let ending = Task { @MainActor in try? await coordinator.end() }
+        await settleCoordinator()
+        audio.dataToEmitOnStop = nil
+        let stopping = coordinator.recordingDisplaySnapshot()
+        XCTAssertEqual(stopping.state, .stopping)
+        XCTAssertFalse(stopping.isCapturing)
+        XCTAssertEqual(stopping.audio.durationSeconds, 0.3, accuracy: 0.000_001)
+
+        asr.finishStream()
+        await ending.value
+        XCTAssertEqual(coordinator.recordingDisplaySnapshot().audio, .empty)
+
+        try await coordinator.begin()
+        let next = coordinator.recordingDisplaySnapshot()
+        XCTAssertNotEqual(next.sessionID, stopping.sessionID)
+        XCTAssertEqual(next.audio.durationSeconds, 0)
+        XCTAssertNil(next.audio.latestLevelAtUptimeNanoseconds)
+        audio.emitStale(AudioCaptureLevel(rms: 0.9, durationSeconds: 0.2, timestampUptimeNanoseconds: 50))
+        XCTAssertNil(coordinator.recordingDisplaySnapshot().audio.latestLevelAtUptimeNanoseconds)
+        coordinator.cancel()
+    }
+
     func testUnexpectedRecognitionEndDoesNotLeaveMicrophoneListening() async throws {
         let asr = FakeRealtimeASRClient()
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
