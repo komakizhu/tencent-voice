@@ -3668,7 +3668,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             if AXTextDocumentResolver.isStaleAXValueBehindSelection(
                 rawText: rawText,
                 selection: selection,
-                confirmedRawText: confirmedKeyboardRawText,
+                confirmedState: confirmedKeyboardState,
                 expectedSelection: pendingKeyboardWrite?.selection
             ) {
                 let key = "retryable:\(rawText.utf16.count):\(selection.location)"
