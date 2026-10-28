@@ -553,6 +553,7 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertTrue(controls.contains { $0.title == "始终保存语音内容" })
         let requiredTooltipTitles = [
             "测试连接",
+            "解锁 API 凭证修改",
             "始终保存语音内容",
             "自动保存诊断日志",
             "故障时采集目标窗口画面（可选）",
@@ -870,6 +871,85 @@ final class AppSmokeTests: XCTestCase {
                 .compactMap { $0 as? NSTextField }
                 .contains { $0.stringValue == "设置已保存" }
         )
+    }
+
+    func testCredentialFieldsRequireUnlockAndSuccessfulSaveLocksThemAgain() throws {
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .authorized },
+            accessibilityStatus: { true },
+            postEventStatus: { true },
+            inputMonitoringStatus: { true }
+        )
+        let original = TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+        var savedCredentials: TencentCredentials?
+        let controller = SettingsWindowController(
+            settings: AppSettings(),
+            credentials: original,
+            onSave: { _, credentials in savedCredentials = credentials },
+            permissionChecker: checker
+        )
+        let controls = flatten(controller.window?.contentView)
+        let credentialFields = ["AppID", "SecretId", "SecretKey"].compactMap { title in
+            controls.compactMap { $0 as? NSTextField }.first { $0.placeholderString == title }
+        }
+        let editCheckbox = try XCTUnwrap(
+            controls.compactMap { $0 as? NSButton }.first { $0.title == "解锁 API 凭证修改" }
+        )
+        let saveButton = try XCTUnwrap(
+            controls.compactMap { $0 as? NSButton }.first { $0.title == "保存设置" }
+        )
+
+        XCTAssertEqual(credentialFields.count, 3)
+        XCTAssertEqual(editCheckbox.state, .off)
+        XCTAssertTrue(credentialFields.allSatisfy { !$0.isEnabled })
+
+        editCheckbox.performClick(nil)
+        XCTAssertTrue(credentialFields.allSatisfy(\.isEnabled))
+        credentialFields.first { $0.placeholderString == "AppID" }?.stringValue = "new-app"
+        credentialFields.first { $0.placeholderString == "SecretId" }?.stringValue = "new-id"
+        credentialFields.first { $0.placeholderString == "SecretKey" }?.stringValue = "new-key"
+        saveButton.performClick(nil)
+
+        XCTAssertEqual(savedCredentials, TencentCredentials(appID: "new-app", secretID: "new-id", secretKey: "new-key"))
+        XCTAssertEqual(editCheckbox.state, .off)
+        XCTAssertTrue(credentialFields.allSatisfy { !$0.isEnabled })
+    }
+
+    func testTurningCredentialEditOffDiscardsUnsavedChanges() throws {
+        let checker = SystemPrivacyPermissionChecker(
+            microphoneStatus: { .authorized },
+            accessibilityStatus: { true },
+            postEventStatus: { true },
+            inputMonitoringStatus: { true }
+        )
+        let original = TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+        var savedCredentials: TencentCredentials?
+        let controller = SettingsWindowController(
+            settings: AppSettings(),
+            credentials: original,
+            onSave: { _, credentials in savedCredentials = credentials },
+            permissionChecker: checker
+        )
+        let controls = flatten(controller.window?.contentView)
+        let appIDField = try XCTUnwrap(
+            controls.compactMap { $0 as? NSTextField }.first { $0.placeholderString == "AppID" }
+        )
+        let editCheckbox = try XCTUnwrap(
+            controls.compactMap { $0 as? NSButton }.first { $0.title == "解锁 API 凭证修改" }
+        )
+        let saveButton = try XCTUnwrap(
+            controls.compactMap { $0 as? NSButton }.first { $0.title == "保存设置" }
+        )
+
+        editCheckbox.performClick(nil)
+        appIDField.stringValue = "unsaved-app"
+        editCheckbox.performClick(nil)
+        XCTAssertEqual(appIDField.stringValue, original.appID)
+
+        saveButton.performClick(nil)
+        XCTAssertEqual(savedCredentials, original)
+        XCTAssertEqual(editCheckbox.state, .off)
+        XCTAssertFalse(appIDField.isEnabled)
     }
 
     func testSettingsWindowSavesSelectedShortcutPreset() throws {
