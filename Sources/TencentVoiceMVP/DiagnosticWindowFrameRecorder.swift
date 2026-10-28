@@ -39,6 +39,7 @@ struct DiagnosticWindowFrameEvidence: Codable, Equatable, Sendable {
     let retainedBytes: Int
     let frames: [DiagnosticWindowFrameReference]
     let archiveStatus: String
+    var stopReason: String? = nil
 
     func replacingArchiveStatus(_ status: String) -> Self {
         Self(
@@ -59,7 +60,8 @@ struct DiagnosticWindowFrameEvidence: Codable, Equatable, Sendable {
             droppedFrameCount: droppedFrameCount,
             retainedBytes: retainedBytes,
             frames: status == "included" ? frames : [],
-            archiveStatus: status
+            archiveStatus: status,
+            stopReason: stopReason
         )
     }
 }
@@ -67,6 +69,28 @@ struct DiagnosticWindowFrameEvidence: Codable, Equatable, Sendable {
 struct DiagnosticWindowFrameSnapshot: Sendable {
     let evidence: DiagnosticWindowFrameEvidence
     let assets: [DiagnosticWindowFrameAsset]
+}
+
+enum DiagnosticWindowFrameVerification {
+    enum FocusState: Equatable {
+        case available
+        case unavailable
+        case windowMismatch
+    }
+
+    static func failureReason(
+        candidateWindowCount: Int,
+        candidateWindowID: UInt32?,
+        expectedWindowID: UInt32,
+        focusState: FocusState,
+        fingerprintMatches: Bool
+    ) -> String? {
+        guard candidateWindowCount == 1 else { return "candidate_window_count_mismatch" }
+        guard candidateWindowID == expectedWindowID else { return "window_identifier_changed" }
+        guard focusState != .unavailable else { return "focused_window_unavailable" }
+        guard focusState != .windowMismatch, fingerprintMatches else { return "window_information_mismatch" }
+        return nil
+    }
 }
 
 enum DiagnosticWindowFrameCapturePolicy {
@@ -140,6 +164,7 @@ private final class DiagnosticWindowFrameBuffer: @unchecked Sendable {
     private var windowID: UInt32?
     private var startedAt: Date?
     private var stoppedAt: Date?
+    private var stopReason: String?
 
     func begin(pid: pid_t, bundleIdentifier: String, windowID: CGWindowID, sessionID: UUID?) {
         lock.lock()
@@ -154,12 +179,14 @@ private final class DiagnosticWindowFrameBuffer: @unchecked Sendable {
         self.windowID = windowID
         startedAt = Date()
         stoppedAt = nil
+        stopReason = nil
     }
 
-    func setStatus(_ status: String, permissionGranted: Bool? = nil, stop: Bool = false) {
+    func setStatus(_ status: String, reason: String? = nil, permissionGranted: Bool? = nil, stop: Bool = false) {
         lock.lock()
         defer { lock.unlock() }
         self.status = status
+        stopReason = reason
         if let permissionGranted { self.permissionGranted = permissionGranted }
         if stop { stoppedAt = Date() }
     }
@@ -202,6 +229,7 @@ private final class DiagnosticWindowFrameBuffer: @unchecked Sendable {
         windowID = nil
         startedAt = nil
         stoppedAt = Date()
+        stopReason = nil
     }
 
     func snapshot(at date: Date) -> DiagnosticWindowFrameSnapshot {
@@ -236,7 +264,8 @@ private final class DiagnosticWindowFrameBuffer: @unchecked Sendable {
                 droppedFrameCount: ring.droppedFrameCount,
                 retainedBytes: ring.retainedBytes,
                 frames: references,
-                archiveStatus: assets.isEmpty ? "not_included" : "included"
+                archiveStatus: assets.isEmpty ? "not_included" : "included",
+                stopReason: stopReason
             ),
             assets: assets
         )
@@ -371,10 +400,23 @@ final class DiagnosticWindowFrameRecorder {
                 stop(status: "target_window_ambiguous")
                 return
             }
-            guard let targetElement,
-                  let focusedWindow = Self.focusedWindowFingerprint(pid: pid, targetElement: targetElement),
-                  Self.matches(focusedWindow, window: window) else {
-                stop(status: "target_window_unverified")
+            guard let targetElement else {
+                stop(status: "target_window_unverified", reason: "focused_window_unavailable")
+                return
+            }
+            let focusedRead = Self.focusedWindowFingerprint(pid: pid, targetElement: targetElement)
+            guard case .available(let focusedWindow) = focusedRead else {
+                let reason: String
+                if case .windowMismatch = focusedRead {
+                    reason = "window_information_mismatch"
+                } else {
+                    reason = "focused_window_unavailable"
+                }
+                stop(status: "target_window_unverified", reason: reason)
+                return
+            }
+            guard Self.matches(focusedWindow, window: window) else {
+                stop(status: "target_window_unverified", reason: "window_information_mismatch")
                 return
             }
 
@@ -451,12 +493,36 @@ final class DiagnosticWindowFrameRecorder {
                 let windows = content.windows.filter {
                     $0.owningApplication?.processID == pid && $0.isOnScreen && $0.windowLayer == 0
                 }
-                guard windows.count == 1,
-                      windows.first?.windowID == windowID,
-                      let focusedWindow = Self.focusedWindowFingerprint(pid: pid),
-                      let window = windows.first,
-                      Self.matches(focusedWindow, window: window) else {
-                    stop(status: "target_window_changed")
+                guard windows.count == 1 else {
+                    stop(status: "target_window_changed", reason: "candidate_window_count_mismatch")
+                    return
+                }
+                guard let window = windows.first, window.windowID == windowID else {
+                    stop(status: "target_window_changed", reason: "window_identifier_changed")
+                    return
+                }
+                let focusedRead = Self.focusedWindowFingerprint(pid: pid)
+                let focusState: DiagnosticWindowFrameVerification.FocusState
+                let fingerprintMatches: Bool
+                switch focusedRead {
+                case .available(let fingerprint):
+                    focusState = .available
+                    fingerprintMatches = Self.matches(fingerprint, window: window)
+                case .unavailable:
+                    focusState = .unavailable
+                    fingerprintMatches = false
+                case .windowMismatch:
+                    focusState = .windowMismatch
+                    fingerprintMatches = false
+                }
+                if let reason = DiagnosticWindowFrameVerification.failureReason(
+                    candidateWindowCount: windows.count,
+                    candidateWindowID: window.windowID,
+                    expectedWindowID: windowID,
+                    focusState: focusState,
+                    fingerprintMatches: fingerprintMatches
+                ) {
+                    stop(status: "target_window_changed", reason: reason)
                     return
                 }
             } catch {
@@ -468,6 +534,7 @@ final class DiagnosticWindowFrameRecorder {
 
     private func stop(
         status: String,
+        reason: String? = nil,
         clearFrames: Bool = false,
         permissionGranted: Bool? = nil,
         closeSession: Bool = true
@@ -490,7 +557,7 @@ final class DiagnosticWindowFrameRecorder {
                 permissionGranted: permissionGranted ?? CGPreflightScreenCaptureAccess()
             )
         } else {
-            buffer.setStatus(status, permissionGranted: permissionGranted, stop: true)
+            buffer.setStatus(status, reason: reason, permissionGranted: permissionGranted, stop: true)
         }
     }
 
@@ -522,12 +589,12 @@ final class DiagnosticWindowFrameRecorder {
     private static func focusedWindowFingerprint(
         pid: pid_t,
         targetElement: AXUIElement? = nil
-    ) -> FocusedWindowFingerprint? {
+    ) -> FocusedWindowFingerprintRead {
         let application = AXUIElementCreateApplication(pid)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(application, kAXFocusedWindowAttribute as CFString, &value) == .success,
               let value,
-              CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+              CFGetTypeID(value) == AXUIElementGetTypeID() else { return .unavailable }
         let window = value as! AXUIElement
         if let targetElement {
             var targetWindowValue: CFTypeRef?
@@ -537,14 +604,14 @@ final class DiagnosticWindowFrameRecorder {
                 &targetWindowValue
             ) == .success,
                   let targetWindowValue,
-                  CFGetTypeID(targetWindowValue) == AXUIElementGetTypeID(),
-                  CFEqual(window, targetWindowValue) else { return nil }
+                  CFGetTypeID(targetWindowValue) == AXUIElementGetTypeID() else { return .unavailable }
+            if !CFEqual(window, targetWindowValue) { return .windowMismatch }
         }
         var titleValue: CFTypeRef?
         let title: String? = AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleValue) == .success
             ? titleValue as? String : nil
-        guard let size = Self.sizeAttribute(kAXSizeAttribute, from: window) else { return nil }
-        return FocusedWindowFingerprint(title: title, size: size)
+        guard let size = Self.sizeAttribute(kAXSizeAttribute, from: window) else { return .unavailable }
+        return .available(FocusedWindowFingerprint(title: title, size: size))
     }
 
     private static func matches(_ fingerprint: FocusedWindowFingerprint, window: SCWindow) -> Bool {
@@ -572,6 +639,12 @@ final class DiagnosticWindowFrameRecorder {
 private struct FocusedWindowFingerprint {
     let title: String?
     let size: CGSize
+}
+
+private enum FocusedWindowFingerprintRead {
+    case available(FocusedWindowFingerprint)
+    case unavailable
+    case windowMismatch
 }
 
 private final class DiagnosticWindowFrameStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {

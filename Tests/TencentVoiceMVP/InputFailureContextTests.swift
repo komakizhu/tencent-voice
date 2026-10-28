@@ -5,6 +5,73 @@ import XCTest
 
 final class InputFailureContextTests: XCTestCase {
     @MainActor
+    func testDiagnosticOnlyTargetTimelineEventsDoNotRunAXProbe() {
+        let probe = CountingInputContextProbe()
+        let recorder = InputFailureContextRecorder(probe: probe)
+        let logger = SessionLogger(enabled: { false })
+        recorder.setEnabled(true)
+        defer { recorder.stop() }
+
+        let events = [
+            "keyboard_editor_continuity_captured",
+            "editor_continuity_scan_summary",
+            "ax_read_diagnostic_queue_summary",
+            "keyboard_document_observation_discarded",
+            AXTextEditorContinuityScanDiagnostic.event
+        ]
+        for (index, event) in events.enumerated() {
+            recorder.observeTarget(
+                TextInputDiagnostic(
+                    timestamp: Date(),
+                    monotonicTimestampNanoseconds: UInt64(index + 1),
+                    event: event,
+                    fields: [:]
+                ),
+                element: nil,
+                pid: 9001,
+                logger: logger
+            )
+        }
+
+        XCTAssertEqual(probe.sampleCount, 0)
+        let recordedEvents = recorder.snapshot(at: Date()).events.map(\.event)
+        for event in events {
+            XCTAssertTrue(recordedEvents.contains(event), "missing timeline event \(event)")
+        }
+    }
+
+    @MainActor
+    func testContinuityTimelineDiagnosticsDoNotTriggerAdditionalAXProbes() {
+        let diagnosticOnlyEvents = [
+            "keyboard_editor_continuity_captured",
+            "editor_continuity_scan_summary",
+            "ax_read_diagnostic_queue_summary",
+            "keyboard_document_observation_discarded",
+            AXTextEditorContinuityScanDiagnostic.event
+        ]
+        for event in diagnosticOnlyEvents {
+            XCTAssertFalse(InputFailureContextRecorder.shouldProbeTarget(
+                event: event,
+                isFailure: false,
+                isCapture: false,
+                elapsedSinceLastProbe: 10
+            ), "\(event) is already diagnostic output and must not cause another AX read")
+        }
+        XCTAssertTrue(InputFailureContextRecorder.shouldProbeTarget(
+            event: "keyboard_document_observed",
+            isFailure: false,
+            isCapture: false,
+            elapsedSinceLastProbe: 1
+        ))
+        XCTAssertTrue(InputFailureContextRecorder.shouldProbeTarget(
+            event: "editor_continuity_scan_summary",
+            isFailure: true,
+            isCapture: false,
+            elapsedSinceLastProbe: 0
+        ))
+    }
+
+    @MainActor
     func testAXNotificationObserverRebindsAndDropsCallbacksAfterSessionEnds() async {
         let observer = FakeInputFailureAXNotificationObserver()
         let recorder = InputFailureContextRecorder(axNotificationObserver: observer)
@@ -530,6 +597,24 @@ final class InputFailureContextTests: XCTestCase {
         XCTAssertEqual(opens, 1)
         menuController.update(failureContextEnabled: true)
         XCTAssertEqual(menu.items.first { $0.title == "记录浏览器与 Codex 故障前操作" }?.state, .on)
+    }
+}
+
+private final class CountingInputContextProbe: InputContextSampling, @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var sampleCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    func sample(pid: pid_t, target: AXUIElement?, includeEditors: Bool) -> [String: String] {
+        lock.lock()
+        count += 1
+        lock.unlock()
+        return [:]
     }
 }
 

@@ -64,6 +64,36 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertNil(decoded.desktopContext.events.first?.sessionID)
     }
 
+    func testReportExplainsSafariContinuityScanFailureAndRendersAXStatus() {
+        let event = SessionLogEntry(
+            sessionID: UUID(),
+            event: AXTextEditorContinuityScanDiagnostic.event,
+            metadata: [
+                "scanStage": "ancestor_parent",
+                "reason": "read_failed",
+                "axAttribute": "AXParent",
+                "axStatus": "-25202",
+                "depth": "2",
+                "elapsedMilliseconds": "17"
+            ]
+        )
+        let report = DiagnosticReport(
+            app: appInfo(), permissions: PrivacyPermissionReport(statuses: []),
+            credentials: DiagnosticCredentialInfo(state: .configured, detail: "configured"),
+            settings: DiagnosticSettingsInfo(
+                shortcut: "test", engineModelType: "test", persistentSessionLogEnabled: true
+            ),
+            events: [event], logDirectoryPath: "/tmp/logs"
+        )
+
+        XCTAssertTrue(report.findings.contains { $0.code == AXTextEditorContinuityScanDiagnostic.event })
+        let text = report.renderedText()
+        XCTAssertTrue(text.contains("ancestor_parent"))
+        XCTAssertTrue(text.contains("AXParent"))
+        XCTAssertTrue(text.contains("-25202"))
+        XCTAssertTrue(text.contains("不能单独证明两个对象属于同一输入框"))
+    }
+
     func testReportSeparatesWaitSkippedFromActualTimeoutAndShowsOperationContext() throws {
         let session = UUID()
         let events = [
@@ -943,7 +973,7 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertTrue(report.renderedText().contains("触发原因未记录"))
     }
 
-    func testReportExplainsInputFailureWhenSafeCopyIsDisabled() {
+    func testLegacyReportExplainsInputFailureWithoutSafeCopy() {
         let report = DiagnosticReport(
             app: appInfo(),
             permissions: PrivacyPermissionReport(statuses: []),
@@ -952,7 +982,7 @@ final class DiagnosticReportTests: XCTestCase {
                 shortcut: "⌘0",
                 engineModelType: "16k_zh",
                 persistentSessionLogEnabled: false,
-                safeCopyEnabled: false
+                alwaysSaveVoiceContent: false
             ),
             events: [SessionLogEntry(
                 event: "input_error",
@@ -964,7 +994,7 @@ final class DiagnosticReportTests: XCTestCase {
 
         XCTAssertTrue(report.findings.contains { $0.code == "input_error" })
         XCTAssertFalse(report.findings.contains { $0.code == "safe_copy_triggered" })
-        XCTAssertTrue(report.renderedText().contains("Safe Copy 已关闭"))
+        XCTAssertTrue(report.renderedText().contains("旧版会话在输入失败后没有启用自动保存回退"))
     }
 
     func testSettingsInfoReadsReportsCreatedBeforeSafeCopyFlag() throws {
@@ -978,7 +1008,22 @@ final class DiagnosticReportTests: XCTestCase {
 
         let settings = try JSONDecoder().decode(DiagnosticSettingsInfo.self, from: data)
 
-        XCTAssertFalse(settings.safeCopyEnabled)
+        XCTAssertFalse(settings.alwaysSaveVoiceContent)
+    }
+
+    func testSettingsInfoReadsLegacySafeCopyField() throws {
+        let data = Data("""
+        {
+            "shortcut": "⌘0",
+            "engineModelType": "16k_zh",
+            "persistentSessionLogEnabled": false,
+            "safeCopyEnabled": true
+        }
+        """.utf8)
+
+        let settings = try JSONDecoder().decode(DiagnosticSettingsInfo.self, from: data)
+
+        XCTAssertTrue(settings.alwaysSaveVoiceContent)
     }
 
     func testLoggerKeepsRecentEntriesWhenPersistentLoggingIsDisabled() throws {

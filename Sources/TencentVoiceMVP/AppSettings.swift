@@ -32,7 +32,7 @@ struct AppSettings: Codable, Equatable, Sendable {
     var shortcut: Shortcut
     var engineModelType: String
     var saveTextLogs: Bool
-    var safeCopyEnabled: Bool
+    var alwaysSaveVoiceContent: Bool
     var hideMenuBarIcon: Bool
     var captureDiagnosticWindowFrames: Bool
     var prepaidQuotaHoursByModel: [String: Int]
@@ -41,7 +41,8 @@ struct AppSettings: Codable, Equatable, Sendable {
         case shortcut
         case engineModelType
         case saveTextLogs
-        case safeCopyEnabled
+        case alwaysSaveVoiceContent
+        case legacySafeCopyEnabled = "safeCopyEnabled"
         case hideMenuBarIcon
         case captureDiagnosticWindowFrames
         case prepaidQuotaHoursByModel
@@ -51,7 +52,7 @@ struct AppSettings: Codable, Equatable, Sendable {
         shortcut: Shortcut = .defaultCommand0,
         engineModelType: String = TencentEnginePreset.defaultPreset.rawValue,
         saveTextLogs: Bool = false,
-        safeCopyEnabled: Bool = false,
+        alwaysSaveVoiceContent: Bool = false,
         hideMenuBarIcon: Bool = false,
         captureDiagnosticWindowFrames: Bool = false,
         prepaidQuotaHoursByModel: [String: Int] = [:]
@@ -59,7 +60,7 @@ struct AppSettings: Codable, Equatable, Sendable {
         self.shortcut = shortcut
         self.engineModelType = engineModelType
         self.saveTextLogs = saveTextLogs
-        self.safeCopyEnabled = safeCopyEnabled
+        self.alwaysSaveVoiceContent = alwaysSaveVoiceContent
         self.hideMenuBarIcon = hideMenuBarIcon
         self.captureDiagnosticWindowFrames = captureDiagnosticWindowFrames
         self.prepaidQuotaHoursByModel = prepaidQuotaHoursByModel
@@ -70,7 +71,9 @@ struct AppSettings: Codable, Equatable, Sendable {
         shortcut = try container.decode(Shortcut.self, forKey: .shortcut)
         engineModelType = try container.decode(String.self, forKey: .engineModelType)
         saveTextLogs = try container.decode(Bool.self, forKey: .saveTextLogs)
-        safeCopyEnabled = try container.decodeIfPresent(Bool.self, forKey: .safeCopyEnabled) ?? false
+        alwaysSaveVoiceContent = try container.decodeIfPresent(Bool.self, forKey: .alwaysSaveVoiceContent)
+            ?? container.decodeIfPresent(Bool.self, forKey: .legacySafeCopyEnabled)
+            ?? false
         hideMenuBarIcon = try container.decodeIfPresent(Bool.self, forKey: .hideMenuBarIcon) ?? false
         captureDiagnosticWindowFrames = try container.decodeIfPresent(
             Bool.self,
@@ -80,6 +83,17 @@ struct AppSettings: Codable, Equatable, Sendable {
             [String: Int].self,
             forKey: .prepaidQuotaHoursByModel
         ) ?? [:]
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(shortcut, forKey: .shortcut)
+        try container.encode(engineModelType, forKey: .engineModelType)
+        try container.encode(saveTextLogs, forKey: .saveTextLogs)
+        try container.encode(alwaysSaveVoiceContent, forKey: .alwaysSaveVoiceContent)
+        try container.encode(hideMenuBarIcon, forKey: .hideMenuBarIcon)
+        try container.encode(captureDiagnosticWindowFrames, forKey: .captureDiagnosticWindowFrames)
+        try container.encode(prepaidQuotaHoursByModel, forKey: .prepaidQuotaHoursByModel)
     }
 }
 

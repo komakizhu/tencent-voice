@@ -48,11 +48,10 @@ final class TextInjector {
         case ax
         case keyboardLiveTail
         case safeCopy
-        case disabledAfterError
     }
 
     private let target: TextTarget
-    private let safeCopyEnabled: Bool
+    private let alwaysSaveVoiceContent: Bool
     private let keyboardPacing: KeyboardPacingConfiguration
     private let pacingClock: KeyboardPacingClock
     private var keyboardPacer: KeyboardCharacterPacer?
@@ -93,10 +92,10 @@ final class TextInjector {
         target: TextTarget,
         keyboardSmoothing: KeyboardSmoothingConfiguration = .immediate,
         pacingClock: KeyboardPacingClock? = nil,
-        safeCopyEnabled: Bool = false
+        alwaysSaveVoiceContent: Bool = false
     ) {
         self.target = target
-        self.safeCopyEnabled = safeCopyEnabled
+        self.alwaysSaveVoiceContent = alwaysSaveVoiceContent
         self.keyboardPacing = keyboardSmoothing
         self.pacingClock = pacingClock ?? ContinuousKeyboardPacingClock()
     }
@@ -107,7 +106,6 @@ final class TextInjector {
         case .ax: return "ax"
         case .keyboardLiveTail: return "keyboard_live_tail"
         case .safeCopy: return "safe_copy"
-        case .disabledAfterError: return "disabled_after_error"
         }
     }
 
@@ -161,7 +159,7 @@ final class TextInjector {
             currentProjectionDiagnosticFields = [:]
             previousProjectionSegmentID = nil
             if captured.preferredInputStrategy.requiresSafeStop {
-                mode = safeCopyEnabled ? .safeCopy : .disabledAfterError
+                mode = .safeCopy
                 inputPhase = .safeCopy
                 errorCount = 1
                 degradationCode = captured.preferredInputStrategy.diagnosticReason
@@ -220,7 +218,7 @@ final class TextInjector {
             } catch {
                 enterSafeCopy(after: error)
             }
-        case .safeCopy, .disabledAfterError:
+        case .safeCopy:
             lastProjectionText = projection.text
         case .inactive:
             break
@@ -280,7 +278,7 @@ final class TextInjector {
             } catch {
                 enterSafeCopy(after: error)
             }
-        case .safeCopy, .inactive, .disabledAfterError:
+        case .safeCopy, .inactive:
             break
         }
 
@@ -313,7 +311,7 @@ final class TextInjector {
             // until a later session can establish a fresh snapshot.
             axWriter?.cancel()
             recordDiagnostic("text_input_phase", ["phase": inputPhase.rawValue, "reason": "finished_immediately_ax_cancelled"])
-        case .safeCopy, .inactive, .disabledAfterError:
+        case .safeCopy, .inactive:
             break
         }
 
@@ -355,7 +353,8 @@ final class TextInjector {
     }
 
     private func copyOnFinishIfNeeded(_ text: String) throws {
-        guard safeCopyEnabled, mode != .inactive, mode != .disabledAfterError,
+        guard mode != .inactive,
+              (mode == .safeCopy || alwaysSaveVoiceContent),
               lastCopiedText == nil else { return }
         // Publish one completed backup per session, keeping interim ASR revisions
         // out of clipboard managers such as Maccy.
@@ -957,12 +956,12 @@ final class TextInjector {
     }
 
     private func enterSafeCopy(after error: Error) {
-        guard mode != .safeCopy, mode != .disabledAfterError else { return }
+        guard mode != .safeCopy else { return }
         let modeBeforeDegradation = modeDescription
         axWriter?.cancel()
         keyboardWriter?.cancel()
         keyboardPacer?.cancel()
-        mode = safeCopyEnabled ? .safeCopy : .disabledAfterError
+        mode = .safeCopy
         inputPhase = .safeCopy
         errorCount += 1
         degradationCode = DiagnosticErrorFormatter.code(for: error)

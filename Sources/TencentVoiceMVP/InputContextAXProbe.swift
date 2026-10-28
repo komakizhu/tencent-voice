@@ -7,6 +7,10 @@ struct InputContextElementReference: @unchecked Sendable {
     let element: AXUIElement?
 }
 
+protocol InputContextSampling: AnyObject, Sendable {
+    func sample(pid: pid_t, target: AXUIElement?, includeEditors: Bool) -> [String: String]
+}
+
 struct InputContextEditorWalk<Node> {
     private var pending: [(Node, Int)]
     private(set) var visitedCount = 0
@@ -40,7 +44,7 @@ struct InputContextEditorWalk<Node> {
 
 // All queries are bounded and run off the input/UI thread. Text is discarded after
 // computing UTF16 length; titles, placeholders, values and selected text are never logged.
-final class InputContextAXProbe: @unchecked Sendable {
+final class InputContextAXProbe: InputContextSampling, @unchecked Sendable {
     private var identities: [(AXUIElement, Int)] = []
     private var nextID = 0
     private var deadline = Date.distantPast

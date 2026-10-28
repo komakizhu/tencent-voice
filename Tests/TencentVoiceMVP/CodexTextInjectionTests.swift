@@ -32,8 +32,8 @@ final class CodexTextInjectionTests: XCTestCase {
         try await injector.finish(finalText: "hello world")
         XCTAssertEqual(target.storage.text, "Draft: hello")
         XCTAssertEqual(injector.degradationCode, "text_target_changed")
-        XCTAssertEqual(injector.modeDescription, "disabled_after_error")
-        XCTAssertNil(target.storage.copiedText)
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
+        XCTAssertEqual(target.storage.copiedText, "hello world")
     }
 
     func testOtherApplicationsKeepAXRouting() throws {

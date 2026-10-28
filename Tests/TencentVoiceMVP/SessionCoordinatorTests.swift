@@ -38,7 +38,7 @@ final class SessionCoordinatorTests: XCTestCase {
         let asr = FakeRealtimeASRClient()
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let settings = UserDefaultsSettingsStore(suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)")
-        settings.save(AppSettings(safeCopyEnabled: true))
+        settings.save(AppSettings(alwaysSaveVoiceContent: true))
         let coordinator = makeCoordinator(asr: asr, target: target, settingsStore: settings)
         try await coordinator.begin()
         let text = String(repeating: "长语音内容。", count: 200)
@@ -825,7 +825,7 @@ final class SessionCoordinatorTests: XCTestCase {
         let settingsStore = UserDefaultsSettingsStore(
             suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"
         )
-        settingsStore.save(AppSettings(safeCopyEnabled: true))
+        settingsStore.save(AppSettings(alwaysSaveVoiceContent: true))
         let asr = FakeRealtimeASRClient()
         let target = FakeTextTarget(text: "原文", supportsAXReplacement: false)
         let coordinator = makeCoordinator(

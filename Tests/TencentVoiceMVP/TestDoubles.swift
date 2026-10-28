@@ -257,11 +257,14 @@ final class FakeRealtimeASRClient: RealtimeASRClient {
 }
 
 final class FakeAudioCapture: AudioCapture {
+    private let stateLock = NSLock()
     private var handler: (@Sendable (Data) -> Void)?
     private var eventHandler: (@Sendable (AudioCaptureEvent) -> Void)?
     private var pendingStarts: [CheckedContinuation<Void, Error>] = []
-    private(set) var startCallCount = 0
-    private(set) var lastSessionID: UUID?
+    private var storedStartCallCount = 0
+    private var storedLastSessionID: UUID?
+    var startCallCount: Int { withStateLock { storedStartCallCount } }
+    var lastSessionID: UUID? { withStateLock { storedLastSessionID } }
     var dataToEmitOnStop: Data?
     var holdsStarts = false
 
@@ -270,34 +273,48 @@ final class FakeAudioCapture: AudioCapture {
         onChunk: @escaping @Sendable (Data) -> Void,
         onEvent: @escaping @Sendable (AudioCaptureEvent) -> Void
     ) async throws {
-        handler = onChunk
-        eventHandler = onEvent
-        lastSessionID = sessionID
-        startCallCount += 1
-        if holdsStarts {
-            try await withCheckedThrowingContinuation { continuation in
-                pendingStarts.append(continuation)
+        let shouldHold = holdsStarts
+        withStateLock {
+            handler = onChunk
+            eventHandler = onEvent
+            storedLastSessionID = sessionID
+            if !shouldHold { storedStartCallCount += 1 }
+        }
+        if shouldHold {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                withStateLock {
+                    pendingStarts.append(continuation)
+                    storedStartCallCount += 1
+                }
             }
         }
     }
 
     func stop() {
-        if let dataToEmitOnStop {
-            handler?(dataToEmitOnStop)
-        }
+        let pending = withStateLock { (dataToEmitOnStop, handler) }
+        if let data = pending.0 { pending.1?(data) }
     }
 
     func emit(_ data: Data) {
-        handler?(data)
+        withStateLock { handler }?(data)
     }
 
     func emit(_ event: AudioCaptureEvent) {
-        eventHandler?(event)
+        withStateLock { eventHandler }?(event)
     }
 
     func releaseNextStart() {
-        guard !pendingStarts.isEmpty else { return }
-        pendingStarts.removeFirst().resume()
+        let continuation = withStateLock { () -> CheckedContinuation<Void, Error>? in
+            guard !pendingStarts.isEmpty else { return nil }
+            return pendingStarts.removeFirst()
+        }
+        continuation?.resume()
+    }
+
+    private func withStateLock<T>(_ body: () -> T) -> T {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return body()
     }
 }
 

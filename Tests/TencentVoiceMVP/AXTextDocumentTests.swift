@@ -834,7 +834,7 @@ final class AXTextDocumentTests: XCTestCase {
 
         XCTAssertEqual(target.rawText, "第一段\n\n第二段甲")
         XCTAssertEqual(target.acknowledgementCount, 1)
-        XCTAssertEqual(injector.modeDescription, "disabled_after_error")
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
         XCTAssertEqual(injector.degradationCode, "text_target_changed")
     }
 

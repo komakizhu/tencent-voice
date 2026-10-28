@@ -46,7 +46,7 @@ enum DiagnosticErrorFormatter {
         case "text_target_write_failed":
             return "无法写入当前输入框"
         case "safe_copy_manual":
-            return "用户手动启用了 Safe Copy"
+            return "用户启用了始终保存语音内容"
         case "accessibility_denied":
             return "辅助功能权限不可用"
         case "post_event_denied":

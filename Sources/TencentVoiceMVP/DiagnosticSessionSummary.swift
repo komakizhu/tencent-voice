@@ -5,7 +5,8 @@ enum DiagnosticAnomaly {
         "keyboard_write_unconfirmed", "ax_write_unconfirmed", "keyboard_confirmed_state_changed",
         "keyboard_state_change_observed", "keyboard_user_edit_detected", "keyboard_user_edit_ambiguous",
         "keyboard_user_edit_read_failed", "mixed_input_ambiguous", "input_degradation",
-        "safe_copy_update_failed", "safari_keyboard_target_reacquire_rejected", "keyboard_focus_changed",
+        "safe_copy_update_failed", "keyboard_target_reacquire_rejected",
+        "safari_keyboard_target_reacquire_rejected", "keyboard_focus_changed",
         "ax_focus_changed", "input_application_changed", "ax_write_failed", "ax_document_mismatch",
         "ax_selection_mismatch", "ax_coordinate_mapping_failed", "finish_error", "stream_error", "input_error"
     ]

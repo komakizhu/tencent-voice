@@ -36,25 +36,26 @@ struct DiagnosticSettingsInfo: Codable, Equatable, Sendable {
     let shortcut: String
     let engineModelType: String
     let persistentSessionLogEnabled: Bool
-    let safeCopyEnabled: Bool
+    let alwaysSaveVoiceContent: Bool
 
     private enum CodingKeys: String, CodingKey {
         case shortcut
         case engineModelType
         case persistentSessionLogEnabled
-        case safeCopyEnabled
+        case alwaysSaveVoiceContent
+        case legacySafeCopyEnabled = "safeCopyEnabled"
     }
 
     init(
         shortcut: String,
         engineModelType: String,
         persistentSessionLogEnabled: Bool,
-        safeCopyEnabled: Bool = false
+        alwaysSaveVoiceContent: Bool = false
     ) {
         self.shortcut = shortcut
         self.engineModelType = engineModelType
         self.persistentSessionLogEnabled = persistentSessionLogEnabled
-        self.safeCopyEnabled = safeCopyEnabled
+        self.alwaysSaveVoiceContent = alwaysSaveVoiceContent
     }
 
     init(from decoder: Decoder) throws {
@@ -62,7 +63,17 @@ struct DiagnosticSettingsInfo: Codable, Equatable, Sendable {
         shortcut = try container.decode(String.self, forKey: .shortcut)
         engineModelType = try container.decode(String.self, forKey: .engineModelType)
         persistentSessionLogEnabled = try container.decode(Bool.self, forKey: .persistentSessionLogEnabled)
-        safeCopyEnabled = try container.decodeIfPresent(Bool.self, forKey: .safeCopyEnabled) ?? false
+        alwaysSaveVoiceContent = try container.decodeIfPresent(Bool.self, forKey: .alwaysSaveVoiceContent)
+            ?? container.decodeIfPresent(Bool.self, forKey: .legacySafeCopyEnabled)
+            ?? false
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(shortcut, forKey: .shortcut)
+        try container.encode(engineModelType, forKey: .engineModelType)
+        try container.encode(persistentSessionLogEnabled, forKey: .persistentSessionLogEnabled)
+        try container.encode(alwaysSaveVoiceContent, forKey: .alwaysSaveVoiceContent)
     }
 }
 
@@ -263,7 +274,7 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
             "快捷键：\(settings.shortcut)",
             "识别引擎：\(settings.engineModelType)",
             "自动保存诊断日志：\(settings.persistentSessionLogEnabled ? "已开启" : "未开启")",
-            "Safe Copy：\(settings.safeCopyEnabled ? "已开启（正常输入并复制到剪贴板）" : "已关闭（发生输入错误时不复制）")",
+            "始终保存语音内容：\(settings.alwaysSaveVoiceContent ? "已开启（正常结束时复制完整识别结果）" : "未开启（正常结束时不自动复制；取消或输入故障时仍自动保存）")",
             "日志目录：\(logDirectoryPath)",
             "",
             "【诊断判断】"
@@ -383,7 +394,9 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
                 "ax_write_submitted": "AX 写入接口返回成功，正在等待正文和选区读回确认；已关联本次操作。",
                 "ax_write_waiting": "AX 写入已提交，尚未把目标状态标记为完成；确认期间未重复发送。",
                 "ax_write_acknowledged": "AX 写入后的正文、选区和目标身份已读回匹配，已推进后续状态。",
-                "ax_write_unconfirmed": "AX 写入返回成功但正文或选区未在期限内确认，已停止继续写入且没有补发。"
+                "ax_write_unconfirmed": "AX 写入返回成功但正文或选区未在期限内确认，已停止继续写入且没有补发。",
+                AXTextEditorContinuityScanDiagnostic.event: "输入框重建期间的连续性扫描记录了失败阶段、AX 属性和返回码；这能解释扫描为何未完成，但不能单独证明两个对象属于同一输入框。",
+                "safari_editor_continuity_scan_diagnostic": "旧版 Safari 编辑器连续性扫描记录了失败阶段、AX 属性和返回码；这能解释扫描为何未完成，但不能单独证明两个对象属于同一输入框。"
             ]
             for code in diagnosticMessages.keys.sorted() {
                 let matching = sessionEvents.filter { $0.event == code }
@@ -459,7 +472,7 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
                 findings.append(DiagnosticFinding(
                     level: .failure,
                     code: "input_error",
-                    message: "\(sessionLabel)：Safe Copy 已关闭，输入失败后已停止继续写入；\(detail)\(timing)"
+                    message: "\(sessionLabel)：旧版会话在输入失败后没有启用自动保存回退，后续停止写入；\(detail)\(timing)"
                 ))
             }
 
@@ -556,7 +569,9 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
             fields.append("revision=\(event.metadata["revision"] ?? "unknown")")
             fields.append("trigger=\(event.metadata["operationTrigger"] ?? "unknown")")
             fields.append("timing=\(timingSummary(event.metadata))")
-        } else if event.event.hasPrefix("keyboard_") || event.event.hasPrefix("ax_") {
+        } else if event.event.hasPrefix("keyboard_") || event.event.hasPrefix("ax_")
+            || event.event == AXTextEditorContinuityScanDiagnostic.event
+            || event.event == "safari_editor_continuity_scan_diagnostic" {
             fields.append("diagnostic=\(diagnosticDetails(event))")
         }
         if !event.metadata.isEmpty {
@@ -602,7 +617,8 @@ struct DiagnosticReport: Codable, Equatable, Sendable {
             "operationID", "operationType", "operationStatus", "segmentID", "revision", "segmentPhase",
             "operationTrigger", "waitClassification", "waitSkippedReason", "lastDispatchAgeMilliseconds",
             "waitBudgetMilliseconds", "waitQualificationMaxAgeMilliseconds", "waitMilliseconds", "polls",
-            "feedbackObservedMonotonicMilliseconds",
+            "feedbackObservedMonotonicMilliseconds", "scanStage", "candidateIndex", "candidateCount",
+            "candidateEditableCounts", "visitedNodes", "depth", "elapsedMilliseconds", "axAttribute", "axStatus",
             "reason", "coordinateSource", "placeholderNormalized", "axValueLengthUTF16",
             "axCoordinateLengthUTF16", "omittedStructuralSeparatorCount", "placeholderAttributePresent",
             "placeholderMarkedNodeCount", "placeholderOtherNodeCount",
@@ -832,7 +848,7 @@ final class DiagnosticReportBuilder {
                 shortcut: ShortcutFormatter.string(for: settings.shortcut),
                 engineModelType: settings.engineModelType,
                 persistentSessionLogEnabled: settings.saveTextLogs,
-                safeCopyEnabled: settings.safeCopyEnabled
+                alwaysSaveVoiceContent: settings.alwaysSaveVoiceContent
             ),
             events: selectedEvents,
             logDirectoryPath: logger.persistenceDirectoryURL.path,

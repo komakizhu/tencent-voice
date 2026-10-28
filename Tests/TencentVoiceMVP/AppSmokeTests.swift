@@ -291,10 +291,10 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertTrue(controls.contains { $0.title == "故障时采集目标窗口画面（可选）" })
         XCTAssertFalse(controls.contains { $0.title == "保存崩溃日志" })
         XCTAssertFalse(controls.contains { $0.title == "故障诊断记录" })
-        XCTAssertTrue(controls.contains { $0.title == "Safe Copy（始终复制到剪贴板）" })
+        XCTAssertTrue(controls.contains { $0.title == "始终保存语音内容" })
         let requiredTooltipTitles = [
             "测试连接",
-            "Safe Copy（始终复制到剪贴板）",
+            "始终保存语音内容",
             "自动保存诊断日志",
             "故障时采集目标窗口画面（可选）",
             "重新录制",

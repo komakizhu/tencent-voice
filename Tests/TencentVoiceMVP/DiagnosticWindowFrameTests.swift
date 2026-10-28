@@ -3,6 +3,56 @@ import XCTest
 @testable import TencentVoiceMVP
 
 final class DiagnosticWindowFrameTests: XCTestCase {
+    func testWindowChangeReasonsDistinguishCountIdentifierFocusAndFingerprint() throws {
+        let expected: UInt32 = 20
+        func reason(
+            count: Int = 1,
+            windowID: UInt32? = expected,
+            focus: DiagnosticWindowFrameVerification.FocusState = .available,
+            matches: Bool = true
+        ) -> String? {
+            DiagnosticWindowFrameVerification.failureReason(
+                candidateWindowCount: count,
+                candidateWindowID: windowID,
+                expectedWindowID: expected,
+                focusState: focus,
+                fingerprintMatches: matches
+            )
+        }
+        XCTAssertEqual(reason(count: 0), "candidate_window_count_mismatch")
+        XCTAssertEqual(reason(count: 2), "candidate_window_count_mismatch")
+        XCTAssertEqual(reason(windowID: 21), "window_identifier_changed")
+        XCTAssertEqual(reason(focus: .unavailable), "focused_window_unavailable")
+        XCTAssertEqual(reason(focus: .windowMismatch), "window_information_mismatch")
+        XCTAssertEqual(reason(matches: false), "window_information_mismatch")
+        XCTAssertNil(reason())
+
+        let encoded = try JSONEncoder().encode(DiagnosticWindowFrameEvidence(
+            enabled: true,
+            status: "target_window_changed",
+            permissionGranted: true,
+            sessionID: UUID(),
+            targetPID: 42,
+            targetBundleIdentifier: "com.example.editor",
+            targetWindowID: expected,
+            startedAt: Date(timeIntervalSince1970: 1),
+            stoppedAt: Date(timeIntervalSince1970: 2),
+            maximumFramesPerSecond: 5,
+            ringDurationSeconds: 60,
+            memoryLimitBytes: 80 * 1_024 * 1_024,
+            ringMemoryLimitBytes: 80 * 1_024 * 1_024,
+            retainedFrameCount: 0,
+            droppedFrameCount: 0,
+            retainedBytes: 0,
+            frames: [],
+            archiveStatus: "not_included",
+            stopReason: "window_identifier_changed"
+        ))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(object["status"] as? String, "target_window_changed")
+        XCTAssertEqual(object["stopReason"] as? String, "window_identifier_changed")
+    }
+
     func testCapturePolicyRequiresOptInActiveSessionPermissionAndNoSecureInput() {
         XCTAssertTrue(DiagnosticWindowFrameCapturePolicy.mayCapture(
             enabled: true,
@@ -93,7 +143,7 @@ final class DiagnosticWindowFrameTests: XCTestCase {
         )
         let evidence = DiagnosticWindowFrameEvidence(
             enabled: true,
-            status: "session_ended",
+            status: "target_window_changed",
             permissionGranted: true,
             sessionID: UUID(),
             targetPID: 42,
@@ -109,12 +159,13 @@ final class DiagnosticWindowFrameTests: XCTestCase {
             droppedFrameCount: 0,
             retainedBytes: asset.jpegData.count,
             frames: [reference],
-            archiveStatus: "included"
+            archiveStatus: "included",
+            stopReason: "window_information_mismatch"
         )
         let snapshot = DiagnosticWindowFrameSnapshot(evidence: evidence, assets: [asset])
 
         try DiagnosticWindowFrameArchiveWriter.write(
-            reportData: Data("{}".utf8),
+            reportData: try JSONEncoder().encode(snapshot.evidence),
             snapshot: snapshot,
             destination: destination
         )
@@ -131,5 +182,23 @@ final class DiagnosticWindowFrameTests: XCTestCase {
         XCTAssertTrue(listing.contains("/report.json"))
         XCTAssertTrue(listing.contains("/frames/index.json"))
         XCTAssertTrue(listing.contains("/frames/000001.jpg"))
+
+        let reportMember = try XCTUnwrap(listing
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .first { $0.hasSuffix("/report.json") })
+        let reportProcess = Process()
+        reportProcess.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        reportProcess.arguments = ["-p", destination.path, reportMember]
+        let reportOutput = Pipe()
+        reportProcess.standardOutput = reportOutput
+        try reportProcess.run()
+        reportProcess.waitUntilExit()
+        XCTAssertEqual(reportProcess.terminationStatus, 0)
+        let archivedReport = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: reportOutput.fileHandleForReading.readDataToEndOfFile()) as? [String: Any]
+        )
+        XCTAssertEqual(archivedReport["status"] as? String, "target_window_changed")
+        XCTAssertEqual(archivedReport["stopReason"] as? String, "window_information_mismatch")
     }
 }
