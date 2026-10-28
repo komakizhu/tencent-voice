@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Rime Voice · 状态栏波形方案</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #f3f4f6;
+      --surface: #ffffff;
+      --surface-soft: #f7f8fa;
+      --ink: #171a20;
+      --muted: #737985;
+      --line: #e5e7eb;
+      --accent: #4359d8;
+      --accent-soft: #edf0ff;
+      --shadow: 0 16px 42px rgba(24, 30, 48, .08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--page);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    button, input { font: inherit; }
+    .page { max-width: 1120px; margin: 0 auto; padding: 54px 32px 42px; }
+    .eyebrow {
+      display: flex; align-items: center; gap: 9px;
+      color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .12em;
+    }
+    .brand-mark { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+    h1 { margin: 18px 0 8px; font-size: clamp(30px, 5vw, 46px); line-height: 1.04; letter-spacing: -.045em; font-weight: 720; }
+    .intro { margin: 0; color: var(--muted); font-size: 15px; line-height: 1.6; }
+    .toolbar {
+      display: grid; grid-template-columns: 1fr auto; gap: 20px; align-items: center;
+      margin: 30px 0 20px; padding: 17px 18px; border: 1px solid var(--line); border-radius: 18px;
+      background: var(--surface); box-shadow: 0 6px 18px rgba(24, 30, 48, .035);
+    }
+    .level-control { display: grid; grid-template-columns: auto minmax(120px, 1fr) auto; gap: 14px; align-items: center; }
+    .level-label { min-width: 68px; }
+    .level-label strong { display: block; font-size: 12px; }
+    .level-label span { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+    input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer; }
+    .presets { display: flex; justify-content: flex-end; gap: 7px; }
+    .preset, .theme-button, .auto-button {
+      border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--ink);
+      padding: 8px 11px; font-size: 11px; font-weight: 600; cursor: pointer; transition: .16s ease;
+      white-space: nowrap;
+    }
+    .preset:hover, .theme-button:hover, .auto-button:hover { border-color: #bbc2d0; transform: translateY(-1px); }
+    .preset[aria-pressed="true"], .auto-button[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); border-color: #cbd2ff; }
+    .toolbar-footer { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; margin-top: -4px; }
+    .readout { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+    .readout strong { color: var(--ink); font-weight: 700; }
+    .toolbar-actions { display: flex; gap: 7px; align-items: center; }
+    .auto-button { display: inline-flex; align-items: center; gap: 7px; }
+    .auto-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .theme-button { padding: 8px 10px; }
+    .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+    .card {
+      min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 20px;
+      background: var(--surface); box-shadow: var(--shadow);
+    }
+    .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 19px 19px 13px; }
+    .letter { color: var(--muted); font-size: 10px; font-weight: 750; letter-spacing: .13em; }
+    h2 { margin: 6px 0 5px; font-size: 17px; letter-spacing: -.02em; }
+    .description { margin: 0; max-width: 260px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+    .tag { padding: 5px 8px; border-radius: 999px; background: var(--surface-soft); color: var(--muted); font-size: 10px; font-weight: 650; white-space: nowrap; }
+    .preview {
+      display: grid; place-items: center; min-height: 168px; margin: 0 13px;
+      border-radius: 14px; background: var(--surface-soft); color: var(--ink); position: relative;
+      transition: background .2s ease, color .2s ease;
+    }
+    .preview svg { width: 126px; height: 92px; overflow: visible; color: currentColor; }
+    .preview-caption { position: absolute; left: 13px; bottom: 11px; color: var(--muted); font-size: 9px; letter-spacing: .04em; }
+    .menubar {
+      display: flex; align-items: center; justify-content: flex-end; gap: 13px; height: 42px;
+      margin: 12px 13px 0; padding: 0 13px; border-radius: 9px; background: #f4f5f7;
+      color: #252830; font-size: 10px; font-weight: 580; box-shadow: inset 0 0 0 1px rgba(20, 25, 35, .05);
+    }
+    .menubar .tiny-app { margin-right: auto; color: #777c85; font-weight: 650; letter-spacing: .04em; }
+    .menubar .mini-icon { display: grid; place-items: center; width: 18px; height: 20px; }
+    .menubar svg { width: 18px; height: 18px; overflow: visible; }
+    .card-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 17px 16px; }
+    .foot-note { color: var(--muted); font-size: 10px; line-height: 1.4; }
+    .meter { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; }
+    .meter span { display: block; width: 4px; border-radius: 99px; background: #c8ccd4; transition: height .12s ease, background .12s ease; }
+    .meter span:nth-child(1), .meter span:nth-child(5) { height: 4px; }
+    .meter span:nth-child(2), .meter span:nth-child(4) { height: 7px; }
+    .meter span:nth-child(3) { height: 10px; }
+    .note {
+      display: flex; gap: 10px; align-items: flex-start; margin-top: 18px; padding: 12px 14px;
+      border-radius: 12px; background: rgba(67, 89, 216, .07); color: #52596d; font-size: 11px; line-height: 1.55;
+    }
+    .note strong { color: var(--ink); }
+    .note-mark { flex: 0 0 auto; width: 17px; height: 17px; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: white; font-size: 10px; font-weight: 800; }
+    body[data-theme="dark"] { --page: #101216; --surface: #1a1d23; --surface-soft: #22262e; --ink: #f2f3f6; --muted: #969ba6; --line: #30343c; --accent: #9daaff; --accent-soft: #282e4e; --shadow: 0 16px 42px rgba(0, 0, 0, .22); }
+    body[data-theme="dark"] .menubar { background: #292c32; color: #f4f5f7; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .06); }
+    body[data-theme="dark"] .menubar .tiny-app { color: #aaaeb7; }
+    body[data-theme="dark"] .note { color: #b2b8c9; }
+    @media (max-width: 900px) {
+      .page { padding: 38px 22px 32px; }
+      .toolbar { grid-template-columns: 1fr; }
+      .presets { justify-content: flex-start; flex-wrap: wrap; }
+      .cards { grid-template-columns: 1fr; }
+      .preview { min-height: 145px; }
+    }
+    @media (max-width: 520px) {
+      .page { padding: 30px 15px; }
+      .level-control { grid-template-columns: 1fr auto; }
+      .level-label { grid-column: 1 / -1; }
+      .level-control input { grid-column: 1; }
+      .presets { gap: 5px; }
+      .preset { padding: 7px 9px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body data-theme="light">
+  <main class="page">
+    <div class="eyebrow"><span class="brand-mark"></span> RIME VOICE <span aria-hidden="true">/</span> DESIGN EXPLORATION</div>
+    <h1>状态栏波形，三个方向</h1>
+    <p class="intro">同一音量输入，不同波形造型。拖动音量，看看静音、轻声和说话时的区别。</p>
+
+    <section class="toolbar" aria-label="波形演示控制">
+      <div class="level-control">
+        <div class="level-label"><strong>输入音量</strong><span id="levelText">正常说话</span></div>
+        <input id="level" type="range" min="0" max="100" value="58" aria-label="模拟输入音量">
+        <div class="readout"><strong id="levelPercent">58</strong><span>%</span></div>
+      </div>
+      <div class="presets" role="group" aria-label="预设音量">
+        <button class="preset" data-level="0" aria-pressed="false">静音</button>
+        <button class="preset" data-level="8" aria-pressed="false">底噪</button>
+        <button class="preset" data-level="28" aria-pressed="false">轻声</button>
+        <button class="preset" data-level="58" aria-pressed="true">说话</button>
+        <button class="preset" data-level="92" aria-pressed="false">较响</button>
+      </div>
+      <div class="toolbar-footer">
+        <div class="readout">模拟电平 <strong id="dbReadout">−24 dBFS</strong> <span>· 不访问麦克风</span></div>
+        <div class="toolbar-actions">
+          <button class="auto-button" id="auto" aria-pressed="false"><span class="auto-dot"></span><span id="autoText">自动演示</span></button>
+          <button class="theme-button" id="theme" aria-label="切换深浅色状态栏">浅色状态栏</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="cards" aria-label="三种波形设计方案">
+      <article class="card" data-variant="a">
+        <header class="card-head">
+          <div><div class="letter">方案 A · 平衡</div><h2>柔弧五柱</h2><p class="description">五条圆角柱，中心更高。熟悉、克制，小尺寸下也清楚。</p></div>
+          <span class="tag">轻巧</span>
+        </header>
+        <div class="preview">
+          <svg viewBox="0 0 24 20" role="img" aria-label="柔弧五柱波形">
+            <g class="bars" fill="currentColor">
+              <rect data-weight=".44" x="3.0" y="9" width="2.4" height="2" rx="1.2"/>
+              <rect data-weight=".72" x="6.6" y="9" width="2.4" height="2" rx="1.2"/>
+              <rect data-weight="1" x="10.2" y="9" width="2.4" height="2" rx="1.2"/>
+              <rect data-weight=".72" x="13.8" y="9" width="2.4" height="2" rx="1.2"/>
+              <rect data-weight=".44" x="17.4" y="9" width="2.4" height="2" rx="1.2"/>
+            </g>
+          </svg>
+          <span class="preview-caption">固定位置 · 整组起落</span>
+        </div>
+        <div class="menubar"><span class="tiny-app">RIME VOICE</span><span>输入法</span><span>中</span><span class="mini-icon"><svg viewBox="0 0 24 20" aria-hidden="true"><g class="bars" fill="currentColor"><rect data-weight=".44" x="3.0" y="9" width="2.4" height="2" rx="1.2"/><rect data-weight=".72" x="6.6" y="9" width="2.4" height="2" rx="1.2"/><rect data-weight="1" x="10.2" y="9" width="2.4" height="2" rx="1.2"/><rect data-weight=".72" x="13.8" y="9" width="2.4" height="2" rx="1.2"/><rect data-weight=".44" x="17.4" y="9" width="2.4" height="2" rx="1.2"/></g></svg></span><span>10:28</span></div>
+        <footer class="card-foot"><span class="foot-note">静音时回到一条细线</span><span class="meter" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></span></footer>
+      </article>
+
+      <article class="card" data-variant="b">
+        <header class="card-head">
+          <div><div class="letter">方案 B · 连贯</div><h2>声形轮廓</h2><p class="description">一条连续的声波轮廓，更接近人们熟悉的“波形”。</p></div>
+          <span class="tag">柔和</span>
+        </header>
+        <div class="preview">
+          <svg viewBox="0 0 24 20" role="img" aria-label="声形轮廓波形">
+            <path class="continuous-wave" fill="currentColor" d="M2 9.3 Q3 9.3 4 9.3 T6 9.3 T8 9.3 T10 9.3 T12 9.3 T14 9.3 T16 9.3 T18 9.3 T20 9.3 T22 9.3 L22 10.7 Q21 10.7 20 10.7 T18 10.7 T16 10.7 T14 10.7 T12 10.7 T10 10.7 T8 10.7 T6 10.7 T4 10.7 T2 10.7 Z"/>
+          </svg>
+          <span class="preview-caption">连续轮廓 · 不横向滚动</span>
+        </div>
+        <div class="menubar"><span class="tiny-app">RIME VOICE</span><span>输入法</span><span>中</span><span class="mini-icon"><svg viewBox="0 0 24 20" aria-hidden="true"><path class="continuous-wave" fill="currentColor" d="M2 9.3 Q3 9.3 4 9.3 T6 9.3 T8 9.3 T10 9.3 T12 9.3 T14 9.3 T16 9.3 T18 9.3 T20 9.3 T22 9.3 L22 10.7 Q21 10.7 20 10.7 T18 10.7 T16 10.7 T14 10.7 T12 10.7 T10 10.7 T8 10.7 T6 10.7 T4 10.7 T2 10.7 Z"/></svg></span><span>10:28</span></div>
+        <footer class="card-foot"><span class="foot-note">低于门限时完全回平</span><span class="meter" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></span></footer>
+      </article>
+
+      <article class="card" data-variant="c">
+        <header class="card-head">
+          <div><div class="letter">方案 C · 清晰</div><h2>密集细柱</h2><p class="description">九条更细的声柱，层次丰富，在菜单栏里更有“正在说话”的感觉。</p></div>
+          <span class="tag">醒目</span>
+        </header>
+        <div class="preview">
+          <svg viewBox="0 0 24 20" role="img" aria-label="密集细柱波形">
+            <g class="bars" fill="currentColor">
+              <rect data-weight=".28" x="2.2" y="9" width="1.25" height="2" rx=".62"/>
+              <rect data-weight=".52" x="4.5" y="9" width="1.25" height="2" rx=".62"/>
+              <rect data-weight=".76" x="6.8" y="9" width="1.25" height="2" rx=".62"/>
+              <rect data-weight=".92" x="9.1" y="9" width="1.25" height="2" rx=".62"/>
+              <rect data-weight="1" x="11.4" y="9" width="1.25" height="2" rx=".62"/>
+              <rect data-weight=".92" x="13.7" y="9" width="1.25" height="2" rx=".62"/>
+              <rect data-weight=".76" x="16" y="9" width="1.25" height="2" rx=".62"/>
+              <rect data-weight=".52" x="18.3" y="9" width="1.25" height="2" rx=".62"/>
+              <rect data-weight=".28" x="20.6" y="9" width="1.25" height="2" rx=".62"/>
+            </g>
+          </svg>
+          <span class="preview-caption">九条细线 · 小幅也可辨</span>
+        </div>
+        <div class="menubar"><span class="tiny-app">RIME VOICE</span><span>输入法</span><span>中</span><span class="mini-icon"><svg viewBox="0 0 24 20" aria-hidden="true"><g class="bars" fill="currentColor"><rect data-weight=".28" x="2.2" y="9" width="1.25" height="2" rx=".62"/><rect data-weight=".52" x="4.5" y="9" width="1.25" height="2" rx=".62"/><rect data-weight=".76" x="6.8" y="9" width="1.25" height="2" rx=".62"/><rect data-weight=".92" x="9.1" y="9" width="1.25" height="2" rx=".62"/><rect data-weight="1" x="11.4" y="9" width="1.25" height="2" rx=".62"/><rect data-weight=".92" x="13.7" y="9" width="1.25" height="2" rx=".62"/><rect data-weight=".76" x="16" y="9" width="1.25" height="2" rx=".62"/><rect data-weight=".52" x="18.3" y="9" width="1.25" height="2" rx=".62"/><rect data-weight=".28" x="20.6" y="9" width="1.25" height="2" rx=".62"/></g></svg></span><span>10:28</span></div>
+        <footer class="card-foot"><span class="foot-note">当前音量决定整组高度</span><span class="meter" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></span></footer>
+      </article>
+    </section>
+
+    <div class="note"><span class="note-mark">i</span><span><strong>演示说明</strong> 这三种图形都固定在原位，不滚动，也不使用随机峰值。当前音量只控制波形整体高度；门限以下会显示平线。浅色／深色切换模拟菜单栏对比度。</span></div>
+  </main>
+  <script>
+    const slider = document.querySelector('#level');
+    const levelText = document.querySelector('#levelText');
+    const levelPercent = document.querySelector('#levelPercent');
+    const dbReadout = document.querySelector('#dbReadout');
+    const presetButtons = [...document.querySelectorAll('.preset')];
+    const autoButton = document.querySelector('#auto');
+    const autoText = document.querySelector('#autoText');
+    const themeButton = document.querySelector('#theme');
+    const start = performance.now();
+    let automatic = false;
+    let autoStart = 0;
+
+    function visualAmplitude(raw) {
+      if (raw < 0.12) return 0;
+      return Math.pow((raw - 0.12) / 0.88, 0.82);
+    }
+
+    function presetName(value) {
+      if (value === 0) return '静音';
+      if (value <= 12) return '底噪';
+      if (value <= 40) return '轻声';
+      if (value <= 72) return '正常说话';
+      return '较响';
+    }
+
+    function setBars(svg, amp) {
+      const bars = [...svg.querySelectorAll('.bars rect')];
+      bars.forEach((bar) => {
+        const base = Number(bar.dataset.baseY || 10);
+        const maxHeight = Number(bar.dataset.maxHeight || 11.6);
+        const weight = Number(bar.dataset.weight);
+        const floor = 0.8;
+        const height = floor + (maxHeight * weight * amp);
+        bar.setAttribute('height', height.toFixed(2));
+        bar.setAttribute('y', (base - height / 2).toFixed(2));
+      });
+    }
+
+    function setContinuous(svg, amp) {
+      const path = svg.querySelector('.continuous-wave');
+      const profile = [0.12, 0.32, 0.66, 0.42, 0.88, 0.55, 1, 0.48, 0.74, 0.28, 0.12];
+      const xs = profile.map((_, i) => 2 + i * 2);
+      const center = 10;
+      const spread = 7.4 * amp;
+      const top = profile.map((weight, i) => [xs[i], center - Math.max(.4, spread * weight)]);
+      const bottom = profile.map((weight, i) => [xs[i], center + Math.max(.4, spread * weight)]).reverse();
+      let d = `M ${top[0][0]} ${top[0][1]}`;
+      for (let i = 1; i < top.length; i++) {
+        const midX = (top[i - 1][0] + top[i][0]) / 2;
+        const midY = (top[i - 1][1] + top[i][1]) / 2;
+        d += ` Q ${top[i - 1][0]} ${top[i - 1][1]} ${midX} ${midY}`;
+      }
+      d += ` T ${top[top.length - 1][0]} ${top[top.length - 1][1]}`;
+      for (let i = 0; i < bottom.length; i++) d += ` L ${bottom[i][0]} ${bottom[i][1]}`;
+      d += ' Z';
+      path.setAttribute('d', d);
+      path.style.opacity = amp === 0 ? '.38' : '1';
+    }
+
+    function update(value) {
+      const numeric = Math.max(0, Math.min(100, Number(value)));
+      const raw = numeric / 100;
+      const amp = visualAmplitude(raw);
+      slider.value = String(Math.round(numeric));
+      levelText.textContent = presetName(Math.round(numeric));
+      levelPercent.textContent = String(Math.round(numeric));
+      dbReadout.textContent = raw === 0 ? '−∞ dBFS' : `${Math.round(20 * Math.log10(raw))} dBFS`;
+      presetButtons.forEach((button) => button.setAttribute('aria-pressed', Number(button.dataset.level) === Math.round(numeric) ? 'true' : 'false'));
+      document.querySelectorAll('.preview svg, .menubar svg').forEach((svg) => {
+        setBars(svg, amp);
+        if (svg.querySelector('.continuous-wave')) setContinuous(svg, amp);
+      });
+      document.querySelectorAll('.meter').forEach((meter) => {
+        [...meter.children].forEach((tick, i) => {
+          const weight = [0.4, 0.72, 1, 0.72, 0.4][i];
+          const height = 3 + amp * 13 * weight;
+          tick.style.height = `${height.toFixed(1)}px`;
+          tick.style.background = amp === 0 ? '#c8ccd4' : 'var(--accent)';
+        });
+      });
+    }
+
+    slider.addEventListener('input', () => { automatic = false; autoButton.setAttribute('aria-pressed', 'false'); autoText.textContent = '自动演示'; update(slider.value); });
+    presetButtons.forEach((button) => button.addEventListener('click', () => { automatic = false; autoButton.setAttribute('aria-pressed', 'false'); autoText.textContent = '自动演示'; update(button.dataset.level); }));
+    autoButton.addEventListener('click', () => {
+      automatic = !automatic;
+      autoStart = performance.now();
+      autoButton.setAttribute('aria-pressed', String(automatic));
+      autoText.textContent = automatic ? '停止演示' : '自动演示';
+    });
+    themeButton.addEventListener('click', () => {
+      const dark = document.body.dataset.theme !== 'dark';
+      document.body.dataset.theme = dark ? 'dark' : 'light';
+      themeButton.textContent = dark ? '深色状态栏' : '浅色状态栏';
+    });
+    function animate(now) {
+      if (automatic) {
+        const t = (now - autoStart) / 1000;
+        const phrase = (t % 5.6);
+        const envelope = phrase < .7 ? .025 : phrase < 3.8 ? .3 + .5 * Math.max(0, Math.sin((phrase - .7) * 2.15)) : phrase < 4.25 ? .22 : .025;
+        update(Math.round(envelope * 100));
+      }
+      requestAnimationFrame(animate);
+    }
+    update(slider.value);
+    requestAnimationFrame(animate);
+  </script>
+</body>
+</html>

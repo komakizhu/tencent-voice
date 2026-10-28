@@ -166,14 +166,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         super.init()
         coordinator.setStateObserver { [weak self] state in
+            guard let self else { return }
+            menu.update(recordingState: state)
             guard case .error = state else { return }
-            self?.endTrackedUsageSession()
-            self?.updateLocalUsageDisplay()
+            self.endTrackedUsageSession()
+            self.updateLocalUsageDisplay()
         }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let launchSettings = settingsStore.load()
+        menu.update(menuBarDisplayMode: launchSettings.menuBarDisplayMode)
         NSApp.setActivationPolicy(launchSettings.hideMenuBarIcon ? .regular : .accessory)
         installMainMenu()
         if !launchSettings.hideMenuBarIcon {
@@ -214,6 +217,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.openFailureReports()
             }
         )
+        menu.configureRecordingDisplay { [weak self] in
+            self?.coordinator.recordingDisplaySnapshot()
+        }
         applyFailureContextSetting()
         menu.update(autoStartEnabled: loginItemManager.isEnabled)
         refreshRimeThemes()
@@ -407,6 +413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 settingsStore.save(newSettings)
                 coordinator.refreshDiagnosticCollectionSettings()
                 diagnosticWindowFrameRecorder.setCaptureEnabled(newSettings.captureDiagnosticWindowFrames)
+                menu.update(menuBarDisplayMode: newSettings.menuBarDisplayMode)
                 menu.setVisible(!newSettings.hideMenuBarIcon)
                 if !newSettings.hideMenuBarIcon {
                     menu.update(autoStartEnabled: loginItemManager.isEnabled)
@@ -414,7 +421,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 menu.update(shortcut: newSettings.shortcut)
                 migrateLocalUsageIfNeeded()
-                menu.update(status: "就绪 · \(ShortcutFormatter.string(for: newSettings.shortcut))")
+                if coordinator.state == .idle {
+                    menu.update(status: "就绪 · \(ShortcutFormatter.string(for: newSettings.shortcut))")
+                }
+                menu.update(recordingState: coordinator.state)
                 updateLocalUsageDisplay()
             },
             onTestConnection: { credentials, engineModelType in

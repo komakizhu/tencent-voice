@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Rime Voice · 五线波形动态对比</title>
+  <style>
+    :root { color-scheme: light; --page:#f3f4f6; --surface:#fff; --soft:#f7f8fa; --ink:#171a20; --muted:#737985; --line:#e5e7eb; --accent:#4359d8; --accent-soft:#edf0ff; --shadow:0 16px 42px rgba(24,30,48,.075); }
+    * { box-sizing:border-box; }
+    body { margin:0; min-width:320px; background:var(--page); color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue",sans-serif; -webkit-font-smoothing:antialiased; }
+    button,input { font:inherit; }
+    .page { max-width:1080px; margin:auto; padding:48px 28px 38px; }
+    .eyebrow { display:flex; align-items:center; gap:9px; color:var(--muted); font-size:10px; font-weight:750; letter-spacing:.13em; }
+    .brand { width:8px; height:8px; border-radius:50%; background:var(--accent); box-shadow:0 0 0 4px var(--accent-soft); }
+    h1 { margin:17px 0 8px; font-size:clamp(29px,5vw,44px); line-height:1.05; letter-spacing:-.045em; font-weight:730; }
+    .intro { margin:0; color:var(--muted); font-size:14px; line-height:1.6; }
+    .controls { display:grid; grid-template-columns:minmax(210px,1fr) auto; gap:17px 20px; align-items:center; margin:27px 0 19px; padding:16px 18px; border:1px solid var(--line); border-radius:17px; background:var(--surface); box-shadow:0 6px 18px rgba(24,30,48,.035); }
+    .slider-row { display:grid; grid-template-columns:auto minmax(100px,1fr) 38px; gap:13px; align-items:center; }
+    .slider-label strong { display:block; font-size:11px; }
+    .slider-label span { display:block; margin-top:3px; color:var(--muted); font-size:10px; }
+    input[type=range] { width:100%; accent-color:var(--accent); cursor:pointer; }
+    .value { color:var(--muted); text-align:right; font-size:11px; font-variant-numeric:tabular-nums; }
+    .presets { display:flex; justify-content:flex-end; flex-wrap:wrap; gap:6px; }
+    .preset,.action { border:1px solid var(--line); border-radius:999px; padding:8px 10px; background:var(--surface); color:var(--ink); font-size:10px; font-weight:650; cursor:pointer; white-space:nowrap; transition:.15s ease; }
+    .preset:hover,.action:hover { border-color:#bbc2d0; transform:translateY(-1px); }
+    .preset[aria-pressed=true],.action[aria-pressed=true] { border-color:#cbd2ff; background:var(--accent-soft); color:var(--accent); }
+    .control-bottom { grid-column:1/-1; display:flex; align-items:center; justify-content:space-between; margin-top:-3px; }
+    .caption { color:var(--muted); font-size:10px; }
+    .caption strong { color:var(--ink); font-weight:700; }
+    .actions { display:flex; gap:6px; }
+    .action { display:inline-flex; align-items:center; gap:6px; }
+    .dot { width:6px; height:6px; border-radius:50%; background:currentColor; }
+    .cards { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:15px; }
+    .card { min-width:0; overflow:hidden; border:1px solid var(--line); border-radius:19px; background:var(--surface); box-shadow:var(--shadow); }
+    .card-head { min-height:112px; padding:18px 18px 13px; }
+    .meta { display:flex; justify-content:space-between; align-items:center; gap:10px; color:var(--muted); font-size:9px; font-weight:750; letter-spacing:.12em; }
+    .pill { padding:5px 8px; border-radius:999px; background:var(--soft); color:var(--muted); font-size:9px; font-weight:650; letter-spacing:0; }
+    h2 { margin:8px 0 5px; font-size:16px; letter-spacing:-.02em; }
+    .desc { margin:0; color:var(--muted); font-size:10px; line-height:1.5; }
+    .stage { position:relative; display:grid; place-items:center; min-height:157px; margin:0 12px; border-radius:13px; background:var(--soft); color:var(--ink); }
+    .stage svg { width:118px; height:92px; overflow:visible; }
+    .stage-label { position:absolute; left:12px; bottom:10px; color:var(--muted); font-size:9px; letter-spacing:.025em; }
+    .menubar { display:flex; align-items:center; justify-content:flex-end; gap:12px; height:40px; margin:11px 12px 0; padding:0 12px; border-radius:8px; background:#f1f2f4; color:#252830; font-size:9px; font-weight:600; box-shadow:inset 0 0 0 1px rgba(20,25,35,.05); }
+    .menubar .app { margin-right:auto; color:#777c85; font-weight:700; letter-spacing:.04em; }
+    .menubar .mini { display:grid; place-items:center; width:18px; height:20px; }
+    .menubar svg { width:18px; height:18px; overflow:visible; }
+    .foot { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:12px 16px 15px; }
+    .foot span:first-child { color:var(--muted); font-size:9px; line-height:1.4; }
+    .meter { display:flex; align-items:center; gap:4px; }
+    .meter i { display:block; width:4px; border-radius:99px; background:#c8ccd4; transition:height .1s ease,background .1s ease; }
+    .explain { display:flex; gap:9px; align-items:flex-start; margin-top:17px; padding:11px 13px; border-radius:11px; background:rgba(67,89,216,.07); color:#535a6d; font-size:10px; line-height:1.55; }
+    .info { flex:0 0 auto; display:grid; place-items:center; width:16px; height:16px; border-radius:50%; background:var(--accent); color:white; font-size:9px; font-weight:800; }
+    .explain strong { color:var(--ink); }
+    body[data-theme=dark] { --page:#101216; --surface:#1a1d23; --soft:#22262e; --ink:#f2f3f6; --muted:#969ba6; --line:#30343c; --accent:#9daaff; --accent-soft:#282e4e; --shadow:0 16px 42px rgba(0,0,0,.22); }
+    body[data-theme=dark] .menubar { background:#292c32; color:#f4f5f7; box-shadow:inset 0 0 0 1px rgba(255,255,255,.06); }
+    body[data-theme=dark] .menubar .app { color:#aaaeb7; }
+    body[data-theme=dark] .explain { color:#b2b8c9; }
+    @media(max-width:850px) { .page{padding:36px 20px 28px}.controls{grid-template-columns:1fr}.presets{justify-content:flex-start}.cards{grid-template-columns:1fr}.card-head{min-height:auto}.stage{min-height:140px} }
+    @media(max-width:500px) { .page{padding:27px 14px}.slider-row{grid-template-columns:1fr auto}.slider-label{grid-column:1/-1}.slider-row input{grid-column:1}.control-bottom{align-items:flex-start;gap:10px;flex-direction:column} }
+    @media(prefers-reduced-motion:reduce) { *,*::before,*::after{transition-duration:.01ms!important;animation-duration:.01ms!important} }
+  </style>
+</head>
+<body data-theme="light">
+  <main class="page">
+    <div class="eyebrow"><span class="brand"></span> RIME VOICE <span aria-hidden="true">/</span> FIVE-BAR MOTION</div>
+    <h1>五根线，三种动态性格</h1>
+    <p class="intro">中间起伏最大，向两侧逐渐收敛。三版使用同一段模拟声音，同时比较起伏与回落。</p>
+
+    <section class="controls" aria-label="波形模拟控制">
+      <div class="slider-row">
+        <div class="slider-label"><strong>输入音量</strong><span id="levelName">正常说话</span></div>
+        <input id="level" type="range" min="0" max="100" value="58" aria-label="模拟输入音量">
+        <div class="value"><strong id="levelValue">58</strong>%</div>
+      </div>
+      <div class="presets" role="group" aria-label="预设音量">
+        <button class="preset" data-value="0" aria-pressed="false">静音</button>
+        <button class="preset" data-value="7" aria-pressed="false">底噪</button>
+        <button class="preset" data-value="28" aria-pressed="false">轻声</button>
+        <button class="preset" data-value="58" aria-pressed="true">说话</button>
+        <button class="preset" data-value="92" aria-pressed="false">较响</button>
+      </div>
+      <div class="control-bottom">
+        <div class="caption">显示门限 <strong>12%</strong><span> · 仅模拟音量，不访问麦克风</span></div>
+        <div class="actions">
+          <button id="auto" class="action" aria-pressed="true"><span class="dot"></span><span id="autoLabel">停止演示</span></button>
+          <button id="theme" class="action" aria-label="切换深浅色状态栏">浅色状态栏</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="cards" aria-label="保守、标准、激进三种动态">
+<article class="card"><header class="card-head"><div class="meta"><span>保守版</span><span class="pill">轻、稳、收敛</span></div><h2>保守版</h2><p class="desc">细线、小幅起伏，声音停止后柔和收回。</p></header><div class="stage"><svg data-variant="conservative" viewBox="0 0 24 20" role="img" aria-label="保守版，五根线"><g fill="currentColor"><rect class="bar" data-index="0" x="4.15" y="10" width="1.7" height="0" rx="0.85"/><rect class="bar" data-index="1" x="7.65" y="10" width="1.7" height="0" rx="0.85"/><rect class="bar" data-index="2" x="11.15" y="10" width="1.7" height="0" rx="0.85"/><rect class="bar" data-index="3" x="14.65" y="10" width="1.7" height="0" rx="0.85"/><rect class="bar" data-index="4" x="18.15" y="10" width="1.7" height="0" rx="0.85"/></g></svg><span class="stage-label">放大预览 · 五根线全部参与变化</span></div><div class="menubar"><span class="app">RIME VOICE</span><span>中</span><span class="mini"><svg data-variant="conservative" viewBox="0 0 24 20" role="img" aria-label="保守版，五根线"><g fill="currentColor"><rect class="bar" data-index="0" x="4.15" y="10" width="1.7" height="0" rx="0.85"/><rect class="bar" data-index="1" x="7.65" y="10" width="1.7" height="0" rx="0.85"/><rect class="bar" data-index="2" x="11.15" y="10" width="1.7" height="0" rx="0.85"/><rect class="bar" data-index="3" x="14.65" y="10" width="1.7" height="0" rx="0.85"/><rect class="bar" data-index="4" x="18.15" y="10" width="1.7" height="0" rx="0.85"/></g></svg></span><span>10:28</span></div><footer class="foot"><span>两侧轻微伸缩 · 中间适度起伏</span></footer></article>
+<article class="card"><header class="card-head"><div class="meta"><span>标准版</span><span class="pill">常规均衡</span></div><h2>标准版</h2><p class="desc">圆角五线，中心高、两侧渐低，跟声清楚。</p></header><div class="stage"><svg data-variant="standard" viewBox="0 0 24 20" role="img" aria-label="标准版，五根线"><g fill="currentColor"><rect class="bar" data-index="0" x="3.70" y="10" width="2.2" height="0" rx="1.1"/><rect class="bar" data-index="1" x="7.30" y="10" width="2.2" height="0" rx="1.1"/><rect class="bar" data-index="2" x="10.90" y="10" width="2.2" height="0" rx="1.1"/><rect class="bar" data-index="3" x="14.50" y="10" width="2.2" height="0" rx="1.1"/><rect class="bar" data-index="4" x="18.10" y="10" width="2.2" height="0" rx="1.1"/></g></svg><span class="stage-label">放大预览 · 五根线全部参与变化</span></div><div class="menubar"><span class="app">RIME VOICE</span><span>中</span><span class="mini"><svg data-variant="standard" viewBox="0 0 24 20" role="img" aria-label="标准版，五根线"><g fill="currentColor"><rect class="bar" data-index="0" x="3.70" y="10" width="2.2" height="0" rx="1.1"/><rect class="bar" data-index="1" x="7.30" y="10" width="2.2" height="0" rx="1.1"/><rect class="bar" data-index="2" x="10.90" y="10" width="2.2" height="0" rx="1.1"/><rect class="bar" data-index="3" x="14.50" y="10" width="2.2" height="0" rx="1.1"/><rect class="bar" data-index="4" x="18.10" y="10" width="2.2" height="0" rx="1.1"/></g></svg></span><span>10:28</span></div><footer class="foot"><span>作为本次对比的均衡基准</span></footer></article>
+<article class="card"><header class="card-head"><div class="meta"><span>激进版</span><span class="pill">更敏捷、更明显</span></div><h2>激进版</h2><p class="desc">更饱满的线条，轻声也有明显起伏，快速收回。</p></header><div class="stage"><svg data-variant="bold" viewBox="0 0 24 20" role="img" aria-label="激进版，五根线"><g fill="currentColor"><rect class="bar" data-index="0" x="3.10" y="10" width="2.6" height="0" rx="1.3"/><rect class="bar" data-index="1" x="6.90" y="10" width="2.6" height="0" rx="1.3"/><rect class="bar" data-index="2" x="10.70" y="10" width="2.6" height="0" rx="1.3"/><rect class="bar" data-index="3" x="14.50" y="10" width="2.6" height="0" rx="1.3"/><rect class="bar" data-index="4" x="18.30" y="10" width="2.6" height="0" rx="1.3"/></g></svg><span class="stage-label">放大预览 · 五根线全部参与变化</span></div><div class="menubar"><span class="app">RIME VOICE</span><span>中</span><span class="mini"><svg data-variant="bold" viewBox="0 0 24 20" role="img" aria-label="激进版，五根线"><g fill="currentColor"><rect class="bar" data-index="0" x="3.10" y="10" width="2.6" height="0" rx="1.3"/><rect class="bar" data-index="1" x="6.90" y="10" width="2.6" height="0" rx="1.3"/><rect class="bar" data-index="2" x="10.70" y="10" width="2.6" height="0" rx="1.3"/><rect class="bar" data-index="3" x="14.50" y="10" width="2.6" height="0" rx="1.3"/><rect class="bar" data-index="4" x="18.30" y="10" width="2.6" height="0" rx="1.3"/></g></svg></span><span>10:28</span></div><footer class="foot"><span>中心大幅跳动 · 两侧缓和跟随</span></footer></article>
+</section><div class="explain"><span class="info">i</span><span>三版始终只有五根线，两端也会伸缩。静音后全部消失；下方菜单栏显示小尺寸效果。“标准版”是这次设计的常规均衡基准，不代表统一行业规范。</span></div>
+  </main>
+  <script>
+const slider=document.querySelector('#level'), levelName=document.querySelector('#levelName'), levelValue=document.querySelector('#levelValue');
+const presets=[...document.querySelectorAll('.preset')], autoButton=document.querySelector('#auto'), autoLabel=document.querySelector('#autoLabel'), theme=document.querySelector('#theme');
+const designs={
+ conservative:{width:1.7,max:10,weights:[.20,.56,1,.56,.20],power:.95,attack:75,release:130},
+ standard:{width:2.2,max:14,weights:[.30,.66,1,.66,.30],power:.75,attack:35,release:80},
+ bold:{width:2.6,max:17,weights:[.38,.74,1,.74,.38],power:.52,attack:18,release:45}
+};
+let automatic=!matchMedia('(prefers-reduced-motion: reduce)').matches, autoStart=performance.now(), lastFrame=0, input=58, silentSince=null;
+const levels=Object.fromEntries(Object.keys(designs).map(key=>[key,[0,0,0,0,0]]));
+const views=[...document.querySelectorAll('svg[data-variant]')];
+function updateInput(next){
+ input=Math.max(0,Math.min(100,Number(next)));
+ slider.value=String(Math.round(input)); levelValue.textContent=String(Math.round(input));
+ levelName.textContent=input===0?'静音':input<=12?'底噪':input<=40?'轻声':input<=72?'正常说话':'较响';
+ presets.forEach(button=>button.setAttribute('aria-pressed',String(Number(button.dataset.value)===Math.round(input))));
+}
+function syncAuto(){autoButton.setAttribute('aria-pressed',String(automatic));autoLabel.textContent=automatic?'停止演示':'自动演示';}
+function draw(now,dt){
+ const raw=Math.max(0,(input/100-.12)/.88);
+ if(raw===0){if(silentSince===null)silentSince=now;}else silentSince=null;
+ for(const [key,design] of Object.entries(designs)){
+  const target=Math.pow(raw,design.power);
+  for(let i=0;i<5;i++){
+   const previous=levels[key][i];
+   const edgeSlow=1+Math.abs(i-2)*.22;
+   const tau=(target>previous?design.attack:design.release)*edgeSlow;
+   levels[key][i]=previous+(target-previous)*(1-Math.exp(-dt/tau));
+   if(silentSince!==null&&now-silentSince>=120)levels[key][i]=0;
+  }
+ }
+ views.forEach(svg=>{
+  const key=svg.dataset.variant, design=designs[key];
+  svg.querySelectorAll('.bar').forEach((bar,i)=>{
+   const amplitude=levels[key][i];
+   const h=design.width+(design.max-design.width)*design.weights[i]*amplitude;
+   bar.setAttribute('height',h.toFixed(3));bar.setAttribute('y',(10-h/2).toFixed(3));
+   bar.setAttribute('opacity',amplitude<.001?'0':String(Math.min(1,amplitude/.06)));
+  });
+ });
+}
+slider.addEventListener('input',()=>{automatic=false;syncAuto();updateInput(slider.value);});
+presets.forEach(button=>button.addEventListener('click',()=>{automatic=false;syncAuto();updateInput(button.dataset.value);}));
+autoButton.addEventListener('click',()=>{automatic=!automatic;autoStart=performance.now();syncAuto();});
+theme.addEventListener('click',()=>{const dark=document.body.dataset.theme!=='dark';document.body.dataset.theme=dark?'dark':'light';theme.textContent=dark?'深色状态栏':'浅色状态栏';});
+function frame(now){
+ if(now-lastFrame>=50){
+  const dt=Math.min(100,now-lastFrame||50);lastFrame=now;
+  if(automatic){
+   const t=((now-autoStart)/1000)%6;
+   const syllables=[[.6,.85,.22],[1.05,.62,.17],[1.5,.96,.25],[2.15,.5,.19],[2.6,.78,.26],[3.3,.94,.16],[3.65,.6,.24],[4.2,.76,.25]];
+   const envelope=Math.min(1,syllables.reduce((sum,[center,height,spread])=>sum+height*Math.exp(-Math.pow((t-center)/spread,2)*2),0));
+   updateInput(envelope<.04?0:envelope*100);
+  }
+  draw(now,dt);
+ }
+ requestAnimationFrame(frame);
+}
+syncAuto();updateInput(58);draw(performance.now(),50);requestAnimationFrame(frame);
+  </script>
+</body>
+</html>

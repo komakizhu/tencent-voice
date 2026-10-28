@@ -526,16 +526,17 @@ enum AXTextDocumentResolver {
     static func isStaleAXValueBehindSelection(
         rawText: String,
         selection: TextRange,
-        confirmedRawText: String?,
+        confirmedState: KeyboardDocumentState?,
         expectedSelection: TextRange?
     ) -> Bool {
-        guard let confirmedRawText,
+        guard let confirmedState,
+              let confirmedRawText = confirmedState.rawText,
               let expectedSelection,
               rawText == confirmedRawText,
               selection == expectedSelection,
               selection.length == 0,
               selection.location >= 0,
-              selection.location > rawText.utf16.count else {
+              selection.location > confirmedState.text.utf16.count else {
             return false
         }
         return true

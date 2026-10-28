@@ -136,6 +136,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let appIDField = NSTextField()
     private let secretIDField = NSTextField()
     private let secretKeyField = NSSecureTextField()
+    private let credentialsEditCheckbox = NSButton(
+        checkboxWithTitle: "解锁 API 凭证修改",
+        target: nil,
+        action: nil
+    )
     private let enginePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let prepaidHoursPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let shortcutPresetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -155,6 +160,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         target: nil,
         action: nil
     )
+    private let menuBarDisplayModePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let shortcutLabel = NSTextField(labelWithString: "")
     private let versionLabel = NSTextField(labelWithString: AppVersion.displayText)
     private let statusLabel = NSTextField(labelWithString: "凭证优先保存在本机 YAML")
@@ -228,6 +234,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         appIDField.stringValue = credentials?.appID ?? ""
         secretIDField.stringValue = credentials?.secretID ?? ""
         secretKeyField.stringValue = credentials?.secretKey ?? ""
+        credentialsEditCheckbox.state = .off
+        setCredentialFieldsEnabled(false)
         statusLabel.stringValue = credentials == nil
             ? "凭证保存在本机共享目录（明文）"
             : "已读取本机共享凭证；两个 macOS 账户可共用"
@@ -253,6 +261,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         captureWindowFramesCheckbox.state = settings.captureDiagnosticWindowFrames ? .on : .off
         alwaysSaveVoiceContentCheckbox.state = settings.alwaysSaveVoiceContent ? .on : .off
         hideMenuBarIconCheckbox.state = settings.hideMenuBarIcon ? .on : .off
+        for mode in MenuBarDisplayMode.allCases {
+            menuBarDisplayModePopup.addItem(withTitle: mode.displayName)
+            menuBarDisplayModePopup.lastItem?.representedObject = mode.rawValue
+        }
+        menuBarDisplayModePopup.selectItem(withTitle: settings.menuBarDisplayMode.displayName)
+        menuBarDisplayModePopup.setAccessibilityLabel("状态栏录音显示模式")
         shortcutLabel.stringValue = ShortcutFormatter.string(for: currentShortcut)
         buildView()
         refreshPermissionReport()
@@ -291,6 +305,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         guard let contentView = window?.contentView else { return }
         let logRow = diagnosticLogRow()
         let fields = NSStackView(views: [
+            credentialsEditCheckbox,
             labeled(
                 "AppID",
                 view: appIDField,
@@ -319,6 +334,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             testButton,
             safeCopyRow(),
             logRow,
+            labeled(
+                "状态栏录音显示",
+                view: menuBarDisplayModePopup,
+                toolTip: "选择录音时状态栏显示图标、已录时长或真实麦克风音量波形；修改后点击“保存设置”。"
+            ),
             hideMenuBarIconCheckbox,
             storageSection()
         ])
@@ -347,6 +367,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         let saveButton = NSButton(title: "保存设置", target: self, action: #selector(saveButtonPressed))
         saveButton.keyEquivalent = "\r"
+        credentialsEditCheckbox.target = self
+        credentialsEditCheckbox.action = #selector(credentialsEditingChanged)
+        credentialsEditCheckbox.setAccessibilityLabel("解锁 API 凭证修改")
+        credentialsEditCheckbox.toolTip = "默认锁定 AppID、SecretId 和 SecretKey；勾选后可编辑。取消勾选会撤销未保存的凭证修改，保存设置成功后会自动锁定。"
         testButton.target = self
         testButton.action = #selector(testConnectionPressed)
         testButton.isEnabled = onTestConnection != nil
@@ -359,7 +383,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         alwaysSaveVoiceContentCheckbox.toolTip = "开启后，每次正常结束语音输入时都会复制完整识别结果。取消或输入异常时，应用始终会自动保存最新已识别文字。"
         logCheckbox.toolTip = "开启后保存本次会话的识别修订、输入框正文和诊断事件；点击右侧“导出诊断报告”导出。"
         hideMenuBarIconCheckbox.toolTip = "隐藏状态栏图标；隐藏后可从 Dock 中 Rime Voice 的应用菜单重新打开设置。"
-        saveButton.toolTip = "保存腾讯云凭证和设置；日志开关、始终保存语音内容和快捷键也在此生效。"
+        saveButton.toolTip = "保存腾讯云凭证和设置；凭证保存成功后会自动锁定。日志开关、始终保存语音内容和快捷键也在此生效。"
         shortcutPresetPopup.toolTip = "选择常用快捷键预设；F5 会在 Rime Voice 运行期间屏蔽 macOS 原生听写。"
         shortcutPresetPopup.setAccessibilityLabel("快捷键预设")
         permissionResetButton.target = self
@@ -722,12 +746,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             saveTextLogs: logCheckbox.state == .on,
             alwaysSaveVoiceContent: alwaysSaveVoiceContentCheckbox.state == .on,
             hideMenuBarIcon: hideMenuBarIconCheckbox.state == .on,
+            menuBarDisplayMode: MenuBarDisplayMode(
+                persistedValue: menuBarDisplayModePopup.selectedItem?.representedObject as? String
+            ),
             captureDiagnosticWindowFrames: captureWindowFramesCheckbox.state == .on,
             prepaidQuotaHoursByModel: prepaidQuotaHoursByModel
         )
         do {
             try onSave(settings, credentials)
             storedCredentials = credentials
+            credentialsEditCheckbox.state = .off
+            setCredentialFieldsEnabled(false)
             onRecordDiagnosticAction?("settings_saved", [
                 "engineModelType": settings.engineModelType,
                 "saveTextLogs": String(settings.saveTextLogs),
@@ -752,6 +781,29 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             ])
             statusLabel.stringValue = "保存失败：\(error.localizedDescription)"
         }
+    }
+
+    @objc private func credentialsEditingChanged() {
+        let isEditing = credentialsEditCheckbox.state == .on
+        setCredentialFieldsEnabled(isEditing)
+        if isEditing {
+            statusLabel.stringValue = "凭证已解锁；修改后点击“保存设置”。"
+        } else {
+            restoreStoredCredentialsInFields()
+            statusLabel.stringValue = "凭证已锁定；未保存的修改已撤销。"
+        }
+    }
+
+    private func setCredentialFieldsEnabled(_ isEnabled: Bool) {
+        appIDField.isEnabled = isEnabled
+        secretIDField.isEnabled = isEnabled
+        secretKeyField.isEnabled = isEnabled
+    }
+
+    private func restoreStoredCredentialsInFields() {
+        appIDField.stringValue = storedCredentials?.appID ?? ""
+        secretIDField.stringValue = storedCredentials?.secretID ?? ""
+        secretKeyField.stringValue = storedCredentials?.secretKey ?? ""
     }
 
     @objc private func openDirectoryPressed(_ sender: NSButton) {
