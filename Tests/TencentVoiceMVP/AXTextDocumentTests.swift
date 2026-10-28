@@ -734,34 +734,103 @@ final class AXTextDocumentTests: XCTestCase {
     }
 
     func testStaleAXValueBehindAdvancedSelectionIsRecognizedAsTransient() {
-        let staleRawText = "abcdef"
-        let advancedSelection = TextRange(location: 7, length: 0)
-        let expectedSelection = advancedSelection
+        let cases: [(rawText: String, text: String)] = [
+            ("a\n😀", "a😀"),
+            ("a\r\n😀", "a😀"),
+            ("\n\r\n😀\u{2028}\n", "😀")
+        ]
+
+        for (rawText, text) in cases {
+            let confirmed = KeyboardDocumentState(
+                text: text,
+                selection: .init(location: text.utf16.count, length: 0),
+                rawText: rawText
+            )
+            let expectedSelection = TextRange(location: text.utf16.count + 1, length: 0)
+
+            XCTAssertTrue(
+                AXTextDocumentResolver.isStaleAXValueBehindSelection(
+                    rawText: rawText,
+                    selection: expectedSelection,
+                    confirmedState: confirmed,
+                    expectedSelection: expectedSelection
+                ),
+                "The previous editable UTF-16 length must ignore structural separators in \(rawText.debugDescription)"
+            )
+        }
+
+        let staleRawText = "a\n😀"
+        let confirmed = KeyboardDocumentState(
+            text: "a😀",
+            selection: .init(location: 3, length: 0),
+            rawText: staleRawText
+        )
+        let advancedSelection = TextRange(location: 4, length: 0)
 
         XCTAssertThrowsError(
             try AXTextDocumentResolver.resolve(
                 rawText: staleRawText,
-                selection: advancedSelection,
+                selection: TextRange(location: 4, length: 0),
                 placeholderEvidence: AXPlaceholderEvidence(),
-                probe: rangeProbe(staleRawText)
+                probe: rangeProbe("a😀")
             )
         ) { error in
-            XCTAssertEqual(error as? AXTextDocumentResolutionError, .invalidSelection)
+            XCTAssertEqual(error as? AXTextDocumentResolutionError, .selectionOutOfBounds)
         }
         XCTAssertTrue(
             AXTextDocumentResolver.isStaleAXValueBehindSelection(
                 rawText: staleRawText,
                 selection: advancedSelection,
-                confirmedRawText: staleRawText,
-                expectedSelection: expectedSelection
+                confirmedState: confirmed,
+                expectedSelection: advancedSelection
             )
         )
         XCTAssertFalse(
             AXTextDocumentResolver.isStaleAXValueBehindSelection(
                 rawText: "different",
                 selection: advancedSelection,
-                confirmedRawText: staleRawText,
-                expectedSelection: expectedSelection
+                confirmedState: confirmed,
+                expectedSelection: advancedSelection
+            )
+        )
+        XCTAssertFalse(
+            AXTextDocumentResolver.isStaleAXValueBehindSelection(
+                rawText: staleRawText,
+                selection: TextRange(location: 3, length: 0),
+                confirmedState: confirmed,
+                expectedSelection: advancedSelection
+            )
+        )
+        XCTAssertFalse(
+            AXTextDocumentResolver.isStaleAXValueBehindSelection(
+                rawText: staleRawText,
+                selection: TextRange(location: 4, length: 1),
+                confirmedState: confirmed,
+                expectedSelection: TextRange(location: 4, length: 1)
+            )
+        )
+        XCTAssertFalse(
+            AXTextDocumentResolver.isStaleAXValueBehindSelection(
+                rawText: staleRawText,
+                selection: advancedSelection,
+                confirmedState: nil,
+                expectedSelection: advancedSelection
+            )
+        )
+        XCTAssertFalse(
+            AXTextDocumentResolver.isStaleAXValueBehindSelection(
+                rawText: staleRawText,
+                selection: advancedSelection,
+                confirmedState: confirmed,
+                expectedSelection: nil
+            )
+        )
+        XCTAssertFalse(
+            AXTextDocumentResolver.isStaleAXValueBehindSelection(
+                rawText: staleRawText,
+                selection: TextRange(location: 3, length: 0),
+                confirmedState: confirmed,
+                expectedSelection: TextRange(location: 3, length: 0)
             )
         )
     }

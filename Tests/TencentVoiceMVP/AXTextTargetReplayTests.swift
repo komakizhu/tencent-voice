@@ -427,6 +427,232 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertFalse(target.drainDiagnostics().contains { $0.event == "keyboard_write_unconfirmed" })
     }
 
+    func testCodexStructuralAXValueLagAfterCaretAdvanceWaitsForCompleteReceipt() async throws {
+        for initialRaw in ["\nTask Router", "Task\nRouter"] {
+            let initialCoordinate = initialRaw.filter { $0 != "\n" }
+            let access = ReplayAXTextTargetAccess(
+                text: initialRaw,
+                selection: .init(location: initialCoordinate.utf16.count, length: 0),
+                application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+            )
+            let clock = ManualKeyboardPacingClock()
+            let sender = ReplayKeyboardEventSender(access: access)
+            let target = AXTextTarget(
+                access: access,
+                keyboardEventSender: sender,
+                writeTiming: .init(
+                    now: { clock.nowNanoseconds },
+                    sleep: { clock.advance(by: $0) }
+                ),
+                acknowledgementTimeoutNanoseconds: 50_000_000
+            )
+
+            _ = try target.capture()
+            for character in "abcdef" {
+                try target.paste(String(character))
+                try await target.acknowledgeKeyboardWrite()
+            }
+
+            let oldRaw = access.rawText
+            let oldCoordinate = access.coordinateText
+            let oldSelection = access.selection
+            let advancedSelection = ReplayTextRange(location: oldCoordinate.utf16.count + 1, length: 0)
+            let newRaw = oldRaw + ","
+            let newCoordinate = oldCoordinate + ","
+            access.readSnapshotsAfterNextWrite = [
+                .init(rawText: oldRaw, coordinateText: oldCoordinate, selection: oldSelection),
+                .init(rawText: oldRaw, coordinateText: oldCoordinate, selection: advancedSelection),
+                .init(rawText: newRaw, coordinateText: newCoordinate, selection: advancedSelection)
+            ]
+
+            try target.paste(",")
+            try await target.acknowledgeKeyboardWrite()
+
+            XCTAssertEqual(access.rawText, newRaw)
+            XCTAssertEqual(access.coordinateText, newCoordinate)
+            XCTAssertEqual(access.selection, advancedSelection)
+            XCTAssertEqual(sender.appendPosts, 7, "The comma must be posted once after six confirmed writes")
+            XCTAssertTrue(access.queuedTextReadSnapshots.isEmpty, "Acknowledgement must wait for the complete snapshot")
+            XCTAssertFalse(target.drainDiagnostics().contains { $0.event == "keyboard_write_unconfirmed" })
+        }
+    }
+
+    func testCodexStructuralAXValueLagSupportsMultiCharacterAppend() async throws {
+        let initialRaw = "Task\nRouter"
+        let initialCoordinate = initialRaw.filter { $0 != "\n" }
+        let access = ReplayAXTextTargetAccess(
+            text: initialRaw,
+            selection: .init(location: initialCoordinate.utf16.count, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        let clock = ManualKeyboardPacingClock()
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(now: { clock.nowNanoseconds }, sleep: { clock.advance(by: $0) }),
+            acknowledgementTimeoutNanoseconds: 50_000_000
+        )
+
+        _ = try target.capture()
+        for character in "abcdef" {
+            try target.paste(String(character))
+            try await target.acknowledgeKeyboardWrite()
+        }
+        let oldRaw = access.rawText
+        let oldCoordinate = access.coordinateText
+        let oldSelection = access.selection
+        let payload = "😀,"
+        let newSelection = ReplayTextRange(location: oldCoordinate.utf16.count + payload.utf16.count, length: 0)
+        let newRaw = oldRaw + payload
+        let newCoordinate = oldCoordinate + payload
+        access.readSnapshotsAfterNextWrite = [
+            .init(rawText: oldRaw, coordinateText: oldCoordinate, selection: oldSelection),
+            .init(rawText: oldRaw, coordinateText: oldCoordinate, selection: newSelection),
+            .init(rawText: newRaw, coordinateText: newCoordinate, selection: newSelection)
+        ]
+
+        try target.paste(payload)
+        try await target.acknowledgeKeyboardWrite()
+
+        XCTAssertEqual(access.rawText, newRaw)
+        XCTAssertEqual(access.coordinateText, newCoordinate)
+        XCTAssertEqual(access.selection, newSelection)
+        XCTAssertEqual(sender.appendPosts, 7)
+        XCTAssertTrue(access.queuedTextReadSnapshots.isEmpty)
+    }
+
+    func testCodexStructuralAXValueLagAfterTailReplacementWaitsForFullReceipt() async throws {
+        let initialRaw = "\nTask Router"
+        let initialCoordinate = initialRaw.filter { $0 != "\n" }
+        let access = ReplayAXTextTargetAccess(
+            text: initialRaw,
+            selection: .init(location: initialCoordinate.utf16.count, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        let clock = ManualKeyboardPacingClock()
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(now: { clock.nowNanoseconds }, sleep: { clock.advance(by: $0) }),
+            acknowledgementTimeoutNanoseconds: 50_000_000
+        )
+
+        _ = try target.capture()
+        try target.paste("abcdef")
+        try await target.acknowledgeKeyboardWrite()
+        let oldRaw = access.rawText
+        let oldCoordinate = access.coordinateText
+        let selectedTail = ReplayTextRange(location: oldCoordinate.utf16.count - 2, length: 2)
+        let newRaw = String(oldRaw.dropLast(2)) + "zxy"
+        let newCoordinate = String(oldCoordinate.dropLast(2)) + "zxy"
+        let newSelection = ReplayTextRange(location: oldCoordinate.utf16.count + 1, length: 0)
+        access.readSnapshotsAfterNextWrite = [
+            .init(rawText: oldRaw, coordinateText: oldCoordinate, selection: selectedTail),
+            .init(rawText: oldRaw, coordinateText: oldCoordinate, selection: newSelection),
+            .init(rawText: newRaw, coordinateText: newCoordinate, selection: newSelection)
+        ]
+
+        try target.replaceTrailingText("ef", with: "zxy")
+        try await target.acknowledgeKeyboardWrite()
+
+        XCTAssertEqual(access.rawText, newRaw)
+        XCTAssertEqual(access.coordinateText, newCoordinate)
+        XCTAssertEqual(access.selection, newSelection)
+        XCTAssertEqual(sender.replacementPosts, 1)
+        XCTAssertEqual(sender.appendPosts, 1)
+        XCTAssertTrue(access.queuedTextReadSnapshots.isEmpty)
+        let events = target.drainDiagnostics()
+        let selectionConfirmed = try XCTUnwrap(events.firstIndex { $0.event == "keyboard_selection_acknowledged" })
+        let replacementSent = try XCTUnwrap(events.firstIndex { $0.event == "keyboard_replacement_submitted" })
+        XCTAssertLessThan(selectionConfirmed, replacementSent)
+    }
+
+    func testCodexPersistentStructuralAXValueLagTimesOutWithoutResending() async throws {
+        let initialRaw = "Task\nRouter"
+        let initialCoordinate = initialRaw.filter { $0 != "\n" }
+        let access = ReplayAXTextTargetAccess(
+            text: initialRaw,
+            selection: .init(location: initialCoordinate.utf16.count, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        let clock = ManualKeyboardPacingClock()
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(now: { clock.nowNanoseconds }, sleep: { clock.advance(by: $0) }),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        _ = try target.capture()
+        let oldRaw = access.rawText
+        let oldCoordinate = access.coordinateText
+        let advancedSelection = ReplayTextRange(location: oldCoordinate.utf16.count + 1, length: 0)
+        access.readSnapshotsAfterNextWrite = Array(repeating: .init(
+            rawText: oldRaw,
+            coordinateText: oldCoordinate,
+            selection: advancedSelection
+        ), count: 3)
+
+        try target.paste(",")
+        do {
+            try await target.acknowledgeKeyboardWrite()
+            XCTFail("Persistent body lag must remain unconfirmed until the acknowledgement deadline")
+        } catch {
+            XCTAssertEqual(error as? TextTargetError, .writeFailed)
+        }
+
+        XCTAssertEqual(access.rawText, oldRaw, "The draft must remain at the last observed body")
+        XCTAssertEqual(sender.appendPosts, 1, "A timeout must never submit the character twice")
+        XCTAssertFalse(target.drainDiagnostics().contains { $0.event == "keyboard_write_acknowledged" })
+    }
+
+    func testCodexStructuralAXValueLagCanBeCancelledWhileWaiting() async throws {
+        let initialRaw = "Task\nRouter"
+        let initialCoordinate = initialRaw.filter { $0 != "\n" }
+        let access = ReplayAXTextTargetAccess(
+            text: initialRaw,
+            selection: .init(location: initialCoordinate.utf16.count, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        let clock = ManualKeyboardPacingClock()
+        let sender = ReplayKeyboardEventSender(access: access)
+        var acknowledgementTask: Task<Void, Never>?
+        var acknowledgementError: Error?
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { _ in acknowledgementTask?.cancel() }
+            ),
+            acknowledgementTimeoutNanoseconds: 50_000_000
+        )
+        _ = try target.capture()
+        let oldRaw = access.rawText
+        let oldCoordinate = access.coordinateText
+        let advancedSelection = ReplayTextRange(location: oldCoordinate.utf16.count + 1, length: 0)
+        access.readSnapshotsAfterNextWrite = [
+            .init(rawText: oldRaw, coordinateText: oldCoordinate, selection: advancedSelection),
+            .init(rawText: oldRaw + ",", coordinateText: oldCoordinate + ",", selection: advancedSelection)
+        ]
+        try target.paste(",")
+        acknowledgementTask = Task {
+            do {
+                try await target.acknowledgeKeyboardWrite()
+            } catch {
+                acknowledgementError = error
+            }
+        }
+        await acknowledgementTask?.value
+
+        XCTAssertTrue(acknowledgementError is CancellationError)
+        XCTAssertEqual(sender.appendPosts, 1)
+        XCTAssertEqual(access.rawText, oldRaw)
+        XCTAssertEqual(access.queuedTextReadSnapshots.count, 1)
+    }
+
     func testCodexConfirmedRawBoundaryIsReusedForTheNextAppend() async throws {
         let prefix = String(repeating: "甲", count: 70)
         let suffix = String(repeating: "乙", count: 20)
