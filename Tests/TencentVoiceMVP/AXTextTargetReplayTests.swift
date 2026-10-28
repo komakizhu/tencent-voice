@@ -2711,6 +2711,8 @@ final class AXTextTargetReplayTests: XCTestCase {
         ]
         typealias ReadOverride = (node: AXUIElement, attribute: String, status: AXError, value: CFTypeRef?)
         var override: ReadOverride?
+        var valueSettableNodes: [AXUIElement] = []
+        var valueSettableReadCount = 0
         var timeoutValues: [Float] = []
         let reader = SystemAXTextTargetAccess.ContinuityAXReader(
             copyAttributeValue: { element, attribute in
@@ -2728,7 +2730,12 @@ final class AXTextTargetReplayTests: XCTestCase {
                 nodes.first(where: { CFEqual($0.handle, element) }) == nil ? nil : 70_201
             },
             now: Date.init,
-            monotonicNanoseconds: { DispatchTime.now().uptimeNanoseconds }
+            monotonicNanoseconds: { DispatchTime.now().uptimeNanoseconds },
+            isAttributeSettable: { element, attribute in
+                guard attribute == (kAXValueAttribute as String) else { return false }
+                valueSettableReadCount += 1
+                return valueSettableNodes.contains { CFEqual($0, element) }
+            }
         )
         let access = SystemAXTextTargetAccess(continuityAXReader: reader)
         let capturedEvidence = try XCTUnwrap(access.editorContinuityEvidence(for: editor))
@@ -2797,6 +2804,32 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertTrue(anchoredComparison.canConfirmFromCapturedAnchor)
         XCTAssertFalse(anchoredComparison.hasIdentifierConflict)
         XCTAssertNil(anchoredEvidence.identifiersFromEditorToAnchor.first ?? nil)
+
+        override = (editor, "AXReadOnly", .noValue, nil)
+        valueSettableNodes = [editor]
+        let writableFallback = try XCTUnwrap(access.editorContinuityEvidence(
+            for: editor,
+            anchoredAt: capturedEvidence
+        ))
+        XCTAssertTrue(writableFallback.scanComplete)
+        XCTAssertEqual(writableFallback.editableEditorCount, 1)
+        XCTAssertEqual(valueSettableReadCount, 1)
+        XCTAssertEqual(
+            access.lastContinuityScanSummary()?["writabilityEvidence"],
+            "AXValue_settable_after_AXReadOnly_unavailable"
+        )
+
+        valueSettableNodes = []
+        valueSettableReadCount = 0
+        XCTAssertNil(access.editorContinuityEvidence(for: editor, anchoredAt: capturedEvidence))
+        XCTAssertEqual(valueSettableReadCount, 1)
+        _ = access.drainReadDiagnostics()
+
+        override = (editor, "AXReadOnly", .cannotComplete, nil)
+        valueSettableNodes = [editor]
+        valueSettableReadCount = 0
+        XCTAssertNil(access.editorContinuityEvidence(for: editor, anchoredAt: capturedEvidence))
+        XCTAssertEqual(valueSettableReadCount, 0, "transient AX errors must not be converted into writable evidence")
 
         override = nil
         _ = access.editorContinuityEvidence(for: editor)
@@ -3211,6 +3244,108 @@ final class AXTextTargetReplayTests: XCTestCase {
             $0.event == "keyboard_target_reacquired"
                 && $0.fields["editableEditorCount"] == "1"
         }, "\(diagnostics.map { ($0.event, $0.fields) })")
+    }
+
+    func testSafariRebuildAcceptsCapturedAXProcessWhenItDiffersFromAppProcess() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "\n",
+            selection: .init(location: 0, length: 0),
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.elementProcessIdentifier = 9002
+        access.rebuiltElementProcessIdentifier = 9002
+        access.configureWebAncestorChain(depth: 4)
+        access.proseMirror = true
+        access.coordinateIncludesStructuralSeparators = true
+        access.simulateSafariEditorLayoutRebuild = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let injector = TextInjector(target: AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        ))
+
+        try injector.begin()
+        injector.apply(projection: projection("前文", revision: 1))
+        try await injector.finish(finalText: "前文")
+        access.focusedElementRebuildsBeforeNextWrite = 1
+        injector.apply(projection: projection("前文续写", revision: 2))
+        try await injector.finish(finalText: "前文续写")
+
+        XCTAssertEqual(access.rawText, "前文续写\n")
+        XCTAssertEqual(sender.totalPosts, 2, "the rebuilt AX target must receive only the new suffix")
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+    }
+
+    func testSafariRebuildRejectsAXProcessDifferentFromCapturedTarget() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "\n",
+            selection: .init(location: 0, length: 0),
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.elementProcessIdentifier = 9002
+        access.rebuiltElementProcessIdentifier = 9003
+        access.configureWebAncestorChain(depth: 4)
+        access.proseMirror = true
+        access.coordinateIncludesStructuralSeparators = true
+        access.simulateSafariEditorLayoutRebuild = true
+        access.anchoredContinuityAvailable = true
+        access.replayEditorIdentifier = nil
+        let sender = ReplayKeyboardEventSender(access: access)
+        let injector = TextInjector(target: AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        ))
+
+        try injector.begin()
+        injector.apply(projection: projection("安全", revision: 1))
+        try await injector.finish(finalText: "安全")
+        access.focusedElementRebuildsBeforeNextWrite = 1
+        injector.apply(projection: projection("安全续写", revision: 2))
+        try await injector.finish(finalText: "安全续写")
+
+        XCTAssertEqual(access.rawText, "安全\n")
+        XCTAssertEqual(sender.totalPosts, 1)
+        XCTAssertEqual(injector.errorCount, 1)
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
+        XCTAssertEqual(
+            injector.drainDiagnostics().first { $0.event == "safe_copy_updated" }?.textEvidence.first?.text,
+            "安全续写"
+        )
+    }
+
+    func testSafariRebuildUsesCapturedAnchorProofWhenReadOnlyContextIsTemporarilyMissing() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "\n",
+            selection: .init(location: 0, length: 0),
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.coordinateIncludesStructuralSeparators = true
+        access.simulateSafariEditorLayoutRebuild = true
+        access.anchoredContinuityAvailable = true
+        access.replayEditorIdentifier = nil
+        access.rebuiltReadOnlyUnavailable = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let injector = TextInjector(target: AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        ))
+
+        try injector.begin()
+        injector.apply(projection: projection("Safari", revision: 1))
+        try await injector.finish(finalText: "Safari")
+        access.focusedElementRebuildsBeforeNextWrite = 1
+        injector.apply(projection: projection("Safari恢复", revision: 2))
+        try await injector.finish(finalText: "Safari恢复")
+
+        XCTAssertEqual(access.rawText, "Safari恢复\n")
+        XCTAssertEqual(sender.totalPosts, 2)
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
     }
 
     func testSafariDiscardsSnapshotWhenEditorRebuildsDuringAcknowledgementRead() async throws {
@@ -6214,6 +6349,9 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var safariContinuityUnavailableReadsBeforeRecovery = 0
     var safariEditableEditorCount = 1
     var replayEditorIdentifier: String? = "replay-composer-editor"
+    var elementProcessIdentifier: pid_t = 9001
+    var rebuiltElementProcessIdentifier: pid_t = 9001
+    var rebuiltReadOnlyUnavailable = false
     var focusedElementRebuildsAfterNextWrite = 0
     private var focusedElementRebuildCount = 0
     var failFocusedElementReadAtCount: Int?
@@ -6307,7 +6445,9 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
 
     private let rebuiltElement = AXUIElementCreateApplication(9003)
 
-    func processIdentifier(of element: AXUIElement) -> pid_t? { 9001 }
+    func processIdentifier(of element: AXUIElement) -> pid_t? {
+        CFEqual(element, rebuiltElement) ? rebuiltElementProcessIdentifier : elementProcessIdentifier
+    }
 
     func elementValidity(_ element: AXUIElement) -> AXTextElementValidity {
         invalidElements.contains(where: { CFEqual($0, element) }) ? .invalid : .valid
@@ -6354,6 +6494,12 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
 
     func textInputContext(for element: AXUIElement) -> AXTextInputTargetContext? {
         if let textInputContextOverride { return textInputContextOverride(element) }
+        if rebuiltReadOnlyUnavailable, CFEqual(element, rebuiltElement) {
+            return AXTextInputTargetContext(
+                role: "AXTextArea", hasWebAreaAncestor: false, webURL: nil,
+                isReadOnly: nil, isSecure: false, ancestorScanStatus: .readFailure
+            )
+        }
         if !queuedTextInputContexts.isEmpty {
             return queuedTextInputContexts.removeFirst()
         }

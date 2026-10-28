@@ -4084,12 +4084,12 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
               activeInputStrategy.prefersAcknowledgedKeyboard,
               application?.bundleIdentifier == "com.apple.Safari",
               application?.processIdentifier == targetApplicationProcessID,
-              let expectedPID = targetApplicationProcessID,
-              access.processIdentifier(of: element) == expectedPID,
+              let expectedTargetPID = targetProcessID,
+              access.processIdentifier(of: element) == expectedTargetPID,
               let context,
               ["AXTextArea", "AXTextField"].contains(context.role ?? ""),
-              context.isReadOnly == false,
-              context.isSecure == false,
+              context.isReadOnly != true,
+              context.isSecure != true,
               [.readFailure, .truncated, .cycle].contains(context.ancestorScanStatus),
               isEligibleSafariWebEditor(
                 element,
@@ -4099,7 +4099,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
               ),
               let previous = editorContinuity,
               let current = access.editorContinuityEvidence(for: element, anchoredAt: previous),
-              Self.editorContinuityMatches(previous, current, capturedAnchorScan: true) else {
+              Self.editorContinuityMatches(previous, current, capturedAnchorScan: true),
+              let focusedAfterScan = try? access.focusedElement(),
+              CFEqual(focusedAfterScan, element),
+              access.currentApplication()?.processIdentifier == targetApplicationProcessID else {
             return false
         }
         editorContinuity = current
@@ -4272,28 +4275,36 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 "applicationComparison": "different"
             ])
         }
-        guard let expectedPID = targetApplicationProcessID else {
+        guard let expectedApplicationPID = targetApplicationProcessID else {
             return .rejected(reason: "old_handle_or_process_not_verified", diagnosticFields: [
                 "identityFailure": "captured_process_unavailable",
                 "processComparison": "unavailable"
             ])
         }
-        guard currentApplication.processIdentifier == expectedPID else {
+        guard currentApplication.processIdentifier == expectedApplicationPID else {
             return .rejected(reason: "old_handle_or_process_not_verified", diagnosticFields: [
                 "identityFailure": "frontmost_process_changed",
                 "processComparison": "different"
             ])
         }
+        guard let capturedTargetPID = targetProcessID else {
+            return .rejected(reason: "old_handle_or_process_not_verified", diagnosticFields: [
+                "identityFailure": "captured_target_process_unavailable",
+                "candidateCapturedTargetProcessComparison": "unavailable"
+            ])
+        }
         guard let candidatePID = access.processIdentifier(of: element) else {
             return .rejected(reason: "old_handle_or_process_not_verified", diagnosticFields: [
                 "identityFailure": "candidate_process_unavailable",
-                "candidateProcessComparison": "unavailable"
+                "candidateProcessComparison": "unavailable",
+                "candidateCapturedTargetProcessComparison": "unavailable"
             ])
         }
-        guard candidatePID == expectedPID else {
+        guard candidatePID == capturedTargetPID else {
             return .rejected(reason: "old_handle_or_process_not_verified", diagnosticFields: [
                 "identityFailure": "candidate_process_changed",
-                "candidateProcessComparison": "different"
+                "candidateProcessComparison": candidatePID == expectedApplicationPID ? "equal" : "different",
+                "candidateCapturedTargetProcessComparison": "different"
             ])
         }
         guard let previousElement = targetElement else {
@@ -4402,10 +4413,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             return .temporarilyUnavailable(reason: "frontmost_application_unavailable_after_scan")
         }
         guard latestApplication.bundleIdentifier == targetApplicationBundleIdentifier,
-              latestApplication.processIdentifier == expectedPID else {
+              latestApplication.processIdentifier == expectedApplicationPID else {
             return .rejected(reason: "application_or_process_changed_during_scan", diagnosticFields: [
                 "applicationComparison": String(latestApplication.bundleIdentifier == targetApplicationBundleIdentifier),
-                "processComparison": String(latestApplication.processIdentifier == expectedPID)
+                "processComparison": String(latestApplication.processIdentifier == expectedApplicationPID)
             ])
         }
         do {
@@ -4442,7 +4453,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         return .confirmed(
             evidence: current,
             route: continuityRoute,
-            processID: expectedPID,
+            processID: candidatePID,
             identityOutcome: confirmedWithoutIdentifier
                 ? "confirmed_by_captured_anchor_without_identifier"
                 : shouldUseCapturedAnchor
@@ -4459,7 +4470,9 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                 "currentScanID": currentScanID ?? "unknown",
                 "focusedTargetComparison": "same",
                 "applicationComparison": "equal",
-                "processComparison": "equal"
+                "processComparison": "equal",
+                "candidateProcessComparison": candidatePID == expectedApplicationPID ? "equal" : "different",
+                "candidateCapturedTargetProcessComparison": "equal"
             ]) { _, new in new }
         )
     }
@@ -4468,10 +4481,12 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         _ context: AXTextInputTargetContext?,
         allowCapturedAnchorFallback: Bool
     ) -> Bool {
-        guard let context,
-              context.role != nil,
-              context.isReadOnly != nil,
-              context.isSecure != nil else {
+        guard let context, let role = context.role else {
+            return true
+        }
+        let capturedTextAreaProof = allowCapturedAnchorFallback && role == "AXTextArea"
+        guard context.isReadOnly != nil || capturedTextAreaProof,
+              context.isSecure != nil || capturedTextAreaProof else {
             return true
         }
         switch context.ancestorScanStatus {
@@ -4511,12 +4526,17 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             && (context?.ancestorScanStatus == .readFailure
                 || context?.ancestorScanStatus == .truncated
                 || context?.ancestorScanStatus == .cycle)
+        let capturedTextAreaProof = allowCapturedAnchorFallback && context?.role == "AXTextArea"
+        let writable = context?.isReadOnly == false
+            || (capturedTextAreaProof && context?.isReadOnly == nil)
+        let nonSecure = context?.isSecure == false
+            || (capturedTextAreaProof && context?.isSecure == nil)
         guard isCodexTarget,
               application?.bundleIdentifier == "com.openai.codex",
               hasConfirmedWebArea || hasCapturedAnchorProof,
               ["AXTextArea", "AXTextField"].contains(context?.role ?? ""),
-              context?.isReadOnly == false,
-              context?.isSecure == false else {
+              writable,
+              nonSecure else {
             return false
         }
         return true
@@ -4536,11 +4556,16 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             && (context?.ancestorScanStatus == .readFailure
                 || context?.ancestorScanStatus == .truncated
                 || context?.ancestorScanStatus == .cycle)
+        let capturedTextAreaProof = allowCapturedAnchorFallback && context?.role == "AXTextArea"
+        let writable = context?.isReadOnly == false
+            || (capturedTextAreaProof && context?.isReadOnly == nil)
+        let nonSecure = context?.isSecure == false
+            || (capturedTextAreaProof && context?.isSecure == nil)
         guard let context,
               context.role == "AXTextArea",
               hasConfirmedWebArea || hasCapturedAnchorProof,
-              context.isReadOnly == false,
-              context.isSecure == false else {
+              writable,
+              nonSecure else {
             return false
         }
         return true
@@ -5100,6 +5125,23 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
         var processIdentifier: (AXUIElement) -> pid_t?
         var now: () -> Date
         var monotonicNanoseconds: () -> UInt64
+        var isAttributeSettable: (AXUIElement, String) -> Bool
+
+        init(
+            copyAttributeValue: @escaping (AXUIElement, String) -> (AXError, CFTypeRef?),
+            setMessagingTimeout: @escaping (AXUIElement, Float) -> Void,
+            processIdentifier: @escaping (AXUIElement) -> pid_t?,
+            now: @escaping () -> Date,
+            monotonicNanoseconds: @escaping () -> UInt64,
+            isAttributeSettable: @escaping (AXUIElement, String) -> Bool = { _, _ in false }
+        ) {
+            self.copyAttributeValue = copyAttributeValue
+            self.setMessagingTimeout = setMessagingTimeout
+            self.processIdentifier = processIdentifier
+            self.now = now
+            self.monotonicNanoseconds = monotonicNanoseconds
+            self.isAttributeSettable = isAttributeSettable
+        }
 
         static let system = ContinuityAXReader(
             copyAttributeValue: { element, name in
@@ -5114,7 +5156,12 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
                 return processID
             },
             now: Date.init,
-            monotonicNanoseconds: { DispatchTime.now().uptimeNanoseconds }
+            monotonicNanoseconds: { DispatchTime.now().uptimeNanoseconds },
+            isAttributeSettable: { element, attribute in
+                var settable = DarwinBoolean(false)
+                return AXUIElementIsAttributeSettable(element, attribute as CFString, &settable) == .success
+                    && settable.boolValue
+            }
         )
     }
 
@@ -5661,10 +5708,21 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
                     try value(kAXSubroleAttribute as String, in: node, optional: true) as? String
                 },
                 readOnly: { node in
-                    guard let raw = try value("AXReadOnly", in: node), let flag = raw as? Bool else {
-                        return nil
+                    do {
+                        guard let raw = try value("AXReadOnly", in: node), let flag = raw as? Bool else {
+                            return nil
+                        }
+                        return flag
+                    } catch let failure as AXAnchoredEditorScanFailure
+                        where failure.attribute == "AXReadOnly"
+                            && [AXError.noValue.rawValue, AXError.attributeUnsupported.rawValue].contains(failure.status) {
+                        continuityAXReader.setMessagingTimeout(node, 0.03)
+                        guard continuityAXReader.isAttributeSettable(node, kAXValueAttribute as String) else {
+                            throw failure
+                        }
+                        activeContinuityScanSummaryFields?["writabilityEvidence"] = "AXValue_settable_after_AXReadOnly_unavailable"
+                        return false
                     }
-                    return flag
                 },
                 children: { node in
                     guard let raw = try value("AXChildren", in: node) else { return [] }
