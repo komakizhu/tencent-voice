@@ -951,7 +951,7 @@ struct AXTextTargetWriteTiming {
 }
 
 @MainActor
-final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
+final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, KeyboardTargetAvailabilityProviding {
     private(set) var requiresKeyboardAcknowledgement = false
     private var confirmedKeyboardDocument: String?
     private var confirmedKeyboardState: KeyboardDocumentState?
@@ -976,9 +976,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     private var safariStrategyRetryDiagnosticRecorded = false
     private var safariStrategyRetryIsPending = false
     private var safariStrategyMismatchStartedAt: UInt64?
+    private var codexEditabilityRetryDiagnosticRecorded = false
+    private var codexEditabilityRetryIsPending = false
+    private var codexEditabilityUnknownStartedAt: UInt64?
+    private var keyboardTargetAwayRetryDiagnosticRecorded = false
     private var keyboardTargetReacquireRetryDiagnosticRecorded = false
     private var keyboardTargetReacquireRetryIsPending = false
     private let safariStrategyRetryWindowNanoseconds: UInt64 = 500_000_000
+    private let codexEditabilityRetryWindowNanoseconds: UInt64 = 500_000_000
     private var usesKeyboardOwnedSelection: Bool {
         activeInputStrategy.prefersAcknowledgedKeyboard
             || (isSafariWebEditor && requiresKeyboardAcknowledgement)
@@ -1177,6 +1182,36 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
 
     func currentApplication() -> TextTargetApplication? {
         access.currentApplication()
+    }
+
+    func keyboardTargetAvailability() -> KeyboardTargetAvailability {
+        guard isCodexTarget,
+              requiresKeyboardAcknowledgement,
+              activeInputStrategy.prefersAcknowledgedKeyboard,
+              let targetElement,
+              let targetApplicationProcessID,
+              let targetProcessID,
+              let targetApplicationBundleIdentifier,
+              targetApplicationBundleIdentifier == "com.openai.codex",
+              let frontmost = access.currentApplication() else {
+            return .invalid
+        }
+        if frontmost.processIdentifier == Int32(targetApplicationProcessID) {
+            return .active
+        }
+
+        // Only classify a different frontmost application as a temporary
+        // departure while the exact captured Codex editor is still alive,
+        // editable, non-secure, and owned by the same AX process.
+        guard access.elementValidity(targetElement) == .valid,
+              access.processIdentifier(of: targetElement) == targetProcessID,
+              let context = access.textInputContext(for: targetElement),
+              context.role == "AXTextArea" || context.role == "AXTextField",
+              context.isReadOnly == false,
+              context.isSecure == false else {
+            return .invalid
+        }
+        return .temporarilyAway
     }
 
     // A successful dispatch call is not proof of what the editor displayed.
@@ -1991,6 +2026,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         safariStrategyRetryDiagnosticRecorded = false
         safariStrategyRetryIsPending = false
         safariStrategyMismatchStartedAt = nil
+        codexEditabilityRetryDiagnosticRecorded = false
+        codexEditabilityRetryIsPending = false
+        codexEditabilityUnknownStartedAt = nil
+        keyboardTargetAwayRetryDiagnosticRecorded = false
         keyboardTargetReacquireRetryDiagnosticRecorded = false
         keyboardTargetReacquireRetryIsPending = false
         guard requiresKeyboardAcknowledgement else {
@@ -2325,7 +2364,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
     ) throws -> AXKeyboardDocumentObservation {
         let requestedAt = Date()
         guard generation == keyboardGeneration else { throw CancellationError() }
-        try ensureTargetApplicationIsFrontmost()
+        try ensureKeyboardReadTargetIsFrontmost(phase: phase)
         let element = try focusedElement()
         if let targetElement, !CFEqual(element, targetElement) {
             guard isSafariWebEditor || isCodexTarget else {
@@ -2355,7 +2394,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             let state = try KeyboardWriteAcknowledgement.readObservation {
                 try self.keyboardDocumentState(in: element, confirming: true)
             }
-            try ensureTargetApplicationIsFrontmost()
+            try ensureKeyboardReadTargetIsFrontmost(phase: phase)
             let afterElement = try focusedElement()
             if !CFEqual(afterElement, targetElement) {
                 guard isSafariWebEditor || isCodexTarget else {
@@ -2491,11 +2530,32 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             throw KeyboardWriteReadError.retryable
         } catch is CancellationError {
             throw CancellationError()
+        } catch is AXTextDocumentResolutionError {
+            // The resolver recorded the precise coordinate failure. Keep it
+            // distinct from an actual change in the focused target.
+            throw TextTargetError.writeFailed
         } catch let error as TextTargetError {
             throw error
         } catch {
             throw TextTargetError.targetChanged
         }
+    }
+
+    private func ensureKeyboardReadTargetIsFrontmost(phase: String) throws {
+        guard phase == "preflight" || phase == "acknowledgement",
+              isCodexTarget,
+              keyboardTargetAvailability() == .temporarilyAway else {
+            try ensureTargetApplicationIsFrontmost()
+            return
+        }
+        if !keyboardTargetAwayRetryDiagnosticRecorded {
+            recordDiagnostic("keyboard_target_away_observation_retryable", [
+                "phase": phase,
+                "sendState": pendingKeyboardWrite == nil ? "not_in_flight" : "sent_unconfirmed"
+            ])
+            keyboardTargetAwayRetryDiagnosticRecorded = true
+        }
+        throw KeyboardWriteReadError.retryable
     }
 
     func acknowledgeKeyboardWrite() async throws {
@@ -3770,8 +3830,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
                     error,
                     rawText: rawText,
                     selection: selection,
-                    evidence: evidence,
-                    confirming: confirming
+                    evidence: evidence
                 )
                 throw error
             } catch let error as TextTargetError {
@@ -4007,6 +4066,46 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         let application = access.currentApplication()
         let context = access.textInputContext(for: element)
         let currentStrategy = AXTextInputStrategy.select(application: application, context: context)
+        if shouldRetryCodexEditabilityRead(currentStrategy, application: application, context: context) {
+            let now = writeTiming.now()
+            let startedAt = codexEditabilityUnknownStartedAt ?? now
+            codexEditabilityUnknownStartedAt = startedAt
+            let elapsed = now &- startedAt
+            guard elapsed < min(codexEditabilityRetryWindowNanoseconds, preflightTimeoutNanoseconds) else {
+                recordDiagnostic("input_strategy_read_failed", [
+                    "expectedStrategy": activeInputStrategy.diagnosticName,
+                    "expectedReason": activeInputStrategy.diagnosticReason,
+                    "actualStrategy": currentStrategy.diagnosticName,
+                    "actualReason": currentStrategy.diagnosticReason,
+                    "currentRole": context?.role ?? "unknown",
+                    "isReadOnly": context?.isReadOnly.map(String.init) ?? "unknown",
+                    "isSecure": context?.isSecure.map(String.init) ?? "unknown",
+                    "strategyMismatchDurationMilliseconds": String(elapsed / 1_000_000),
+                    "retryWindow": "expired"
+                ])
+                codexEditabilityUnknownStartedAt = nil
+                codexEditabilityRetryIsPending = false
+                throw TextTargetError.writeFailed
+            }
+            if !codexEditabilityRetryDiagnosticRecorded {
+                recordDiagnostic("input_strategy_read_retryable", [
+                    "expectedStrategy": activeInputStrategy.diagnosticName,
+                    "expectedReason": activeInputStrategy.diagnosticReason,
+                    "actualStrategy": currentStrategy.diagnosticName,
+                    "actualReason": currentStrategy.diagnosticReason,
+                    "currentRole": context?.role ?? "unknown",
+                    "isReadOnly": "unknown",
+                    "isSecure": "false",
+                    "retryWindow": "existing_keyboard_preflight"
+                ])
+                codexEditabilityRetryDiagnosticRecorded = true
+            }
+            codexEditabilityRetryIsPending = true
+            throw KeyboardWriteReadError.retryable
+        }
+        codexEditabilityUnknownStartedAt = nil
+        codexEditabilityRetryDiagnosticRecorded = false
+        codexEditabilityRetryIsPending = false
         if currentStrategy == .safeStop(reason: "web_ancestor_unclassified"),
            confirmSafariTargetUnderCapturedAnchor(element, application: application, context: context) {
             safariStrategyMismatchStartedAt = nil
@@ -4073,6 +4172,23 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
             invalidateKeyboardRawInsertionRegion()
             throw TextTargetError.targetChanged
         }
+    }
+
+    private func shouldRetryCodexEditabilityRead(
+        _ currentStrategy: AXTextInputStrategy,
+        application: TextTargetApplication?,
+        context: AXTextInputTargetContext?
+    ) -> Bool {
+        guard isCodexTarget,
+              activeInputStrategy == .acknowledgedKeyboard(reason: "codex_editable_text_control"),
+              application?.bundleIdentifier == "com.openai.codex",
+              application?.processIdentifier == targetApplicationProcessID,
+              context?.role == "AXTextArea" || context?.role == "AXTextField",
+              context?.isReadOnly == nil,
+              context?.isSecure == false else {
+            return false
+        }
+        return currentStrategy == .safeStop(reason: "codex_editability_unknown")
     }
 
     private func confirmSafariTargetUnderCapturedAnchor(
@@ -5030,14 +5146,13 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget {
         _ error: AXTextDocumentResolutionError,
         rawText: String,
         selection: TextRange,
-        evidence: AXPlaceholderEvidence,
-        confirming: Bool = false
+        evidence: AXPlaceholderEvidence
     ) {
         let reason = coordinateResolutionCode(for: error)
         let key = "failed:\(reason):\(rawText.utf16.count):\(selection.location):\(selection.length)"
         guard key != lastCoordinateDiagnosticKey else { return }
         lastCoordinateDiagnosticKey = key
-        recordDiagnostic(confirming ? "ax_coordinate_mapping_retryable" : "ax_coordinate_mapping_failed", [
+        recordDiagnostic("ax_coordinate_mapping_failed", [
             "reason": reason,
             "axValueLengthUTF16": String(rawText.utf16.count),
             "selectionLocation": String(selection.location),

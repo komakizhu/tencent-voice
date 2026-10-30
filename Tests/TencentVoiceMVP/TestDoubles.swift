@@ -2,9 +2,10 @@ import Foundation
 @testable import TencentVoiceMVP
 
 @MainActor
-final class FakeTextTarget: TextTarget {
+final class FakeTextTarget: TextTarget, KeyboardTargetAvailabilityProviding {
     var text: String
     let supportsAXReplacement: Bool
+    var keyboardAvailability: KeyboardTargetAvailability = .active
     private(set) var copiedText: String?
     private(set) var copiedTexts: [String] = []
     private(set) var replaceCallCount = 0
@@ -15,6 +16,8 @@ final class FakeTextTarget: TextTarget {
         self.text = text
         self.supportsAXReplacement = supportsAXReplacement
     }
+
+    func keyboardTargetAvailability() -> KeyboardTargetAvailability { keyboardAvailability }
 
     func capture() throws -> TextSnapshot {
         TextSnapshot(
@@ -52,8 +55,9 @@ final class FakeTextTarget: TextTarget {
 }
 
 @MainActor
-final class FinalizationAcknowledgingKeyboardTarget: KeyboardAcknowledgingTarget {
+final class FinalizationAcknowledgingKeyboardTarget: KeyboardAcknowledgingTarget, KeyboardTargetAvailabilityProviding {
     let requiresKeyboardAcknowledgement = true
+    var keyboardAvailability: KeyboardTargetAvailability = .active
     private(set) var text = "草稿："
     private var selection = TencentVoiceMVP.TextRange(location: "草稿：".utf16.count, length: 0)
     private var confirmedText = "草稿："
@@ -62,6 +66,8 @@ final class FinalizationAcknowledgingKeyboardTarget: KeyboardAcknowledgingTarget
     private var pendingSelection: TencentVoiceMVP.TextRange?
     private(set) var postCount = 0
     var blockAcknowledgement = true
+
+    func keyboardTargetAvailability() -> KeyboardTargetAvailability { keyboardAvailability }
 
     func capture() throws -> TextSnapshot {
         TextSnapshot(

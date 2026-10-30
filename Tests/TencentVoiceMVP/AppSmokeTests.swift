@@ -133,6 +133,24 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertEqual(menu.items.first { $0.title == "开始录音" }?.title, "开始录音")
     }
 
+    func testStatusMenuShowsSeparateStoppedPendingCompletionAndCancelAction() {
+        let controller = StatusMenuController()
+        let menu = controller.makeMenu()
+        let waiting = menu.items.first { $0.title == "已停止录音，等待返回补齐" }
+        let cancel = menu.items.first { $0.title == "取消补齐" }
+        XCTAssertTrue(waiting?.isHidden ?? true)
+        XCTAssertTrue(cancel?.isHidden ?? true)
+
+        controller.update(pendingCompletion: true)
+        XCTAssertFalse(waiting?.isHidden ?? true)
+        XCTAssertFalse(cancel?.isHidden ?? true)
+        XCTAssertEqual(menu.items.first { $0.title == "开始录音" }?.title, "开始录音")
+
+        controller.update(pendingCompletion: false)
+        XCTAssertTrue(waiting?.isHidden ?? false)
+        XCTAssertTrue(cancel?.isHidden ?? false)
+    }
+
     func testStatusPresentationKeepsTimerIconAndWaveformShapesDistinct() {
         let timer = StatusButtonPresentation.make(
             mode: .timer, state: .listening, isCapturing: true, duration: 61.9

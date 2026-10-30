@@ -20,6 +20,13 @@ struct DiagnosticWindowFrameReference: Codable, Equatable, Sendable {
     let byteCount: Int
 }
 
+struct DiagnosticWindowFrameStatusTransition: Codable, Equatable, Sendable {
+    let timestamp: Date
+    let monotonicNanoseconds: UInt64
+    let status: String
+    let reason: String?
+}
+
 struct DiagnosticWindowFrameEvidence: Codable, Equatable, Sendable {
     let enabled: Bool
     let status: String
@@ -40,6 +47,7 @@ struct DiagnosticWindowFrameEvidence: Codable, Equatable, Sendable {
     let frames: [DiagnosticWindowFrameReference]
     let archiveStatus: String
     var stopReason: String? = nil
+    var statusTransitions: [DiagnosticWindowFrameStatusTransition]? = nil
 
     func replacingArchiveStatus(_ status: String) -> Self {
         Self(
@@ -61,7 +69,8 @@ struct DiagnosticWindowFrameEvidence: Codable, Equatable, Sendable {
             retainedBytes: retainedBytes,
             frames: status == "included" ? frames : [],
             archiveStatus: status,
-            stopReason: stopReason
+            stopReason: stopReason,
+            statusTransitions: statusTransitions
         )
     }
 }
@@ -85,11 +94,21 @@ enum DiagnosticWindowFrameVerification {
         focusState: FocusState,
         fingerprintMatches: Bool
     ) -> String? {
-        guard candidateWindowCount == 1 else { return "candidate_window_count_mismatch" }
+        guard candidateWindowCount > 0 else { return "candidate_window_count_mismatch" }
         guard candidateWindowID == expectedWindowID else { return "window_identifier_changed" }
         guard focusState != .unavailable else { return "focused_window_unavailable" }
         guard focusState != .windowMismatch, fingerprintMatches else { return "window_information_mismatch" }
         return nil
+    }
+
+    static func uniqueWindowID(
+        candidateWindowIDs: [UInt32],
+        matchingFocusedWindowIDs: [UInt32]
+    ) -> UInt32? {
+        let matchingSet = Set(matchingFocusedWindowIDs)
+        let matches = candidateWindowIDs.filter { matchingSet.contains($0) }
+        guard matches.count == 1 else { return nil }
+        return matches[0]
     }
 }
 
@@ -165,6 +184,7 @@ private final class DiagnosticWindowFrameBuffer: @unchecked Sendable {
     private var startedAt: Date?
     private var stoppedAt: Date?
     private var stopReason: String?
+    private var statusTransitions: [DiagnosticWindowFrameStatusTransition] = []
 
     func begin(pid: pid_t, bundleIdentifier: String, windowID: CGWindowID, sessionID: UUID?) {
         lock.lock()
@@ -180,11 +200,16 @@ private final class DiagnosticWindowFrameBuffer: @unchecked Sendable {
         startedAt = Date()
         stoppedAt = nil
         stopReason = nil
+        statusTransitions = []
+        appendStatusTransition(status: "starting", reason: nil, at: startedAt ?? Date())
     }
 
     func setStatus(_ status: String, reason: String? = nil, permissionGranted: Bool? = nil, stop: Bool = false) {
         lock.lock()
         defer { lock.unlock() }
+        if self.status != status || stopReason != reason {
+            appendStatusTransition(status: status, reason: reason, at: Date())
+        }
         self.status = status
         stopReason = reason
         if let permissionGranted { self.permissionGranted = permissionGranted }
@@ -230,6 +255,7 @@ private final class DiagnosticWindowFrameBuffer: @unchecked Sendable {
         startedAt = nil
         stoppedAt = Date()
         stopReason = nil
+        statusTransitions = []
     }
 
     func snapshot(at date: Date) -> DiagnosticWindowFrameSnapshot {
@@ -265,10 +291,27 @@ private final class DiagnosticWindowFrameBuffer: @unchecked Sendable {
                 retainedBytes: ring.retainedBytes,
                 frames: references,
                 archiveStatus: assets.isEmpty ? "not_included" : "included",
-                stopReason: stopReason
+                stopReason: stopReason,
+                statusTransitions: statusTransitions.filter {
+                    $0.timestamp >= date.addingTimeInterval(-60) && $0.timestamp <= date
+                }
             ),
             assets: assets
         )
+    }
+
+    private func appendStatusTransition(status: String, reason: String?, at date: Date) {
+        statusTransitions.append(DiagnosticWindowFrameStatusTransition(
+            timestamp: date,
+            monotonicNanoseconds: DispatchTime.now().uptimeNanoseconds,
+            status: status,
+            reason: reason
+        ))
+        let cutoff = date.addingTimeInterval(-60)
+        statusTransitions.removeAll { $0.timestamp < cutoff }
+        if statusTransitions.count > 128 {
+            statusTransitions.removeFirst(statusTransitions.count - 128)
+        }
     }
 }
 
@@ -286,6 +329,8 @@ final class DiagnosticWindowFrameRecorder {
     private var retentionTask: Task<Void, Never>?
     private var activationObserver: NSObjectProtocol?
     private var expectedPID: pid_t?
+    private var expectedWindowID: CGWindowID?
+    private var expectedBundleIdentifier: String?
 
     func setCaptureEnabled(_ enabled: Bool) {
         guard enabled != isEnabled else { return }
@@ -340,6 +385,7 @@ final class DiagnosticWindowFrameRecorder {
         stopStreamOnly()
         buffer.setStatus("starting", permissionGranted: true)
         expectedPID = pid
+        expectedBundleIdentifier = bundleIdentifier
         startupTask = Task { [weak self] in
             await self?.startCapture(pid: pid, bundleIdentifier: bundleIdentifier, targetElement: targetElement)
         }
@@ -372,6 +418,9 @@ final class DiagnosticWindowFrameRecorder {
     }
 
     private func startCapture(pid: pid_t, bundleIdentifier: String?, targetElement: AXUIElement?) async {
+        defer {
+            if expectedPID == pid { startupTask = nil }
+        }
         do {
             guard !Task.isCancelled, isEnabled, sessionIsActive else { return }
             guard DiagnosticWindowFrameCapturePolicy.mayCapture(
@@ -396,10 +445,6 @@ final class DiagnosticWindowFrameRecorder {
             let candidateWindows = content.windows.filter {
                 $0.owningApplication?.processID == pid && $0.isOnScreen && $0.windowLayer == 0
             }
-            guard candidateWindows.count == 1, let window = candidateWindows.first else {
-                stop(status: "target_window_ambiguous")
-                return
-            }
             guard let targetElement else {
                 stop(status: "target_window_unverified", reason: "focused_window_unavailable")
                 return
@@ -415,43 +460,17 @@ final class DiagnosticWindowFrameRecorder {
                 stop(status: "target_window_unverified", reason: reason)
                 return
             }
-            guard Self.matches(focusedWindow, window: window) else {
+            let matchingWindows = candidateWindows.filter { Self.matches(focusedWindow, window: $0) }
+            let selectedWindowID = DiagnosticWindowFrameVerification.uniqueWindowID(
+                candidateWindowIDs: candidateWindows.map(\.windowID),
+                matchingFocusedWindowIDs: matchingWindows.map(\.windowID)
+            )
+            guard let selectedWindowID,
+                  let window = matchingWindows.first(where: { $0.windowID == selectedWindowID }) else {
                 stop(status: "target_window_unverified", reason: "window_information_mismatch")
                 return
             }
-
-            let configuration = SCStreamConfiguration()
-            let sourceWidth = max(1, window.frame.width * 2)
-            let sourceHeight = max(1, window.frame.height * 2)
-            let scale = min(CGFloat(1), min(1_440 / sourceWidth, 900 / sourceHeight))
-            configuration.width = max(1, Int(sourceWidth * scale))
-            configuration.height = max(1, Int(sourceHeight * scale))
-            configuration.minimumFrameInterval = CMTime(value: 1, timescale: 5)
-            configuration.queueDepth = 3
-            configuration.showsCursor = true
-            configuration.capturesAudio = false
-            let filter = SCContentFilter(desktopIndependentWindow: window)
-            let frameOutput = DiagnosticWindowFrameStreamOutput(buffer: buffer)
-            let newStream = SCStream(filter: filter, configuration: configuration, delegate: frameOutput)
-            buffer.begin(
-                pid: pid,
-                bundleIdentifier: bundleIdentifier ?? "unknown",
-                windowID: window.windowID,
-                sessionID: activeSessionID
-            )
-            try newStream.addStreamOutput(
-                frameOutput,
-                type: .screen,
-                sampleHandlerQueue: frameOutput.sampleQueue
-            )
-            try await newStream.startCapture()
-            guard !Task.isCancelled, isEnabled else {
-                try? await newStream.stopCapture()
-                return
-            }
-            stream = newStream
-            output = frameOutput
-            buffer.setStatus("capturing", permissionGranted: true)
+            expectedWindowID = window.windowID
             activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
                 forName: NSWorkspace.didActivateApplicationNotification,
                 object: nil,
@@ -460,16 +479,71 @@ final class DiagnosticWindowFrameRecorder {
                 let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
                 guard application?.processIdentifier != pid else { return }
                 Task { @MainActor [weak self] in
-                    self?.stop(status: "target_app_inactive")
+                    self?.pauseCapture(status: "target_app_inactive", reason: "target_application_not_frontmost")
                 }
             }
             monitorTask?.cancel()
             monitorTask = Task { [weak self] in
                 await self?.monitorTarget(pid: pid, windowID: window.windowID)
             }
+            // Keep the activation and verification paths alive while ScreenCaptureKit
+            // is starting. The target can lose focus during startCapture(); in that
+            // case startStream intentionally returns without a stream, and the
+            // monitor must still be able to resume the same original window later.
+            try await startStream(window: window, pid: pid, bundleIdentifier: bundleIdentifier, initial: true)
         } catch {
             stop(status: "capture_failed")
         }
+    }
+
+    private func startStream(
+        window: SCWindow,
+        pid: pid_t,
+        bundleIdentifier: String?,
+        initial: Bool
+    ) async throws {
+        guard isEnabled, sessionIsActive,
+              expectedPID == pid, expectedWindowID == window.windowID else { return }
+        let configuration = SCStreamConfiguration()
+        let sourceWidth = max(1, window.frame.width * 2)
+        let sourceHeight = max(1, window.frame.height * 2)
+        let scale = min(CGFloat(1), min(1_440 / sourceWidth, 900 / sourceHeight))
+        configuration.width = max(1, Int(sourceWidth * scale))
+        configuration.height = max(1, Int(sourceHeight * scale))
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 5)
+        configuration.queueDepth = 3
+        configuration.showsCursor = true
+        configuration.capturesAudio = false
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let frameOutput = DiagnosticWindowFrameStreamOutput(buffer: buffer)
+        let newStream = SCStream(filter: filter, configuration: configuration, delegate: frameOutput)
+        if initial {
+            buffer.begin(
+                pid: pid,
+                bundleIdentifier: bundleIdentifier ?? "unknown",
+                windowID: window.windowID,
+                sessionID: activeSessionID
+            )
+        } else {
+            buffer.setStatus("resuming", permissionGranted: true)
+        }
+        try newStream.addStreamOutput(frameOutput, type: .screen, sampleHandlerQueue: frameOutput.sampleQueue)
+        try await newStream.startCapture()
+        guard !Task.isCancelled, isEnabled, sessionIsActive,
+              expectedPID == pid, expectedWindowID == window.windowID,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
+            try? await newStream.stopCapture()
+            return
+        }
+        stream = newStream
+        output = frameOutput
+        buffer.setStatus("capturing", permissionGranted: true)
+    }
+
+    private func pauseCapture(status: String, reason: String) {
+        guard expectedPID != nil else { return }
+        buffer.setStatus(status, reason: reason)
+        stopStreamOnly()
     }
 
     private func monitorTarget(pid: pid_t, windowID: CGWindowID) async {
@@ -485,19 +559,20 @@ final class DiagnosticWindowFrameRecorder {
                 return
             }
             guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
-                stop(status: "target_app_inactive")
-                return
+                pauseCapture(status: "target_app_inactive", reason: "target_application_not_frontmost")
+                continue
             }
             do {
                 let content = try await Self.shareableContent()
                 let windows = content.windows.filter {
                     $0.owningApplication?.processID == pid && $0.isOnScreen && $0.windowLayer == 0
                 }
-                guard windows.count == 1 else {
-                    stop(status: "target_window_changed", reason: "candidate_window_count_mismatch")
-                    return
+                let originalWindows = windows.filter { $0.windowID == windowID }
+                guard originalWindows.count == 1, let window = originalWindows.first else {
+                    pauseCapture(status: "target_window_changed", reason: "original_target_window_unavailable")
+                    continue
                 }
-                guard let window = windows.first, window.windowID == windowID else {
+                guard expectedWindowID == window.windowID else {
                     stop(status: "target_window_changed", reason: "window_identifier_changed")
                     return
                 }
@@ -507,7 +582,13 @@ final class DiagnosticWindowFrameRecorder {
                 switch focusedRead {
                 case .available(let fingerprint):
                     focusState = .available
-                    fingerprintMatches = Self.matches(fingerprint, window: window)
+                    let matchingFocusedWindowIDs = windows
+                        .filter { Self.matches(fingerprint, window: $0) }
+                        .map(\.windowID)
+                    fingerprintMatches = DiagnosticWindowFrameVerification.uniqueWindowID(
+                        candidateWindowIDs: windows.map(\.windowID),
+                        matchingFocusedWindowIDs: matchingFocusedWindowIDs
+                    ) == windowID
                 case .unavailable:
                     focusState = .unavailable
                     fingerprintMatches = false
@@ -516,14 +597,30 @@ final class DiagnosticWindowFrameRecorder {
                     fingerprintMatches = false
                 }
                 if let reason = DiagnosticWindowFrameVerification.failureReason(
-                    candidateWindowCount: windows.count,
+                    candidateWindowCount: originalWindows.count,
                     candidateWindowID: window.windowID,
                     expectedWindowID: windowID,
                     focusState: focusState,
                     fingerprintMatches: fingerprintMatches
                 ) {
-                    stop(status: "target_window_changed", reason: reason)
-                    return
+                    pauseCapture(status: "target_window_changed", reason: reason)
+                    continue
+                }
+                if stream == nil, startupTask == nil {
+                    startupTask = Task { [weak self] in
+                        guard let self else { return }
+                        do {
+                            try await self.startStream(
+                                window: window,
+                                pid: pid,
+                                bundleIdentifier: self.expectedBundleIdentifier,
+                                initial: false
+                            )
+                        } catch {
+                            self.stop(status: "capture_resume_failed")
+                        }
+                        if self.expectedPID == pid { self.startupTask = nil }
+                    }
                 }
             } catch {
                 stop(status: "target_verification_failed")
@@ -550,6 +647,8 @@ final class DiagnosticWindowFrameRecorder {
             self.activationObserver = nil
         }
         expectedPID = nil
+        expectedWindowID = nil
+        expectedBundleIdentifier = nil
         if clearFrames {
             buffer.clear(
                 status: status,

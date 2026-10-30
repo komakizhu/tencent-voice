@@ -512,7 +512,9 @@ enum AXTextDocumentResolver {
         do {
             return try resolve()
         } catch let error as AXTextDocumentResolutionError {
-            if (error == .coordinateReadUnavailable || error == .coordinateTextMismatch),
+            if (error == .coordinateReadUnavailable
+                || error == .coordinateTextMismatch
+                || error == .selectedRangeUnavailable),
                let acknowledgedSelection,
                acknowledgedSelection.selection.length > 0,
                rawText == acknowledgedSelection.rawText,
