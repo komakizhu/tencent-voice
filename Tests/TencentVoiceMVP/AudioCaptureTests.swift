@@ -15,17 +15,24 @@ final class AudioCaptureTests: XCTestCase {
             onLevel: { levels.append($0) },
             onEvent: { _ in }
         )
-        measuredEngine.emitBuffer(frameCount: 4_800, sampleValue: 0.02)
+        measuredEngine.emitBuffer(frameCount: 1_024, sampleValue: 0.02)
         await settleAudioCapture()
 
         XCTAssertEqual(levels.values.count, 1)
         let observedLevel = try XCTUnwrap(levels.values.first)
-        XCTAssertEqual(observedLevel.rms, 0.02, accuracy: 0.000_02)
+        // Allow one 16-bit PCM step for the short converter block, then verify
+        // the displayed measurement against the actual emitted bytes below.
+        XCTAssertEqual(observedLevel.rms, 0.02, accuracy: 1.0 / 32_768)
         XCTAssertGreaterThan(observedLevel.durationSeconds, 0)
-        XCTAssertLessThan(observedLevel.durationSeconds, 0.2)
+        XCTAssertLessThan(observedLevel.durationSeconds, 0.025, "音量观察应能使用短音频块")
         XCTAssertGreaterThan(observedLevel.timestampUptimeNanoseconds, 0)
         XCTAssertEqual(measuredChunks.totalCount, 0, "小于识别分片的声音也应先更新音量")
         measuredCapture.stop()
+        XCTAssertEqual(
+            observedLevel.rms,
+            AudioCaptureLevelMeasurement.rms(in: measuredChunks.dataSnapshot()),
+            accuracy: 0.000_000_001
+        )
         let expectedOutputBytes = Int((observedLevel.durationSeconds * 16_000).rounded()) * 2
 
         let plainEngine = FakeAudioEngineAdapter(format: makeFormat(sampleRate: 48_000))
@@ -36,7 +43,7 @@ final class AudioCaptureTests: XCTestCase {
             onChunk: { plainChunks.append($0) },
             onEvent: { _ in }
         )
-        plainEngine.emitBuffer(frameCount: 4_800, sampleValue: 0.02)
+        plainEngine.emitBuffer(frameCount: 1_024, sampleValue: 0.02)
         await settleAudioCapture()
         plainCapture.stop()
 

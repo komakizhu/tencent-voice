@@ -2,7 +2,10 @@ import AppKit
 
 @MainActor
 final class StatusMenuController: NSObject {
-    private var statusItem: NSStatusItem?
+    // Reserve the same slot in every mode, including idle and finalization.
+    // Starting recording and adding timer digits must never move nearby items.
+    static let statusItemWidth: CGFloat = 56
+    private(set) var statusItem: NSStatusItem?
     private var usageMenuItemView: UsageMenuItemView?
     private var calibrateUsageMenuItem: NSMenuItem?
     private var settingsMenuItem: NSMenuItem?
@@ -31,6 +34,7 @@ final class StatusMenuController: NSObject {
     private var statusFeedback: String?
     private var waveformDisplayModel = WaveformDisplayModel()
     private let monotonicClock: () -> UInt64
+    private let applicationStatusImageURL: URL?
     private(set) var menuBarDisplayMode: MenuBarDisplayMode = .defaultMode
     private(set) var statusButtonTitle = ""
     private(set) var statusButtonToolTip = "Rime Voice"
@@ -40,8 +44,12 @@ final class StatusMenuController: NSObject {
     private(set) var statusText = "就绪"
     private(set) var installedMenu: NSMenu?
 
-    init(monotonicClock: @escaping () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }) {
+    init(
+        monotonicClock: @escaping () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
+        applicationStatusImageURL: URL? = Bundle.main.url(forResource: "statusbar-matched", withExtension: "png")
+    ) {
         self.monotonicClock = monotonicClock
+        self.applicationStatusImageURL = applicationStatusImageURL
         super.init()
     }
 
@@ -49,7 +57,7 @@ final class StatusMenuController: NSObject {
         guard statusItem == nil else { return }
 
         waveformDisplayModel.reset()
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        let item = NSStatusBar.system.statusItem(withLength: Self.statusItemWidth)
         item.button?.title = ""
         item.button?.image = statusImage(for: .application)
         item.button?.imageScaling = .scaleProportionallyDown
@@ -281,10 +289,12 @@ final class StatusMenuController: NSObject {
         let currentState = displaySnapshot?.state ?? sessionState
         let isCapturing = displaySnapshot?.isCapturing ?? false
         switch (menuBarDisplayMode, currentState, isCapturing) {
-        case (.timer, .connecting, true), (.timer, .listening, true), (.timer, .recovering, true):
-            interval = 1
-        case (.waveform, .listening, true):
-            interval = 0.05
+        case (.timer, .connecting, true), (.timer, .listening, true),
+             (.timer, .recovering, true), (.timer, .stopping, true):
+            interval = 0.25
+        case (.waveform, .connecting, true), (.waveform, .listening, true),
+             (.waveform, .recovering, true), (.waveform, .stopping, true):
+            interval = 1.0 / 30
         default:
             interval = nil
         }
@@ -343,18 +353,14 @@ final class StatusMenuController: NSObject {
         }
 
         guard let button = statusItem?.button else { return }
-        button.title = presentation.title
-        button.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
-        if presentation.imageStyle == .none {
-            button.image = nil
-            button.imagePosition = .noImage
-        } else {
-            button.image = statusImage(for: presentation.imageStyle)
-            button.imagePosition = presentation.title.isEmpty ? .imageOnly : .imageLeading
-        }
+        // Recording styles share one image canvas. The idle application image
+        // keeps its original resource, size and native image-only rendering.
+        button.title = ""
+        button.image = statusImage(for: presentation.imageStyle)
+        button.imagePosition = .imageOnly
         button.toolTip = presentation.toolTip
         button.setAccessibilityLabel(presentation.accessibilityLabel)
-        statusItem?.length = presentation.title.isEmpty ? NSStatusItem.squareLength : NSStatusItem.variableLength
+        statusItem?.length = Self.statusItemWidth
     }
 
     static func formattedDuration(_ duration: Double) -> String {
@@ -459,30 +465,86 @@ final class StatusMenuController: NSObject {
 
     private func statusImage(for style: StatusButtonImageStyle) -> NSImage? {
         switch style {
-        case .none:
-            return nil
         case .application:
             return applicationStatusImage()
+        case .recording:
+            return recordingImage()
+        case .timer:
+            return recordingTimerImage(title: statusButtonTitle)
         case .waveform:
             return waveformImage()
-        case let .symbol(symbolName):
-            if symbolName == "mic.waiting" { return connectingImage() }
-            guard let symbol = NSImage(
-                systemSymbolName: symbolName,
-                accessibilityDescription: statusButtonAccessibilityLabel
-            ) else { return applicationStatusImage() }
-            let configured = symbol.withSymbolConfiguration(
-                NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
-            ) ?? symbol
-            configured.size = NSSize(width: 18, height: 18)
-            configured.isTemplate = true
-            return configured
         }
     }
 
+    private func recordingImage() -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 18))
+        image.lockFocus()
+        NSColor.systemRed.setFill()
+        NSColor.systemRed.setStroke()
+        let ring = NSBezierPath(ovalIn: NSRect(x: 2, y: 2, width: 14, height: 14))
+        ring.lineWidth = 1.6
+        ring.stroke()
+        NSBezierPath(ovalIn: NSRect(x: 5.4, y: 5.4, width: 7.2, height: 7.2)).fill()
+        image.unlockFocus()
+        // A template image loses its red recording cue in the macOS menu bar.
+        image.isTemplate = false
+        return image
+    }
+
+    private func recordingTimerImage(title: String) -> NSImage {
+        let baseFont = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
+        let titleWidth = (title as NSString).size(withAttributes: [.font: baseFont]).width
+        let pointSize = baseFont.pointSize * min(1, 32 / max(1, titleWidth))
+        let font = NSFont.monospacedDigitSystemFont(ofSize: pointSize, weight: .semibold)
+        let dot = NSImage(size: NSSize(width: 6, height: 6))
+        dot.lockFocus()
+        NSColor.systemRed.setFill()
+        NSBezierPath(ovalIn: NSRect(x: 0, y: 0, width: 6, height: 6)).fill()
+        dot.unlockFocus()
+        dot.isTemplate = false
+        let attachment = NSTextAttachment()
+        attachment.image = dot
+        // Share the text baseline and center the dot on the visible digit height.
+        // Native attributed text handles light/dark colors and drawing direction.
+        attachment.bounds = NSRect(x: 0, y: (font.capHeight - 6) / 2, width: 6, height: 6)
+        let text = NSMutableAttributedString(attachment: attachment)
+        text.append(NSAttributedString(string: "\u{2002}" + title))
+        text.addAttributes([.font: font, .foregroundColor: NSColor.labelColor], range: NSRange(location: 0, length: text.length))
+        let image = NSImage(size: NSSize(width: Self.statusItemWidth - 12, height: 18))
+        let appearance = statusItem?.button?.effectiveAppearance ?? NSApplication.shared.effectiveAppearance
+        appearance.performAsCurrentDrawingAppearance {
+            image.lockFocus()
+            let size = text.size()
+            text.draw(at: NSPoint(x: (image.size.width - size.width) / 2, y: (image.size.height - size.height) / 2))
+            image.unlockFocus()
+        }
+        return verticallyCenteredImage(image)
+    }
+
+    private func verticallyCenteredImage(_ image: NSImage) -> NSImage {
+        guard let data = image.tiffRepresentation, let bitmap = NSBitmapImageRep(data: data) else { return image }
+        var minY = bitmap.pixelsHigh
+        var maxY = -1
+        for y in 0..<bitmap.pixelsHigh {
+            for x in 0..<bitmap.pixelsWide where (bitmap.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0.5 {
+                minY = min(minY, y)
+                maxY = max(maxY, y)
+            }
+        }
+        guard maxY >= minY else { return image }
+        let scale = CGFloat(bitmap.pixelsHigh) / image.size.height
+        let center = image.size.height - CGFloat(minY + maxY + 1) / (2 * scale)
+        let centered = NSImage(size: image.size)
+        centered.lockFocus()
+        image.draw(at: NSPoint(x: 0, y: image.size.height / 2 - center), from: .zero, operation: .sourceOver, fraction: 1)
+        centered.unlockFocus()
+        centered.isTemplate = image.isTemplate
+        return centered
+    }
+
     private func applicationStatusImage() -> NSImage {
-        if let path = Bundle.main.path(forResource: "statusbar-matched", ofType: "png"),
-           let image = NSImage(contentsOfFile: path) {
+        if let url = applicationStatusImageURL,
+           let image = NSImage(contentsOfFile: url.path) {
             image.size = NSSize(width: 18, height: 18)
             // Let macOS tint the transparent mask for light/dark menu bars.
             image.isTemplate = true
@@ -509,14 +571,13 @@ final class StatusMenuController: NSObject {
         let image = NSImage(size: NSSize(width: 18, height: 18))
         image.lockFocus()
         let levels = statusButtonWaveformLevels.map { min(1, max(0, $0)) }
-        // Match the approved 24 × 20 HTML preview inside an 18-point icon.
-        let width = 2.6 * 0.75
+        let width = 2.4
+        NSColor.white.setFill()
         for index in 0..<5 {
-            let envelope = levels[index] / WaveformDisplayModel.barWeights[index]
-            guard envelope >= 0.001 else { continue }
-            NSColor.white.withAlphaComponent(min(1, envelope / 0.06)).setFill()
-            let height = width + (17 * 0.75 - width) * levels[index]
-            let x = 9 + Double(index - 2) * 3.8 * 0.75 - width / 2
+            // Silence still shows a solid baseline: the microphone is live even
+            // when there is no sound. Only height follows the measured volume.
+            let height = 3 + 13 * levels[index]
+            let x = 9 + Double(index - 2) * 3.4 - width / 2
             NSBezierPath(
                 roundedRect: NSRect(x: x, y: (18 - height) / 2, width: width, height: height),
                 xRadius: width / 2,
@@ -528,21 +589,4 @@ final class StatusMenuController: NSObject {
         return image
     }
 
-    private func connectingImage() -> NSImage {
-        let image = NSImage(size: NSSize(width: 18, height: 18))
-        image.lockFocus()
-        if let microphone = NSImage(
-            systemSymbolName: "mic.fill",
-            accessibilityDescription: statusButtonAccessibilityLabel
-        )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)) {
-            microphone.draw(in: NSRect(x: 0, y: 0, width: 15, height: 15))
-        }
-        NSColor.white.setFill()
-        for x in [12.0, 14.0, 16.0] {
-            NSBezierPath(ovalIn: NSRect(x: x, y: 3.0, width: 1.2, height: 1.2)).fill()
-        }
-        image.unlockFocus()
-        image.isTemplate = true
-        return image
-    }
 }

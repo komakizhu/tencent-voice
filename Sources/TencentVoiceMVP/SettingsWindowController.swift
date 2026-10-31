@@ -337,7 +337,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             labeled(
                 "状态栏录音显示",
                 view: menuBarDisplayModePopup,
-                toolTip: "选择录音时状态栏显示图标、已录时长或真实麦克风音量波形；修改后点击“保存设置”。"
+                toolTip: "三种模式占用相同的固定宽度：红色录音标记、累计秒数或麦克风音量波形。静音时波形保留基线；修改后点击“保存设置”。"
             ),
             hideMenuBarIconCheckbox,
             storageSection()
