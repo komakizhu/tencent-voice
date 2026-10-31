@@ -4,7 +4,7 @@ import XCTest
 
 @MainActor
 final class StatusMenuBarDisplayTests: XCTestCase {
-    func testStatusSlotDoesNotMoveWhenTimerGrowsOrRecordingStateChanges() throws {
+    func testIconModesKeepOriginalNativeWidthBeforeDuringAndAfterRecording() throws {
         _ = NSApplication.shared
         let controller = StatusMenuController(applicationStatusImageURL: originalApplicationImageURL)
         var snapshot = makeSnapshot(state: .idle, isCapturing: false)
@@ -13,17 +13,9 @@ final class StatusMenuBarDisplayTests: XCTestCase {
         defer { controller.uninstall() }
         let item = try XCTUnwrap(controller.statusItem)
         let button = try XCTUnwrap(item.button)
-        let initialWidth = item.length
-
-        for duration in [0, 9, 10, 99, 100, 999, 1_000, 3_599, 3_600, 86_400] {
-            snapshot = makeSnapshot(duration: Double(duration))
-            controller.update(recordingState: .listening)
-            XCTAssertEqual(controller.statusButtonTitle, "\(duration)s")
-            XCTAssertEqual(item.length, initialWidth)
-            XCTAssertEqual(button.imagePosition, .imageOnly)
-            XCTAssertEqual(button.image?.size.height, 18)
-            XCTAssertLessThanOrEqual(try XCTUnwrap(button.cell).cellSize.width, item.length)
-        }
+        let referenceItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        defer { NSStatusBar.system.removeStatusItem(referenceItem) }
+        let reference = try XCTUnwrap(referenceItem.button)
 
         for mode in MenuBarDisplayMode.allCases {
             controller.update(menuBarDisplayMode: mode)
@@ -31,12 +23,52 @@ final class StatusMenuBarDisplayTests: XCTestCase {
                 for capturing in [false, true] {
                     snapshot = makeSnapshot(state: state, isCapturing: capturing)
                     controller.update(recordingState: state)
-                    XCTAssertEqual(item.length, initialWidth, "切换风格和状态不能挤动旁边图标")
+                    if controller.statusButtonImageStyle != .timer {
+                        XCTAssertEqual(item.length, NSStatusItem.squareLength)
+                        XCTAssertEqual(button.bounds.width, reference.bounds.width,
+                                       "未录音、录音图标和波形必须保持旧版系统标准占位")
+                    }
                     XCTAssertNotNil(button.image)
                     XCTAssertTrue(button.title.isEmpty)
+                    XCTAssertEqual(button.imagePosition, .imageOnly)
+                    XCTAssertEqual(button.image?.size.height, 18)
                     XCTAssertFalse(button.accessibilityLabel()?.isEmpty ?? true)
                 }
             }
+        }
+    }
+
+    func testTimerUsesOnlyContentWidthAndOriginalIconSideMargins() throws {
+        _ = NSApplication.shared
+        let controller = StatusMenuController(applicationStatusImageURL: originalApplicationImageURL)
+        var snapshot = makeSnapshot()
+        controller.configureRecordingDisplay { snapshot }
+        controller.install()
+        defer { controller.uninstall() }
+        let button = try XCTUnwrap(controller.statusItem?.button)
+        let referenceItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        defer { NSStatusBar.system.removeStatusItem(referenceItem) }
+        let nativePadding = try XCTUnwrap(referenceItem.button).bounds.width - 18
+        var widthsByDigitCount: [Int: CGFloat] = [:]
+
+        for duration in [0, 9, 10, 61, 99, 100, 999, 1_000, 3_599, 3_600, 9_999, 10_000, 86_400] {
+            snapshot = makeSnapshot(duration: Double(duration))
+            controller.update(recordingState: .listening)
+            let image = try XCTUnwrap(button.image)
+            let bitmap = try self.bitmap(image)
+            let content = try pixelBounds(bitmap) { _ in true }
+            let scale = CGFloat(bitmap.pixelsWide) / image.size.width
+            XCTAssertEqual(controller.statusButtonTitle, "\(duration)s")
+            XCTAssertEqual(button.bounds.width - image.size.width, nativePadding, accuracy: 0.5,
+                           "计时两侧必须沿用原图标的间距，不额外预留空位")
+            XCTAssertLessThanOrEqual(image.size.width - content.width / scale, 2,
+                                     "计时画布内不能藏有多余的左右留白")
+            XCTAssertLessThanOrEqual(try XCTUnwrap(button.cell).cellSize.width, button.bounds.width)
+            let digits = String(duration).count
+            if let priorWidth = widthsByDigitCount[digits] {
+                XCTAssertEqual(button.bounds.width, priorWidth, "相同位数的计时不能跳动")
+            }
+            widthsByDigitCount[digits] = button.bounds.width
         }
     }
 
@@ -207,7 +239,7 @@ final class StatusMenuBarDisplayTests: XCTestCase {
 
         // Reproduce the original application's direct resource loading and
         // native image-only rendering, rather than a separately redrawn icon.
-        let referenceItem = NSStatusBar.system.statusItem(withLength: StatusMenuController.statusItemWidth)
+        let referenceItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         defer { NSStatusBar.system.removeStatusItem(referenceItem) }
         referenceItem.menu = NSMenu()
         let reference = try XCTUnwrap(referenceItem.button)
@@ -333,7 +365,10 @@ final class StatusMenuBarDisplayTests: XCTestCase {
             (label as NSString).draw(at: NSPoint(x: 40, y: y + 5),
                                     withAttributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: dark ? NSColor.lightGray : .darkGray])
             for (column, item) in items.enumerated() {
-                item.draw(in: NSRect(x: 214 + column * 150, y: Int(y), width: 56, height: 24))
+                // Preserve the native control's actual width and icon size.
+                item.draw(at: NSPoint(x: 242 + CGFloat(column * 150) - item.size.width / 2,
+                                      y: y + (24 - item.size.height) / 2),
+                          from: .zero, operation: .sourceOver, fraction: 1)
             }
         }
         image.unlockFocus()

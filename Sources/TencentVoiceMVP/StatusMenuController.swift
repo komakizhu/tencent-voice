@@ -2,9 +2,6 @@ import AppKit
 
 @MainActor
 final class StatusMenuController: NSObject {
-    // Reserve the same slot in every mode, including idle and finalization.
-    // Starting recording and adding timer digits must never move nearby items.
-    static let statusItemWidth: CGFloat = 56
     private(set) var statusItem: NSStatusItem?
     private var usageMenuItemView: UsageMenuItemView?
     private var calibrateUsageMenuItem: NSMenuItem?
@@ -57,7 +54,7 @@ final class StatusMenuController: NSObject {
         guard statusItem == nil else { return }
 
         waveformDisplayModel.reset()
-        let item = NSStatusBar.system.statusItem(withLength: Self.statusItemWidth)
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.title = ""
         item.button?.image = statusImage(for: .application)
         item.button?.imageScaling = .scaleProportionallyDown
@@ -360,7 +357,15 @@ final class StatusMenuController: NSObject {
         button.imagePosition = .imageOnly
         button.toolTip = presentation.toolTip
         button.setAccessibilityLabel(presentation.accessibilityLabel)
-        statusItem?.length = Self.statusItemWidth
+        if presentation.imageStyle == .timer, let image = button.image {
+            // Keep the original square item's side margins; only the visible
+            // timer content needs more room than the original 18-point icon.
+            let nativeWidth = NSStatusBar.system.thickness
+            let horizontalPadding = max(0, nativeWidth - 18)
+            statusItem?.length = max(nativeWidth, image.size.width + horizontalPadding)
+        } else {
+            statusItem?.length = NSStatusItem.squareLength
+        }
     }
 
     static func formattedDuration(_ duration: Double) -> String {
@@ -492,10 +497,7 @@ final class StatusMenuController: NSObject {
     }
 
     private func recordingTimerImage(title: String) -> NSImage {
-        let baseFont = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
-        let titleWidth = (title as NSString).size(withAttributes: [.font: baseFont]).width
-        let pointSize = baseFont.pointSize * min(1, 32 / max(1, titleWidth))
-        let font = NSFont.monospacedDigitSystemFont(ofSize: pointSize, weight: .semibold)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
         let dot = NSImage(size: NSSize(width: 6, height: 6))
         dot.lockFocus()
         NSColor.systemRed.setFill()
@@ -510,11 +512,11 @@ final class StatusMenuController: NSObject {
         let text = NSMutableAttributedString(attachment: attachment)
         text.append(NSAttributedString(string: "\u{2002}" + title))
         text.addAttributes([.font: font, .foregroundColor: NSColor.labelColor], range: NSRange(location: 0, length: text.length))
-        let image = NSImage(size: NSSize(width: Self.statusItemWidth - 12, height: 18))
+        let size = text.size()
+        let image = NSImage(size: NSSize(width: ceil(size.width), height: 18))
         let appearance = statusItem?.button?.effectiveAppearance ?? NSApplication.shared.effectiveAppearance
         appearance.performAsCurrentDrawingAppearance {
             image.lockFocus()
-            let size = text.size()
             text.draw(at: NSPoint(x: (image.size.width - size.width) / 2, y: (image.size.height - size.height) / 2))
             image.unlockFocus()
         }
