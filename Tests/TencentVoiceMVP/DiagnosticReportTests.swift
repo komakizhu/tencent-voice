@@ -264,6 +264,7 @@ final class DiagnosticReportTests: XCTestCase {
                         "selectionLocation": "6"
                     ]
                 ),
+                SessionLogEntry(sessionID: session, event: "keyboard_write_unconfirmed"),
                 SessionLogEntry(
                     sessionID: session,
                     event: "keyboard_selection_stabilization_failed",
@@ -282,6 +283,9 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertTrue(report.findings.contains { $0.code == "ax_coordinate_mapping_resolved" })
         XCTAssertTrue(report.findings.contains { $0.code == "ax_coordinate_mapping_retryable" })
         XCTAssertTrue(report.findings.contains { $0.code == "ax_coordinate_mapping_failed" })
+        XCTAssertTrue(report.findings.first { $0.code == "ax_coordinate_mapping_retryable" }?.message.contains("正文、坐标或选区暂时不同步") == true)
+        XCTAssertTrue(report.findings.first { $0.code == "keyboard_write_unconfirmed" }?.message.contains("未能确认") == true)
+        XCTAssertFalse(report.findings.first { $0.code == "keyboard_write_unconfirmed" }?.message.contains("确认期限内") == true)
         XCTAssertEqual(
             report.findings.first { $0.code == "ax_coordinate_mapping_resolved" }?.level,
             .info

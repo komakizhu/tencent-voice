@@ -165,6 +165,121 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.state, .idle)
     }
 
+    func testStopWhileTargetAwayKeepsTranscriptAndCompletesWhenTargetReturns() async throws {
+        let asr = FakeRealtimeASRClient()
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        target.keyboardAvailability = .temporarilyAway
+        var pendingStates: [Bool] = []
+        let coordinator = SessionCoordinator(
+            asr: asr,
+            audio: FakeAudioCapture(),
+            textTarget: target,
+            settingsStore: UserDefaultsSettingsStore(suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"),
+            credentialStore: InMemoryCredentialStore(TencentCredentials(appID: "app", secretID: "id", secretKey: "key")),
+            keyboardSmoothing: .immediate,
+            onPendingCompletionChange: { pendingStates.append($0) },
+            onStateChange: { _ in }
+        )
+
+        try await coordinator.begin()
+        asr.emit(ASRUpdate(text: "123", isFinal: true, sequence: 0))
+        await settleCoordinator()
+        XCTAssertEqual(target.text, "")
+
+        try await coordinator.end()
+        XCTAssertEqual(coordinator.state, .idle, "Waiting to complete text must not keep recording active")
+        XCTAssertEqual(target.text, "")
+        XCTAssertEqual(pendingStates, [true])
+
+        target.keyboardAvailability = .active
+        await coordinator.pollTargetAvailabilityForTesting()
+        XCTAssertEqual(target.text, "123")
+        XCTAssertEqual(target.pastedTexts, ["123"])
+        XCTAssertEqual(pendingStates, [true, false])
+
+        asr.emit(ASRUpdate(text: "late callback", isFinal: true, sequence: 1))
+        await settleCoordinator()
+        XCTAssertEqual(target.text, "123", "A late callback from the stopped session must be ignored")
+    }
+
+    func testRecognitionAcrossAwayAndReturnCoalescesTo123456789ExactlyOnce() async throws {
+        let asr = FakeRealtimeASRClient()
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let coordinator = makeCoordinator(asr: asr, target: target, keyboardSmoothing: .immediate)
+
+        try await coordinator.begin()
+        asr.emit(ASRUpdate(text: "123", isFinal: false, sequence: 0))
+        await settleCoordinator()
+        XCTAssertEqual(target.text, "123")
+
+        target.keyboardAvailability = .temporarilyAway
+        asr.emit(ASRUpdate(text: "123456", isFinal: false, sequence: 0))
+        await settleCoordinator()
+        XCTAssertEqual(target.text, "123")
+
+        target.keyboardAvailability = .active
+        await coordinator.pollTargetAvailabilityForTesting()
+        XCTAssertEqual(target.text, "123456", "Return polling must resume even without a new ASR callback")
+
+        target.keyboardAvailability = .temporarilyAway
+        asr.emit(ASRUpdate(text: "123456789", isFinal: false, sequence: 0))
+        await settleCoordinator()
+        XCTAssertEqual(target.text, "123456")
+        target.keyboardAvailability = .active
+        await coordinator.pollTargetAvailabilityForTesting()
+        try await coordinator.end()
+
+        XCTAssertEqual(target.text, "123456789")
+        XCTAssertEqual(target.pastedTexts.joined(), "123456789")
+        XCTAssertEqual(target.text.components(separatedBy: "123456789").count - 1, 1)
+    }
+
+    func testStoppedPendingCompletionExpiresAtOriginalSixtySecondDeadline() async throws {
+        let asr = FakeRealtimeASRClient()
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        target.keyboardAvailability = .temporarilyAway
+        var now: UInt64 = 1_000
+        let coordinator = SessionCoordinator(
+            asr: asr,
+            audio: FakeAudioCapture(),
+            textTarget: target,
+            settingsStore: UserDefaultsSettingsStore(suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"),
+            credentialStore: InMemoryCredentialStore(TencentCredentials(appID: "app", secretID: "id", secretKey: "key")),
+            keyboardSmoothing: .immediate,
+            monotonicNow: { now },
+            onStateChange: { _ in }
+        )
+        try await coordinator.begin()
+        asr.emit(ASRUpdate(text: "到期要复制", isFinal: true, sequence: 0))
+        await settleCoordinator()
+        try await coordinator.end()
+
+        now = 60_000_001_000
+        await coordinator.pollTargetAvailabilityForTesting()
+        XCTAssertEqual(target.text, "")
+        XCTAssertEqual(target.copiedText, "到期要复制")
+        XCTAssertEqual(target.pastedTexts, [])
+    }
+
+    func testCancellingStoppedPendingCompletionCopiesTranscriptAndInvalidatesReturn() async throws {
+        let asr = FakeRealtimeASRClient()
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        target.keyboardAvailability = .temporarilyAway
+        let coordinator = makeCoordinator(asr: asr, target: target)
+        try await coordinator.begin()
+        asr.emit(ASRUpdate(text: "用户取消的补齐", isFinal: true, sequence: 0))
+        await settleCoordinator()
+        try await coordinator.end()
+
+        coordinator.cancelPendingCompletion()
+        target.keyboardAvailability = .active
+        await coordinator.pollTargetAvailabilityForTesting()
+
+        XCTAssertEqual(target.text, "")
+        XCTAssertEqual(target.pastedTexts, [])
+        XCTAssertEqual(target.copiedText, "用户取消的补齐")
+    }
+
     func testStoppingDefersPacingFlushUntilASRFinalizationCompletes() async throws {
         let asr = FakeRealtimeASRClient()
         asr.finishCompletesStream = false

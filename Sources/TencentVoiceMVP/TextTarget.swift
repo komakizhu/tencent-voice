@@ -343,6 +343,19 @@ extension TextTarget {
     }
 }
 
+enum KeyboardTargetAvailability: Equatable {
+    case active
+    case temporarilyAway
+    case invalid
+}
+
+/// Optional seam for targets that can prove the captured editor is merely
+/// behind another application. Other targets retain the existing stop rules.
+@MainActor
+protocol KeyboardTargetAvailabilityProviding: AnyObject {
+    func keyboardTargetAvailability() -> KeyboardTargetAvailability
+}
+
 enum TextTargetError: Error, LocalizedError {
     case unsupported
     case targetChanged

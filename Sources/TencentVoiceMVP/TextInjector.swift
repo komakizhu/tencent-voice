@@ -47,6 +47,7 @@ final class TextInjector {
         case inactive
         case ax
         case keyboardLiveTail
+        case pausedTarget
         case safeCopy
     }
 
@@ -84,6 +85,7 @@ final class TextInjector {
     private var diagnostics: [TextInputDiagnostic] = []
     private var diagnosticBytes = 0
     private var droppedDiagnosticCount = 0
+    private var pendingCompletionResumeInFlight = false
     private let diagnosticLimit = 128
     private var currentProjectionDiagnosticFields: [String: String] = [:]
     private var previousProjectionSegmentID: Int?
@@ -105,6 +107,7 @@ final class TextInjector {
         case .inactive: return "inactive"
         case .ax: return "ax"
         case .keyboardLiveTail: return "keyboard_live_tail"
+        case .pausedTarget: return "target_away"
         case .safeCopy: return "safe_copy"
         }
     }
@@ -129,6 +132,19 @@ final class TextInjector {
             droppedDiagnosticCount = 0
         }
         return result.sorted { $0.timestamp < $1.timestamp }
+    }
+
+    private func pauseKeyboardWritesIfTargetIsAway() {
+        guard mode == .keyboardLiveTail,
+              let availability = target as? any KeyboardTargetAvailabilityProviding,
+              availability.keyboardTargetAvailability() == .temporarilyAway else {
+            return
+        }
+        mode = .pausedTarget
+        recordDiagnostic("input_target_temporarily_away", [
+            "recognizedLengthCharacters": String(lastProjectionText.count),
+            "writeDispatchPaused": "true"
+        ])
     }
 
     func begin() throws {
@@ -192,6 +208,8 @@ final class TextInjector {
             return
         }
 
+        pauseKeyboardWritesIfTargetIsAway()
+
         let previousText = lastProjectionText
         let previousSegmentID = previousProjectionSegmentID
         currentProjectionDiagnosticFields = projectionDiagnosticFields(
@@ -220,6 +238,11 @@ final class TextInjector {
             }
         case .safeCopy:
             lastProjectionText = projection.text
+        case .pausedTarget:
+            recordDiagnostic("target_away_projection_deferred", [
+                "candidateLengthCharacters": String(projection.text.count),
+                "revision": String(projection.revision)
+            ])
         case .inactive:
             break
         }
@@ -238,6 +261,7 @@ final class TextInjector {
 
     func beginFinalization() {
         guard mode == .keyboardLiveTail || mode == .ax else { return }
+        pauseKeyboardWritesIfTargetIsAway()
         inputPhase = .finalizing
         recordDiagnostic("text_input_phase", ["phase": inputPhase.rawValue, "reason": "asr_finalization_started"])
         keyboardPacer?.beginFinalization()
@@ -245,6 +269,16 @@ final class TextInjector {
 
     func finish(finalText: String) async throws {
         let completionText = finalText.isEmpty ? lastProjectionText : finalText
+        pauseKeyboardWritesIfTargetIsAway()
+        if mode == .pausedTarget {
+            lastProjectionText = completionText
+            inputPhase = .finalizing
+            recordDiagnostic("input_waiting_for_target_return", [
+                "recognizedLengthCharacters": String(completionText.count),
+                "reason": "target_temporarily_away"
+            ])
+            return
+        }
         if inputPhase == .live {
             inputPhase = .finalizing
             recordDiagnostic("text_input_phase", ["phase": inputPhase.rawValue, "reason": "finish_without_explicit_finalization"])
@@ -280,6 +314,10 @@ final class TextInjector {
             }
         case .safeCopy, .inactive:
             break
+        case .pausedTarget:
+            // The early return above deliberately retains the injector for the
+            // bounded post-stop completion window.
+            break
         }
 
         try copyOnFinishIfNeeded(completionText)
@@ -311,7 +349,7 @@ final class TextInjector {
             // until a later session can establish a fresh snapshot.
             axWriter?.cancel()
             recordDiagnostic("text_input_phase", ["phase": inputPhase.rawValue, "reason": "finished_immediately_ax_cancelled"])
-        case .safeCopy, .inactive:
+        case .safeCopy, .pausedTarget, .inactive:
             break
         }
 
@@ -330,6 +368,113 @@ final class TextInjector {
             ])
         }
         reset()
+    }
+
+    var isAwaitingTargetReturn: Bool { mode == .pausedTarget }
+
+    /// Rechecks the captured target and writes only the latest, still-unconfirmed
+    /// transcript. It never replays an operation already accepted by the writer.
+    func resumeTargetIfAvailable() -> Bool {
+        guard mode == .pausedTarget,
+              let availability = target as? any KeyboardTargetAvailabilityProviding else {
+            return false
+        }
+        switch availability.keyboardTargetAvailability() {
+        case .temporarilyAway:
+            return false
+        case .invalid:
+            enterSafeCopy(after: TextTargetError.targetChanged)
+            recordDiagnostic("input_target_resume_failed", ["reason": "target_identity_or_editability_unconfirmed"])
+            return false
+        case .active:
+            guard !(keyboardWriter?.hasPendingWork ?? false) else {
+                recordDiagnostic("input_target_resume_waiting_for_write_confirmation", [
+                    "reason": "previous_operation_still_unconfirmed"
+                ])
+                return false
+            }
+            mode = .keyboardLiveTail
+            recordDiagnostic("input_target_resume_rechecking", [
+                "candidateLengthCharacters": String(lastProjectionText.count)
+            ])
+            do {
+                let hasUnconfirmedVoiceTail = lastSubmittedText != lastProjectionText
+                let originalPhase = inputPhase
+                if !hasUnconfirmedVoiceTail, inputPhase == .finalizing {
+                    // With no missing voice text, an independently completed
+                    // manual edit can safely establish a fresh insertion point.
+                    inputPhase = .live
+                }
+                let candidateText = try prepareKeyboardCandidate(
+                    lastProjectionText,
+                    previousText: lastSubmittedText,
+                    projection: nil,
+                    allowExternalRebase: !hasUnconfirmedVoiceTail
+                )
+                if inputPhase == .live, originalPhase == .finalizing {
+                    inputPhase = .finalizing
+                }
+                if let keyboardPacer {
+                    try keyboardPacer.accept(candidate: candidateText, trigger: .partial)
+                } else {
+                    try applyKeyboardCandidate(candidateText)
+                }
+                recordDiagnostic("input_target_resumed", [
+                    "candidateLengthCharacters": String(lastProjectionText.count),
+                    "unconfirmedTailLengthCharacters": String(max(0, lastProjectionText.count - lastSubmittedText.count))
+                ])
+                return mode == .keyboardLiveTail
+            } catch {
+                enterSafeCopy(after: error)
+                recordDiagnostic("input_target_resume_failed", [
+                    "reason": DiagnosticErrorFormatter.code(for: error)
+                ])
+                return false
+            }
+        }
+    }
+
+    func finishPendingAfterTargetReturn(finalText: String) async throws -> Bool {
+        guard !pendingCompletionResumeInFlight else { return false }
+        guard mode == .pausedTarget else { return true }
+        pendingCompletionResumeInFlight = true
+        defer { pendingCompletionResumeInFlight = false }
+        if !finalText.isEmpty { lastProjectionText = finalText }
+        guard resumeTargetIfAvailable() else { return mode != .pausedTarget }
+        try await finish(finalText: finalText)
+        return mode != .pausedTarget
+    }
+
+    func expirePendingCompletion() {
+        guard mode == .pausedTarget else { return }
+        recordDiagnostic("input_pending_completion_expired", [
+            "recognizedLengthCharacters": String(lastProjectionText.count)
+        ])
+        enterSafeCopy(after: TextTargetError.targetChanged)
+        do {
+            try copyIfNeeded(lastProjectionText)
+        } catch {
+            recordDiagnostic("safe_copy_update_failed", [
+                "failureCode": DiagnosticErrorFormatter.code(for: error),
+                "recognizedLengthCharacters": String(lastProjectionText.count)
+            ])
+        }
+    }
+
+    func cancelPendingCompletion() {
+        guard mode == .pausedTarget else { return }
+        recordDiagnostic("input_pending_completion_cancelled", [
+            "recognizedLengthCharacters": String(lastProjectionText.count)
+        ])
+        enterSafeCopy(after: TextTargetError.targetChanged)
+        do {
+            try copyIfNeeded(lastProjectionText)
+        } catch {
+            recordDiagnostic("safe_copy_update_failed", [
+                "failureCode": DiagnosticErrorFormatter.code(for: error),
+                "recognizedLengthCharacters": String(lastProjectionText.count)
+            ])
+        }
     }
 
     private func copyIfNeeded(_ text: String) throws {
@@ -425,7 +570,8 @@ final class TextInjector {
     private func prepareKeyboardCandidate(
         _ candidateText: String,
         previousText: String,
-        projection: ASRProjection?
+        projection: ASRProjection?,
+        allowExternalRebase: Bool = true
     ) throws -> String {
         if let acknowledging = target as? any KeyboardAcknowledgingTarget,
            acknowledging.requiresKeyboardAcknowledgement {
@@ -451,6 +597,13 @@ final class TextInjector {
                 guard inputPhase != .finalizing else {
                     inputPhase = .frozenByExternalEdit
                     recordDiagnostic("text_input_phase", ["phase": inputPhase.rawValue, "reason": "external_edit_during_finalization"])
+                    throw TextTargetError.targetChanged
+                }
+                guard allowExternalRebase else {
+                    recordDiagnostic("mixed_input_ambiguous", [
+                        "candidateLengthCharacters": String(candidateText.count),
+                        "reason": "external_edit_overlaps_unconfirmed_voice_tail"
+                    ])
                     throw TextTargetError.targetChanged
                 }
                 guard !(keyboardPacer?.hasPendingOutput ?? false),
@@ -1006,6 +1159,7 @@ final class TextInjector {
         diagnostics.removeAll(keepingCapacity: true)
         diagnosticBytes = 0
         droppedDiagnosticCount = 0
+        pendingCompletionResumeInFlight = false
         currentProjectionDiagnosticFields = [:]
         previousProjectionSegmentID = nil
         mixedInputFrozenPrefix = nil
@@ -1039,6 +1193,7 @@ final class TextInjector {
         diagnostics.removeAll(keepingCapacity: true)
         diagnosticBytes = 0
         droppedDiagnosticCount = 0
+        pendingCompletionResumeInFlight = false
         currentProjectionDiagnosticFields = [:]
         previousProjectionSegmentID = nil
         mixedInputFrozenPrefix = nil

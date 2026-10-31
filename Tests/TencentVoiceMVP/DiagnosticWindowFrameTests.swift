@@ -20,7 +20,22 @@ final class DiagnosticWindowFrameTests: XCTestCase {
             )
         }
         XCTAssertEqual(reason(count: 0), "candidate_window_count_mismatch")
-        XCTAssertEqual(reason(count: 2), "candidate_window_count_mismatch")
+        XCTAssertEqual(reason(count: 2, windowID: nil), "window_identifier_changed")
+        XCTAssertNil(
+            reason(count: 2, windowID: expected),
+            "additional windows from the same app must not invalidate a verified original window"
+        )
+        XCTAssertEqual(
+            DiagnosticWindowFrameVerification.uniqueWindowID(
+                candidateWindowIDs: [expected, 21],
+                matchingFocusedWindowIDs: [expected]
+            ),
+            expected
+        )
+        XCTAssertNil(DiagnosticWindowFrameVerification.uniqueWindowID(
+            candidateWindowIDs: [expected, 21],
+            matchingFocusedWindowIDs: [expected, 21]
+        ))
         XCTAssertEqual(reason(windowID: 21), "window_identifier_changed")
         XCTAssertEqual(reason(focus: .unavailable), "focused_window_unavailable")
         XCTAssertEqual(reason(focus: .windowMismatch), "window_information_mismatch")
@@ -46,11 +61,19 @@ final class DiagnosticWindowFrameTests: XCTestCase {
             retainedBytes: 0,
             frames: [],
             archiveStatus: "not_included",
-            stopReason: "window_identifier_changed"
+            stopReason: "window_identifier_changed",
+            statusTransitions: [DiagnosticWindowFrameStatusTransition(
+                timestamp: Date(timeIntervalSince1970: 1.5),
+                monotonicNanoseconds: 123,
+                status: "target_window_changed",
+                reason: "original_target_window_unavailable"
+            )]
         ))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         XCTAssertEqual(object["status"] as? String, "target_window_changed")
         XCTAssertEqual(object["stopReason"] as? String, "window_identifier_changed")
+        let transitions = try XCTUnwrap(object["statusTransitions"] as? [[String: Any]])
+        XCTAssertEqual(transitions.first?["reason"] as? String, "original_target_window_unavailable")
     }
 
     func testCapturePolicyRequiresOptInActiveSessionPermissionAndNoSecureInput() {

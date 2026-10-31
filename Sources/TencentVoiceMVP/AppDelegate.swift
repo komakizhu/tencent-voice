@@ -133,6 +133,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 failureContext.sessionBegan(sessionID)
                 diagnosticWindowFrameRecorder.sessionBegan(sessionID)
             },
+            onPendingCompletionChange: { pending in
+                menu.update(pendingCompletion: pending)
+                menu.update(status: pending ? "已停止录音，等待返回补齐" : "就绪")
+            },
             onStateChange: { state in
                 let diagnosticState: String = switch state {
                 case .idle: "idle"
@@ -215,6 +219,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             onOpenFailureReports: { [weak self] in
                 self?.openFailureReports()
+            },
+            onCancelPendingCompletion: { [weak self] in
+                self?.coordinator.cancelPendingCompletion()
             }
         )
         menu.configureRecordingDisplay { [weak self] in

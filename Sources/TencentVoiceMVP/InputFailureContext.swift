@@ -359,6 +359,7 @@ final class InputFailureContextRecorder {
     private var applicationObserver: NSObjectProtocol?
     private let probeQueue = DispatchQueue(label: "local.tencent.voice.mvp.failure-context", qos: .utility)
     private let probe: any InputContextSampling
+    private let inputSourceIdentifierProvider: () -> String?
     private var previousSample: [String: String]?
     private var lastActivity: Date = .distantPast
     private var generation = 0
@@ -408,12 +409,43 @@ final class InputFailureContextRecorder {
             || (!diagnosticOnlyTimelineEvents.contains(event) && elapsedSinceLastProbe >= 1)
     }
 
+    static func codexInputEnvironmentFields(
+        bundleIdentifier: String?,
+        processID: Int32?,
+        capturedTargetPID: pid_t?,
+        inputSourceIdentifier: String?,
+        secureInputActive: Bool
+    ) -> [String: String]? {
+        guard bundleIdentifier == "com.openai.codex",
+              let processID,
+              capturedTargetPID == pid_t(processID) else { return nil }
+        return [
+            "inputSourceIdentifier": inputSourceIdentifier ?? "unknown",
+            "secureInputActive": String(secureInputActive),
+            "externalIMECompositionState": "unknown",
+            "externalIMECompositionStateAvailability": "unavailable_outside_host_process",
+            "typedCharactersRecorded": "false"
+        ]
+    }
+
+    nonisolated private static func currentInputSourceIdentifier() -> String? {
+        guard let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+              let identifier = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else {
+            return nil
+        }
+        return Unmanaged<CFString>.fromOpaque(identifier).takeUnretainedValue() as String
+    }
+
     init(
         axNotificationObserver: (any InputFailureAXNotificationObserving)? = nil,
-        probe: any InputContextSampling = InputContextAXProbe()
+        probe: any InputContextSampling = InputContextAXProbe(),
+        inputSourceIdentifierProvider: @escaping () -> String? = {
+            InputFailureContextRecorder.currentInputSourceIdentifier()
+        }
     ) {
         self.axNotificationObserver = axNotificationObserver ?? SystemInputFailureAXNotificationObserver()
         self.probe = probe
+        self.inputSourceIdentifierProvider = inputSourceIdentifierProvider
     }
 
     var latestFailure: InputFailureEvidence? {
@@ -486,10 +518,23 @@ final class InputFailureContextRecorder {
                 targetObservationID: diagnostic.fields["targetElementObservationID"]
             )
         }
+        var diagnosticFields = DiagnosticLogSanitizer.fields(diagnostic.fields)
+        if activeSessionID != nil,
+           bundleIdentifier == "com.openai.codex",
+           pid == observedAXTargetPID,
+           let inputEnvironment = Self.codexInputEnvironmentFields(
+            bundleIdentifier: bundleIdentifier,
+            processID: pid.map { Int32($0) },
+            capturedTargetPID: observedAXTargetPID,
+            inputSourceIdentifier: inputSourceIdentifierProvider(),
+            secureInputActive: IsSecureEventInputEnabled()
+        ) {
+            diagnosticFields.merge(inputEnvironment) { _, new in new }
+        }
         if failure {
             record(
                 diagnostic.event,
-                fields: DiagnosticLogSanitizer.fields(diagnostic.fields),
+                fields: diagnosticFields,
                 at: now,
                 sessionID: activeSessionID,
                 operationID: Int(diagnostic.fields["operationID"] ?? ""),
@@ -505,7 +550,7 @@ final class InputFailureContextRecorder {
         } else if timelineEvent || dispatch || acknowledged || capture {
             record(
                 diagnostic.event,
-                fields: DiagnosticLogSanitizer.fields(diagnostic.fields),
+                fields: diagnosticFields,
                 at: now,
                 sessionID: activeSessionID,
                 operationID: Int(diagnostic.fields["operationID"] ?? ""),
@@ -538,7 +583,7 @@ final class InputFailureContextRecorder {
                     }
             }
             guard let self, self.isEnabled, self.generation == token else { return }
-            var fields = DiagnosticLogSanitizer.fields(diagnostic.fields)
+            var fields = diagnosticFields
             fields.merge(details) { _, new in new }
             fields["phase"] = diagnostic.event
             fields["pid"] = String(pid)
@@ -709,6 +754,11 @@ final class InputFailureContextRecorder {
         window.collectionStatus["safariContinuityDiagnosticPermission"] = "existing_accessibility_permission"
         window.collectionStatus["safariContinuityDiagnosticRetention"] = "same_bounded_input_failure_window"
         window.collectionStatus["localMonitorInstalled"] = String(localMonitor != nil)
+        window.collectionStatus["externalIMECompositionState"] = "unknown"
+        window.collectionStatus["externalIMECompositionStateAvailability"] = "unavailable_outside_host_process"
+        window.collectionStatus["inputSourceCaptureScope"] = "active_original_codex_target_only"
+        window.collectionStatus["inputSourceCapturePermission"] = "existing_diagnostic_opt_in"
+        window.collectionStatus["inputSourceCaptureRetention"] = "same_bounded_input_failure_window"
         window.collectionStatus["axNotificationCaptureScope"] = "focused_target_value_selection_and_application_focus_only"
         window.collectionStatus["axNotificationIsIndependentPageEvidence"] = "false"
         window.collectionStatus["axNotificationNoCallbackMeaning"] = "no_callback_is_not_evidence_of_no_change"
@@ -810,6 +860,18 @@ final class InputFailureContextRecorder {
         let app = NSWorkspace.shared.frontmostApplication
         var fields = ["application": app?.bundleIdentifier ?? "unknown", "pid": String(app?.processIdentifier ?? 0),
             "accessibilityGranted": String(AXIsProcessTrusted())]
+        if activeSessionID != nil,
+           app?.bundleIdentifier == "com.openai.codex",
+           app.map({ pid_t($0.processIdentifier) }) == observedAXTargetPID,
+           let inputEnvironment = Self.codexInputEnvironmentFields(
+            bundleIdentifier: app?.bundleIdentifier,
+            processID: app.map { Int32($0.processIdentifier) },
+            capturedTargetPID: observedAXTargetPID,
+            inputSourceIdentifier: inputSourceIdentifierProvider(),
+            secureInputActive: IsSecureEventInputEnabled()
+           ) {
+            fields.merge(inputEnvironment) { _, new in new }
+        }
         if let bundleIdentifier = app?.bundleIdentifier,
            Self.focusProbeApplicationBundleIdentifiers.contains(bundleIdentifier),
            let pid = app?.processIdentifier {

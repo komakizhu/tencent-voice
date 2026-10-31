@@ -119,6 +119,48 @@ final class InputFailureContextTests: XCTestCase {
         XCTAssertFalse(InputFailureContextRecorder.focusProbeApplicationBundleIdentifiers.contains("com.apple.finder"))
     }
 
+    @MainActor
+    func testCollectionStatusNamesUnavailableExternalIMECompositionState() {
+        let recorder = InputFailureContextRecorder()
+        recorder.setEnabled(true)
+        defer { recorder.stop() }
+
+        let status = recorder.snapshot(at: Date()).collectionStatus
+        XCTAssertEqual(status["externalIMECompositionState"], "unknown")
+        XCTAssertEqual(status["externalIMECompositionStateAvailability"], "unavailable_outside_host_process")
+        XCTAssertEqual(status["typedCharactersRecorded"], "false")
+    }
+
+    @MainActor
+    func testCodexInputEnvironmentIsBoundToCapturedTargetAndStatesUnknownComposition() {
+        let fields = InputFailureContextRecorder.codexInputEnvironmentFields(
+            bundleIdentifier: "com.openai.codex",
+            processID: 9001,
+            capturedTargetPID: 9001,
+            inputSourceIdentifier: "com.example.inputmethod",
+            secureInputActive: false
+        )
+        XCTAssertEqual(fields?["inputSourceIdentifier"], "com.example.inputmethod")
+        XCTAssertEqual(fields?["secureInputActive"], "false")
+        XCTAssertEqual(fields?["externalIMECompositionState"], "unknown")
+        XCTAssertEqual(fields?["typedCharactersRecorded"], "false")
+
+        XCTAssertNil(InputFailureContextRecorder.codexInputEnvironmentFields(
+            bundleIdentifier: "com.apple.Safari",
+            processID: 9001,
+            capturedTargetPID: 9001,
+            inputSourceIdentifier: "should-not-be-recorded",
+            secureInputActive: false
+        ))
+        XCTAssertNil(InputFailureContextRecorder.codexInputEnvironmentFields(
+            bundleIdentifier: "com.openai.codex",
+            processID: 9002,
+            capturedTargetPID: 9001,
+            inputSourceIdentifier: "should-not-be-recorded",
+            secureInputActive: false
+        ))
+    }
+
     func testLateReportRetainsFailureMinuteSeparatelyFromClickMinute() {
         let failureAt = Date(timeIntervalSince1970: 100)
         let clickAt = failureAt.addingTimeInterval(62)

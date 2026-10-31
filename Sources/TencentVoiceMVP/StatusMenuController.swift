@@ -7,12 +7,15 @@ final class StatusMenuController: NSObject {
     private var calibrateUsageMenuItem: NSMenuItem?
     private var settingsMenuItem: NSMenuItem?
     private var recordMenuItem: NSMenuItem?
+    private var pendingCompletionMenuItem: NSMenuItem?
+    private var cancelPendingCompletionMenuItem: NSMenuItem?
     private var autoStartMenuItem: NSMenuItem?
     private var rimeThemeMenuItem: NSMenuItem?
     private var rimeDictionaryMenuItem: NSMenuItem?
     private var onSettings: (() -> Void)?
     private var onCalibrateUsage: (() -> Void)?
     private var onToggleRecording: (() -> Void)?
+    private var onCancelPendingCompletion: (() -> Void)?
     private var onToggleAutoStart: (() -> Void)?
     private var onSelectRimeTheme: ((String) -> Void)?
     private var onManageRimeDictionary: (() -> Void)?
@@ -115,6 +118,18 @@ final class StatusMenuController: NSObject {
         autoStart.toolTip = "登录 macOS 账户后自动启动 Rime Voice。"
         menu.addItem(settings)
         menu.addItem(record)
+        let pendingCompletion = NSMenuItem(title: "已停止录音，等待返回补齐", action: nil, keyEquivalent: "")
+        pendingCompletion.isEnabled = false
+        pendingCompletion.isHidden = true
+        menu.addItem(pendingCompletion)
+        let cancelPendingCompletion = NSMenuItem(
+            title: "取消补齐",
+            action: #selector(cancelPendingCompletionPressed),
+            keyEquivalent: ""
+        )
+        cancelPendingCompletion.target = self
+        cancelPendingCompletion.isHidden = true
+        menu.addItem(cancelPendingCompletion)
         menu.addItem(autoStart)
         menu.addItem(.separator())
         let context = NSMenuItem(title: "记录浏览器与 Codex 故障前操作", action: #selector(toggleFailureContextPressed), keyEquivalent: "")
@@ -139,6 +154,8 @@ final class StatusMenuController: NSObject {
         calibrateUsageMenuItem = calibrateUsage
         settingsMenuItem = settings
         recordMenuItem = record
+        pendingCompletionMenuItem = pendingCompletion
+        cancelPendingCompletionMenuItem = cancelPendingCompletion
         autoStartMenuItem = autoStart
         rimeThemeMenuItem = rimeTheme
         rimeDictionaryMenuItem = dictionary
@@ -233,11 +250,13 @@ final class StatusMenuController: NSObject {
         onImportRimeConfiguration: @escaping () -> Void,
         onToggleFailureContext: @escaping () -> Void = {},
         onReportInputFailure: @escaping () -> Void = {},
-        onOpenFailureReports: @escaping () -> Void = {}
+        onOpenFailureReports: @escaping () -> Void = {},
+        onCancelPendingCompletion: @escaping () -> Void = {}
     ) {
         self.onSettings = onSettings
         self.onCalibrateUsage = onCalibrateUsage
         self.onToggleRecording = onToggleRecording
+        self.onCancelPendingCompletion = onCancelPendingCompletion
         self.onToggleAutoStart = onToggleAutoStart
         self.onSelectRimeTheme = onSelectRimeTheme
         self.onManageRimeDictionary = onManageRimeDictionary
@@ -252,6 +271,11 @@ final class StatusMenuController: NSObject {
         failureContextMenuItem?.state = failureContextEnabled ? .on : .off
     }
 
+    func update(pendingCompletion: Bool) {
+        pendingCompletionMenuItem?.isHidden = !pendingCompletion
+        cancelPendingCompletionMenuItem?.isHidden = !pendingCompletion
+    }
+
     func update(failureReportResult: String, path: String? = nil) {
         failureResultMenuItem?.title = failureReportResult
         failureResultMenuItem?.toolTip = path
@@ -260,6 +284,7 @@ final class StatusMenuController: NSObject {
     @objc private func toggleFailureContextPressed() { onToggleFailureContext?() }
     @objc private func reportInputFailurePressed() { onReportInputFailure?() }
     @objc private func openFailureReportsPressed() { onOpenFailureReports?() }
+    @objc private func cancelPendingCompletionPressed() { onCancelPendingCompletion?() }
 
     private func updateRecordMenuItem() {
         let isStopping: Bool
@@ -437,6 +462,7 @@ final class StatusMenuController: NSObject {
         removeStatusItem()
         onSettings = nil
         onToggleRecording = nil
+        onCancelPendingCompletion = nil
         onToggleAutoStart = nil
         onSelectRimeTheme = nil
         onManageRimeDictionary = nil
@@ -445,6 +471,8 @@ final class StatusMenuController: NSObject {
         onToggleFailureContext = nil
         onReportInputFailure = nil
         onOpenFailureReports = nil
+        pendingCompletionMenuItem = nil
+        cancelPendingCompletionMenuItem = nil
     }
 
     private func removeStatusItem() {

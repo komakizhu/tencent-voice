@@ -1,4 +1,5 @@
 import AVFoundation
+import AppKit
 import Foundation
 
 enum SessionState: Equatable, Sendable {
@@ -47,6 +48,16 @@ protocol SessionCoordinating: AnyObject {
 
 @MainActor
 final class SessionCoordinator: SessionCoordinating {
+    private struct PendingKeyboardCompletion {
+        let token: UUID
+        let sessionID: UUID
+        let operationGeneration: UInt64
+        let deadlineNanoseconds: UInt64
+        let finalText: String
+        let injector: TextInjector
+    }
+
+    private static let pendingCompletionWindowNanoseconds: UInt64 = 60_000_000_000
     let asr: RealtimeASRClient
     let audio: AudioCapture
     let textTarget: TextTarget
@@ -55,6 +66,7 @@ final class SessionCoordinator: SessionCoordinating {
     let logger: SessionLogger
     private let onSessionStart: (UUID) -> Void
     private let onStateChange: (SessionState) -> Void
+    private let onPendingCompletionChange: (Bool) -> Void
     private var stateObserver: ((SessionState) -> Void)?
     private(set) var state: SessionState = .idle {
         didSet {
@@ -68,6 +80,10 @@ final class SessionCoordinator: SessionCoordinating {
     private var audioForwarder: AudioChunkForwarder?
     private var eventTask: Task<Void, Never>?
     private var progressTask: Task<Void, Never>?
+    private var pendingCompletionTask: Task<Void, Never>?
+    private var pendingKeyboardCompletion: PendingKeyboardCompletion?
+    private var applicationActivationObserver: NSObjectProtocol?
+    private var operationGeneration: UInt64 = 0
     private var audioProgress: AudioPipelineProgress?
     private var latestProjection: ASRProjection?
     private var asrStreamEnded = false
@@ -78,6 +94,7 @@ final class SessionCoordinator: SessionCoordinating {
     private let finishTimeoutNanoseconds: UInt64
     private let keyboardSmoothing: KeyboardSmoothingConfiguration
     private let pacingClock: KeyboardPacingClock
+    private let monotonicNow: () -> UInt64
     private var discardCount = 0
     private var errorCount = 0
     private var degradationWasLogged = false
@@ -93,7 +110,9 @@ final class SessionCoordinator: SessionCoordinating {
         finishTimeoutNanoseconds: UInt64 = 3_000_000_000,
         keyboardSmoothing: KeyboardSmoothingConfiguration = .live,
         pacingClock: KeyboardPacingClock? = nil,
+        monotonicNow: @escaping () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
         onSessionStart: @escaping (UUID) -> Void = { _ in },
+        onPendingCompletionChange: @escaping (Bool) -> Void = { _ in },
         onStateChange: @escaping (SessionState) -> Void
     ) {
         self.asr = asr
@@ -105,12 +124,16 @@ final class SessionCoordinator: SessionCoordinating {
         self.finishTimeoutNanoseconds = finishTimeoutNanoseconds
         self.keyboardSmoothing = keyboardSmoothing
         self.pacingClock = pacingClock ?? ContinuousKeyboardPacingClock()
+        self.monotonicNow = monotonicNow
         self.onSessionStart = onSessionStart
+        self.onPendingCompletionChange = onPendingCompletionChange
         self.onStateChange = onStateChange
     }
 
     func begin() async throws {
         guard state == .idle else { throw SessionError.busy }
+        cancelPendingCompletion(reason: "new_recording_started")
+        operationGeneration &+= 1
         let id = UUID()
         sessionID = id
         onSessionStart(id)
@@ -279,6 +302,7 @@ final class SessionCoordinator: SessionCoordinating {
             cancel()
             return
         }
+        let stopRequestedAtNanoseconds = monotonicNow()
         setState(.stopping)
         asrFinalizationPhase = .finalizing
         log(event: "stop_requested")
@@ -322,13 +346,24 @@ final class SessionCoordinator: SessionCoordinating {
 
         guard sessionID == endingSessionID, state == .stopping else { return }
 
+        let finalCompletionText = latestProjection?.text ?? ""
+        var injectorAwaitingTargetReturn: TextInjector?
         if let injector {
             do {
-                try await injector.finish(finalText: latestProjection?.text ?? "")
+                try await injector.finish(finalText: finalCompletionText)
                 asrFinalizationPhase = .finalized
                 logDegradationIfNeeded(projection: latestProjection)
                 log(event: streamCompleted ? "finished" : "finished_timeout", projection: latestProjection)
-                injector.cancel()
+                if injector.isAwaitingTargetReturn {
+                    injectorAwaitingTargetReturn = injector
+                    logger.recordDiagnosticAction(
+                        "input_waiting_for_target_return",
+                        sessionID: endingSessionID,
+                        fields: ["deadlineMilliseconds": "60000", "operationGeneration": String(operationGeneration)]
+                    )
+                } else {
+                    injector.cancel()
+                }
             } catch {
                 logDegradationIfNeeded(projection: latestProjection)
                 log(event: "finish_error", error: error)
@@ -345,9 +380,24 @@ final class SessionCoordinator: SessionCoordinating {
         eventTask?.cancel()
         resetSession()
         setState(.idle)
+        if let injectorAwaitingTargetReturn {
+            let pending = PendingKeyboardCompletion(
+                token: UUID(),
+                sessionID: endingSessionID,
+                operationGeneration: operationGeneration,
+                deadlineNanoseconds: stopRequestedAtNanoseconds &+ Self.pendingCompletionWindowNanoseconds,
+                finalText: finalCompletionText,
+                injector: injectorAwaitingTargetReturn
+            )
+            pendingKeyboardCompletion = pending
+            onPendingCompletionChange(true)
+            installApplicationActivationObserverIfNeeded()
+            startPendingCompletionObservation(token: pending.token)
+        }
     }
 
     func cancel() {
+        cancelPendingCompletion(reason: "session_cancelled")
         asrFinalizationPhase = .hardStopped
         log(event: "cancel_requested")
         logAudioProgress()
@@ -543,19 +593,136 @@ final class SessionCoordinator: SessionCoordinating {
         degradationWasLogged = false
         asrFinalizationPhase = .listening
         projectionAccumulator = ASRProjectionAccumulator()
+        if pendingKeyboardCompletion == nil {
+            removeApplicationActivationObserver()
+        }
     }
 
     private func startProgressObservation(sessionID id: UUID) {
         progressTask?.cancel()
+        installApplicationActivationObserverIfNeeded()
         progressTask = Task { [weak self] in
+            var progressTicks = 0
             while !Task.isCancelled {
                 do {
-                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                    try await Task.sleep(nanoseconds: 500_000_000)
                 } catch { return }
                 guard let self, self.sessionID == id else { return }
-                self.logAudioProgress()
+                self.pollActiveTargetReturn()
+                progressTicks += 1
+                if progressTicks >= 10 {
+                    progressTicks = 0
+                    self.logAudioProgress()
+                }
             }
         }
+    }
+
+    private func pollActiveTargetReturn() {
+        guard let injector, injector.isAwaitingTargetReturn else { return }
+        if injector.resumeTargetIfAvailable() {
+            logger.recordDiagnosticAction("input_target_resumed", sessionID: sessionID, fields: [
+                "operationGeneration": String(operationGeneration),
+                "resumeSource": "periodic_target_check"
+            ])
+        }
+    }
+
+    func pollTargetAvailabilityForTesting() async {
+        pollActiveTargetReturn()
+        guard let pending = pendingKeyboardCompletion else { return }
+        guard pending.operationGeneration == operationGeneration,
+              pending.token == pendingKeyboardCompletion?.token else {
+            cancelPendingCompletion(reason: "stale_operation_generation")
+            return
+        }
+        guard monotonicNow() < pending.deadlineNanoseconds else {
+            pending.injector.expirePendingCompletion()
+            logger.recordDiagnosticAction("input_pending_completion_expired", sessionID: pending.sessionID, fields: [
+                "operationGeneration": String(pending.operationGeneration)
+            ])
+            finishPendingCompletion(pending)
+            return
+        }
+        do {
+            let completed = try await pending.injector.finishPendingAfterTargetReturn(finalText: pending.finalText)
+            guard pending.token == pendingKeyboardCompletion?.token else { return }
+            if completed {
+                logger.recordDiagnosticAction("input_target_resumed_after_stop", sessionID: pending.sessionID, fields: [
+                    "operationGeneration": String(pending.operationGeneration),
+                    "result": "completed_or_safely_stopped"
+                ])
+                finishPendingCompletion(pending)
+            }
+        } catch {
+            logger.recordDiagnosticAction("input_target_resume_failed", sessionID: pending.sessionID, fields: [
+                "operationGeneration": String(pending.operationGeneration),
+                "failureCode": DiagnosticErrorFormatter.code(for: error)
+            ])
+            pending.injector.expirePendingCompletion()
+            finishPendingCompletion(pending)
+        }
+    }
+
+    func cancelPendingCompletion() {
+        cancelPendingCompletion(reason: "user_cancelled")
+    }
+
+    private func startPendingCompletionObservation(token: UUID) {
+        pendingCompletionTask?.cancel()
+        pendingCompletionTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: 500_000_000)
+                } catch { return }
+                guard let self, self.pendingKeyboardCompletion?.token == token else { return }
+                await self.pollTargetAvailabilityForTesting()
+            }
+        }
+    }
+
+    private func finishPendingCompletion(_ pending: PendingKeyboardCompletion) {
+        guard pendingKeyboardCompletion?.token == pending.token else { return }
+        pendingCompletionTask?.cancel()
+        pendingCompletionTask = nil
+        pendingKeyboardCompletion = nil
+        pending.injector.cancel()
+        onPendingCompletionChange(false)
+        if sessionID == nil { removeApplicationActivationObserver() }
+    }
+
+    private func cancelPendingCompletion(reason: String) {
+        guard let pending = pendingKeyboardCompletion else { return }
+        pendingCompletionTask?.cancel()
+        pendingCompletionTask = nil
+        pendingKeyboardCompletion = nil
+        logger.recordDiagnosticAction("input_pending_completion_cancelled", sessionID: pending.sessionID, fields: [
+            "reason": reason,
+            "operationGeneration": String(pending.operationGeneration)
+        ])
+        pending.injector.cancelPendingCompletion()
+        pending.injector.cancel()
+        onPendingCompletionChange(false)
+        if sessionID == nil { removeApplicationActivationObserver() }
+    }
+
+    private func installApplicationActivationObserverIfNeeded() {
+        guard applicationActivationObserver == nil else { return }
+        applicationActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.pollTargetAvailabilityForTesting()
+            }
+        }
+    }
+
+    private func removeApplicationActivationObserver() {
+        guard let applicationActivationObserver else { return }
+        NSWorkspace.shared.notificationCenter.removeObserver(applicationActivationObserver)
+        self.applicationActivationObserver = nil
     }
 
     private func logAudioProgress() {
