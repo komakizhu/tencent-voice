@@ -103,12 +103,12 @@ final class AppSmokeTests: XCTestCase {
 
         controller.update(menuBarDisplayMode: .timer)
         controller.update(recordingState: .listening)
-        XCTAssertEqual(controller.statusButtonTitle, "01:01")
-        XCTAssertTrue(controller.statusButtonAccessibilityLabel.contains("已录 01:01"))
+        XCTAssertEqual(controller.statusButtonTitle, "61s")
+        XCTAssertTrue(controller.statusButtonAccessibilityLabel.contains("已录 61 秒"))
         XCTAssertEqual(menu.items.first { $0.title == "停止录音" }?.title, "停止录音")
 
         controller.update(menuBarDisplayMode: .waveform)
-        XCTAssertEqual(controller.statusButtonWaveformLevels, Array(repeating: 0, count: 5))
+        XCTAssertGreaterThan(controller.statusButtonWaveformLevels[2], 0)
         XCTAssertEqual(controller.statusButtonAccessibilityLabel, "正在录音，显示麦克风输入音量")
 
         snapshot = RecordingDisplaySnapshot(
@@ -121,11 +121,11 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertEqual(menu.items.first { $0.title == "收尾中…" }?.title, "收尾中…")
         XCTAssertFalse(menu.items.first { $0.title == "收尾中…" }?.isEnabled ?? true)
         controller.update(menuBarDisplayMode: .timer)
-        XCTAssertEqual(controller.statusButtonImageStyle, .none)
-        XCTAssertEqual(controller.statusButtonTitle, "01:01")
+        XCTAssertEqual(controller.statusButtonImageStyle, .application)
+        XCTAssertEqual(controller.statusButtonTitle, "")
 
-        XCTAssertEqual(StatusMenuController.formattedDuration(3_599.99), "59:59")
-        XCTAssertEqual(StatusMenuController.formattedDuration(3_600), "1:00:00")
+        XCTAssertEqual(StatusMenuController.formattedDuration(3_599.99), "3599s")
+        XCTAssertEqual(StatusMenuController.formattedDuration(3_600), "3600s")
         snapshot = RecordingDisplaySnapshot(sessionID: nil, state: .idle, audio: .empty)
         controller.update(recordingState: .idle)
         XCTAssertEqual(controller.statusButtonTitle, "")
@@ -137,8 +137,8 @@ final class AppSmokeTests: XCTestCase {
         let timer = StatusButtonPresentation.make(
             mode: .timer, state: .listening, isCapturing: true, duration: 61.9
         )
-        XCTAssertEqual(timer.title, "01:01")
-        XCTAssertEqual(timer.imageStyle, .none)
+        XCTAssertEqual(timer.title, "61s")
+        XCTAssertEqual(timer.imageStyle, .timer)
 
         let connectingBeforeCapture = StatusButtonPresentation.make(
             mode: .timer, state: .connecting, isCapturing: false, duration: 0
@@ -149,8 +149,8 @@ final class AppSmokeTests: XCTestCase {
         let connectingWhileCapturing = StatusButtonPresentation.make(
             mode: .timer, state: .connecting, isCapturing: true, duration: 0
         )
-        XCTAssertEqual(connectingWhileCapturing.title, "00:00")
-        XCTAssertEqual(connectingWhileCapturing.imageStyle, .none)
+        XCTAssertEqual(connectingWhileCapturing.title, "0s")
+        XCTAssertEqual(connectingWhileCapturing.imageStyle, .timer)
 
         let circleIdle = StatusButtonPresentation.make(
             mode: .icon, state: .connecting, isCapturing: false, duration: 0
@@ -168,10 +168,10 @@ final class AppSmokeTests: XCTestCase {
             mode: .icon, state: .stopping, isCapturing: true, duration: 1
         )
         XCTAssertEqual(circleIdle.imageStyle, .application)
-        XCTAssertEqual(circleRecording.imageStyle, .symbol("record.circle.fill"))
+        XCTAssertEqual(circleRecording.imageStyle, .recording)
         XCTAssertEqual(circleRecovering.imageStyle, .application)
         XCTAssertEqual(circleStopping.imageStyle, .application)
-        XCTAssertEqual(circleStoppingCaptureActive.imageStyle, .symbol("record.circle.fill"))
+        XCTAssertEqual(circleStoppingCaptureActive.imageStyle, .recording)
 
         XCTAssertEqual(StatusButtonPresentation.make(
             mode: .waveform, state: .listening, isCapturing: true, duration: 1
@@ -181,21 +181,21 @@ final class AppSmokeTests: XCTestCase {
         ).imageStyle, .application)
         XCTAssertEqual(StatusButtonPresentation.make(
             mode: .waveform, state: .connecting, isCapturing: true, duration: 0
-        ).imageStyle, .symbol("mic.waiting"))
+        ).imageStyle, .waveform)
         XCTAssertEqual(StatusButtonPresentation.make(
             mode: .waveform, state: .recovering, isCapturing: false, duration: 1
-        ).imageStyle, .symbol("mic.slash.fill"))
+        ).imageStyle, .application)
         XCTAssertEqual(StatusButtonPresentation.make(
             mode: .waveform, state: .stopping, isCapturing: false, duration: 1
-        ).imageStyle, .symbol("hourglass"))
+        ).imageStyle, .application)
         XCTAssertEqual(StatusButtonPresentation.make(
             mode: .waveform, state: .error("failure"), isCapturing: false, duration: 0
-        ).imageStyle, .symbol("exclamationmark.triangle.fill"))
+        ).imageStyle, .application)
     }
 
     func testWaveformGateGainAttackReleaseAndStaleResetAreDeterministic() {
-        XCTAssertEqual(WaveformDisplayModel.amplitude(forRMS: 0.005), 0)
-        XCTAssertEqual(WaveformDisplayModel.amplitude(forRMS: 0.008), 0.291, accuracy: 0.015)
+        XCTAssertEqual(WaveformDisplayModel.amplitude(forRMS: 0.002), 0)
+        XCTAssertGreaterThan(WaveformDisplayModel.amplitude(forRMS: 0.004), 0)
         XCTAssertLessThan(
             WaveformDisplayModel.amplitude(forRMS: 0.02),
             WaveformDisplayModel.amplitude(forRMS: 0.05)
@@ -208,18 +208,16 @@ final class AppSmokeTests: XCTestCase {
             sessionID: sessionID, rms: 0.05, sequence: 1, timestamp: 0, duration: 0.1
         )
         let initial = model.update(snapshot: loud, now: 0)
-        XCTAssertEqual(initial, Array(repeating: 0, count: 5))
+        XCTAssertGreaterThan(initial[2], 0, "第一帧应立即显示已测得的声音")
         let afterAttack = model.update(snapshot: loud, now: 100_000_000)
         XCTAssertGreaterThanOrEqual(afterAttack[2], WaveformDisplayModel.amplitude(forRMS: 0.05) * 0.99)
-        XCTAssertGreaterThan(afterAttack[0] / afterAttack[2], 0.36)
-        XCTAssertLessThan(afterAttack[0] / afterAttack[2], 0.38)
-        XCTAssertGreaterThan(afterAttack[1] / afterAttack[2], 0.73)
-        XCTAssertLessThan(afterAttack[1] / afterAttack[2], 0.74)
+        XCTAssertEqual(afterAttack[0] / afterAttack[2], 0.38, accuracy: 0.001)
+        XCTAssertEqual(afterAttack[1] / afterAttack[2], 0.74, accuracy: 0.001)
         XCTAssertEqual(afterAttack[0], afterAttack[4])
         XCTAssertEqual(afterAttack[1], afterAttack[3])
 
         let quiet = makeDisplaySnapshot(
-            sessionID: sessionID, rms: 0.005, sequence: 2, timestamp: 100_000_000, duration: 0.1
+            sessionID: sessionID, rms: 0.002, sequence: 2, timestamp: 100_000_000, duration: 0.1
         )
         _ = model.update(snapshot: quiet, now: 100_000_000)
         let afterSilence = model.update(snapshot: quiet, now: 250_000_000)
@@ -263,7 +261,7 @@ final class AppSmokeTests: XCTestCase {
         for step in 0...3 {
             let time = UInt64(250_000_000 + step * 50_000_000)
             let quiet = makeDisplaySnapshot(
-                sessionID: sessionID, rms: 0.005, sequence: UInt64(3 + step), timestamp: time, duration: 0.05
+                sessionID: sessionID, rms: 0.002, sequence: UInt64(3 + step), timestamp: time, duration: 0.05
             )
             quietLevels = model.update(snapshot: quiet, now: time)
         }
@@ -272,13 +270,16 @@ final class AppSmokeTests: XCTestCase {
         let nextSession = makeDisplaySnapshot(
             sessionID: UUID(), rms: 0.1, sequence: 1, timestamp: 450_000_000, duration: 0.1
         )
-        XCTAssertEqual(model.update(snapshot: nextSession, now: 450_000_000), Array(repeating: 0, count: 5))
+        XCTAssertEqual(
+            model.update(snapshot: nextSession, now: 450_000_000)[2],
+            WaveformDisplayModel.amplitude(forRMS: 0.1), accuracy: 0.001
+        )
     }
 
     func testPCMMeasurementDistinguishesSilenceNoiseWeakAndStrongSignals() {
         let cases: [(Int16, Double)] = [
             (0, 0),
-            (164, 164.0 / 32_768),
+            (65, 65.0 / 32_768),
             (655, 655.0 / 32_768),
             (1_638, 1_638.0 / 32_768),
             (Int16.max, Double(Int16.max) / 32_768)
@@ -296,7 +297,7 @@ final class AppSmokeTests: XCTestCase {
             displayedLevels.append(WaveformDisplayModel.amplitude(forRMS: measuredRMS))
         }
         XCTAssertEqual(displayedLevels[0], 0)
-        XCTAssertEqual(displayedLevels[1], 0, "RMS 0.005 底噪必须回平")
+        XCTAssertEqual(displayedLevels[1], 0, "低于门限的底噪必须回平")
         XCTAssertLessThan(displayedLevels[2], displayedLevels[3])
         XCTAssertEqual(displayedLevels[4], 1)
     }

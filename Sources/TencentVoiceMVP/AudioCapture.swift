@@ -372,7 +372,7 @@ final class SystemAudioCapture: AudioCapture, @unchecked Sendable {
                 self.handleConfigurationChange()
             }
         }
-        try newEngine.installTap(format: nil, bufferSize: 4096) { [weak self] buffer in
+        try newEngine.installTap(format: nil, bufferSize: 1_024) { [weak self] buffer in
             guard let self else { return }
             guard let copiedBuffer = Self.copyBuffer(buffer) else { return }
             self.queue.async {

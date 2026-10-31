@@ -3,21 +3,15 @@ import Foundation
 enum RecordingDurationFormatter {
     static func string(from duration: Double) -> String {
         let seconds = max(0, Int(duration))
-        let hours = seconds / 3_600
-        let minutes = (seconds % 3_600) / 60
-        let remainder = seconds % 60
-        if hours > 0 {
-            return String(format: "%d:%02d:%02d", hours, minutes, remainder)
-        }
-        return String(format: "%02d:%02d", minutes, remainder)
+        return "\(seconds)s"
     }
 }
 
 enum StatusButtonImageStyle: Equatable {
     case application
-    case symbol(String)
+    case recording
+    case timer
     case waveform
-    case none
 }
 
 struct StatusButtonPresentation: Equatable {
@@ -34,6 +28,13 @@ struct StatusButtonPresentation: Equatable {
         statusFeedback: String? = nil
     ) -> Self {
         let time = RecordingDurationFormatter.string(from: duration)
+        let spokenTime = "\(max(0, Int(duration))) 秒"
+        let activelyCapturing = isCapturing && {
+            switch state {
+            case .connecting, .listening, .recovering, .stopping: return true
+            case .idle, .error: return false
+            }
+        }()
         let detail: String
         switch state {
         case .idle: detail = "已就绪"
@@ -51,73 +52,35 @@ struct StatusButtonPresentation: Equatable {
             failureText = statusFeedback
         }
 
+        // The menu bar has exactly two visual states. Finalization, recovery
+        // and failures remain available in the tooltip without another icon.
+        guard activelyCapturing else {
+            return Self(
+                title: "", imageStyle: .application,
+                toolTip: "Rime Voice · \(failureText ?? detail)",
+                accessibilityLabel: "Rime Voice，\(failureText ?? detail)"
+            )
+        }
         switch mode {
         case .timer:
-            switch state {
-            case .idle, .error:
-                return Self(
-                    title: "",
-                    imageStyle: .application,
-                    toolTip: failureText.map { "Rime Voice · \($0)" } ?? "Rime Voice · \(detail)",
-                    accessibilityLabel: failureText.map { "Rime Voice，\($0)" } ?? "Rime Voice，\(detail)"
-                )
-            case .connecting where !isCapturing:
-                return Self(
-                    title: "",
-                    imageStyle: .application,
-                    toolTip: "Rime Voice · \(detail)",
-                    accessibilityLabel: "Rime Voice，\(detail)"
-                )
-            case .connecting, .listening, .recovering, .stopping:
-                return Self(
-                    title: time,
-                    imageStyle: .none,
-                    toolTip: "\(detail) · 已录 \(time)",
-                    accessibilityLabel: "\(detail)，已录 \(time)"
-                )
-            }
+            return Self(
+                title: time, imageStyle: .timer,
+                toolTip: "\(detail) · 已录 \(spokenTime)",
+                accessibilityLabel: "\(detail)，已录 \(spokenTime)"
+            )
         case .icon:
-            let activelyCapturing = isCapturing && {
-                switch state {
-                case .connecting, .listening, .recovering, .stopping: return true
-                case .idle, .error: return false
-                }
-            }()
             return Self(
                 title: "",
-                imageStyle: activelyCapturing ? .symbol("record.circle.fill") : .application,
+                imageStyle: .recording,
                 toolTip: failureText.map { "Rime Voice · \($0)" } ?? "Rime Voice · \(detail)",
                 accessibilityLabel: "Rime Voice，\(failureText ?? detail)"
             )
         case .waveform:
-            let style: StatusButtonImageStyle
-            switch state {
-            case .idle:
-                style = statusFeedback == nil ? .application : .symbol("exclamationmark.triangle.fill")
-            case .connecting:
-                style = isCapturing ? .symbol("mic.waiting") : .application
-            case .listening:
-                style = isCapturing ? .waveform : .application
-            case .recovering:
-                style = .symbol("mic.slash.fill")
-            case .stopping:
-                style = .symbol("hourglass")
-            case .error:
-                style = .symbol("exclamationmark.triangle.fill")
-            }
-            let tooltip: String
-            let label: String
-            if case .listening = state, isCapturing {
-                tooltip = "正在录音，波形显示麦克风输入音量"
-                label = "正在录音，显示麦克风输入音量"
-            } else if let failureText {
-                tooltip = "Rime Voice · \(failureText)"
-                label = "Rime Voice，\(failureText)"
-            } else {
-                tooltip = "Rime Voice · \(detail)"
-                label = "Rime Voice，\(detail)"
-            }
-            return Self(title: "", imageStyle: style, toolTip: tooltip, accessibilityLabel: label)
+            return Self(
+                title: "", imageStyle: .waveform,
+                toolTip: "\(detail)，波形显示麦克风输入音量；静音时保留基线",
+                accessibilityLabel: "\(detail)，显示麦克风输入音量"
+            )
         }
     }
 }
@@ -125,8 +88,8 @@ struct StatusButtonPresentation: Equatable {
 /// Converts numeric microphone levels into five fixed-position display envelopes.
 /// It never retains audio or a rolling history of past sound.
 struct WaveformDisplayModel {
-    static let openThreshold = 0.008
-    static let closeThreshold = 0.006
+    static let openThreshold = 0.004
+    static let closeThreshold = 0.0025
     static let attackTimeConstant: TimeInterval = 0.018
     static let releaseTimeConstant: TimeInterval = 0.045
     static let silenceResetNanoseconds: UInt64 = 120_000_000
@@ -152,9 +115,16 @@ struct WaveformDisplayModel {
         snapshot: RecordingDisplaySnapshot,
         now: UInt64
     ) -> [Double] {
-        guard snapshot.state == .listening, snapshot.isCapturing else {
+        guard snapshot.isCapturing else {
             reset()
             return barLevels
+        }
+        switch snapshot.state {
+        case .idle, .error:
+            reset()
+            return barLevels
+        case .connecting, .listening, .recovering, .stopping:
+            break
         }
         if lastSessionID != snapshot.sessionID {
             reset()
@@ -201,6 +171,10 @@ struct WaveformDisplayModel {
                     responseScale: 1 + Double(abs(index - 2)) * 0.22
                 )
             }
+        } else {
+            // The first microphone sample is already measured. Show it on this
+            // frame instead of waiting for another display refresh to attack.
+            envelopes = Array(repeating: targetAmplitude, count: 5)
         }
         lastTickAt = now
         return barLevels
