@@ -418,6 +418,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     throw error
                 }
                 settingsStore.save(newSettings)
+                failureContext.configureDiagnosticCollection(
+                    failureContextEnabled: failureContext.isEnabled,
+                    persistentLoggingEnabled: newSettings.saveTextLogs
+                )
                 coordinator.refreshDiagnosticCollectionSettings()
                 diagnosticWindowFrameRecorder.setCaptureEnabled(newSettings.captureDiagnosticWindowFrames)
                 menu.update(menuBarDisplayMode: newSettings.menuBarDisplayMode)
@@ -609,6 +613,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let enabled = failureContextDefaults.bool(forKey: "inputFailureContextEnabled")
         failureContext.setEnabled(enabled)
         sessionLogger.setFailureContextEnabled(enabled)
+        failureContext.configureDiagnosticCollection(
+            failureContextEnabled: enabled,
+            persistentLoggingEnabled: settingsStore.load().saveTextLogs
+        )
         coordinator.refreshDiagnosticCollectionSettings()
         menu.update(failureContextEnabled: enabled)
         failureContextMainMenuItem?.state = enabled ? .on : .off
@@ -635,6 +643,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let frameSnapshot = diagnosticWindowFrameRecorder.snapshot(at: now)
         let captureStartedAt = sessionLogger.reportCaptureStartedAt
         let eventSnapshot = sessionLogger.reportEventSnapshot(at: now, captureStartedAt: captureStartedAt)
+        let axReadEvidence = failureContext.axReadEvidence(at: now)
         let reportSettings = settingsStore.load()
         let diagnosticCaptureEnabledAtRequest = context.enabled || reportSettings.saveTextLogs
         let captureEnabledAtRequest = diagnosticCaptureEnabledAtRequest
@@ -731,7 +740,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     )
                 }.value
                 let preliminaryReport = InputFailureReport(
-                    schemaVersion: 6,
+                    schemaVersion: 7,
                     id: reportID,
                     generatedAt: now,
                     desktopContext: context,
@@ -747,7 +756,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     latestFailure: scopedFailureEvidence.0,
                     sessionEvidenceSummaries: scopedFailureEvidence.2,
                     firstFailure: scopedFailureEvidence.1,
-                    evidenceScopeNote: "主时间线严格限定为点击前60秒；另附最近故障点之前60秒的关联快照（若早于主窗口则会标注原始时间）。采集未开启、截断、权限不足、节流或读取失败时，报告会标明缺口。键盘事件提交、AX调用返回和AX通知都不证明编辑器已实际执行；AX证据不代表页面DOM或屏幕状态。Safari与Codex编辑器重建诊断记录首次身份依据是否保存、恢复比较的失败条件、扫描路径、属性错误码、候选数、操作状态和事件原始时间；AX标识符只记录是否存在及比较结果，对象代次和扫描编号只用于本次会话内关联，不保存原始AX标识、网页文字、音频、标题或地址。诊断沿用“输入失败上下文”和“自动保存诊断日志”两个现有开关；任一开启时记录本项诊断，全部关闭后清空未导出的临时身份摘要。只使用现有辅助功能权限，不请求新权限。每次扫描最多250毫秒、单次AX调用超时30毫秒、祖先最多64层、子树最多160个对象。底层诊断队列最多16条；首次捕获和首次拒绝摘要各一份、每份最多8 KiB；上层目标事件最多4096条或16 MiB，操作背景最多2000条，达到上限时会报告丢失数量。诊断随现有60秒故障窗口保留；已导出的报告保留至用户手动删除。窗口画面采集默认关闭，仅在设置中主动开启后对已确认的前台目标窗口进行短时采集，不包含音频或上传；停止原因会区分窗口数量、窗口编号、焦点读取和窗口信息核对失败。",
+                    axReadEvidence: axReadEvidence,
+                    evidenceScopeNote: "主时间线严格限定为点击前60秒；另附最近故障点之前60秒的关联快照（若早于主窗口则会标注原始时间）。采集未开启、截断、权限不足、节流或读取失败时，报告会标明缺口。键盘事件提交、AX调用返回和AX通知都不证明编辑器已实际执行；AX证据不代表页面DOM或屏幕状态。新增AX调用证据只记录输入、周期、操作和窗口监测来源、属性名、单调时钟、返回码、目标进程绑定、会话/操作代次和调用耗时，不保存属性值、原始AX标识、网页文字、音频、标题或地址。Safari与Codex编辑器重建诊断记录首次身份依据是否保存、恢复比较的失败条件、扫描路径、属性错误码、候选数、操作状态和事件原始时间；对象代次和扫描编号只用于本次会话内关联。诊断沿用“输入失败上下文”和“自动保存诊断日志”两个现有开关；任一开启时记录本项诊断，全部关闭后清空未导出的临时身份摘要。只使用现有辅助功能权限，不请求新权限。每次扫描最多250毫秒、单次AX调用超时30毫秒、祖先最多64层、子树最多160个对象。AX调用证据只在内存保留60秒，最多16384条；切换目标进程或会话时清空旧代次，迟到结果丢弃；底层诊断队列最多16条；首次捕获和首次拒绝摘要各一份、每份最多8 KiB；上层目标事件最多4096条或16 MiB，操作背景最多2000条，达到上限时会报告丢失数量。诊断随现有60秒故障窗口保留；已导出的报告保留至用户手动删除。窗口画面采集默认关闭，仅在设置中主动开启后对已确认的前台目标窗口进行短时采集，不包含音频或上传；停止原因会区分窗口数量、窗口编号、焦点读取和窗口信息核对失败。",
                     windowFrameCapture: frameSnapshot.evidence
                 )
                 menu.update(failureReportResult: "正在编码并保存报告…")

@@ -690,27 +690,47 @@ final class DiagnosticWindowFrameRecorder {
         targetElement: AXUIElement? = nil
     ) -> FocusedWindowFingerprintRead {
         let application = AXUIElementCreateApplication(pid)
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(application, kAXFocusedWindowAttribute as CFString, &value) == .success,
-              let value,
+        let focusedWindowRead = copyAXAttribute(
+            kAXFocusedWindowAttribute as String, from: application, targetBound: targetElement != nil
+        )
+        guard focusedWindowRead.0 == .success,
+              let value = focusedWindowRead.1,
               CFGetTypeID(value) == AXUIElementGetTypeID() else { return .unavailable }
         let window = value as! AXUIElement
         if let targetElement {
-            var targetWindowValue: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(
-                targetElement,
-                kAXWindowAttribute as CFString,
-                &targetWindowValue
-            ) == .success,
-                  let targetWindowValue,
+            let targetWindowRead = copyAXAttribute(
+                kAXWindowAttribute as String, from: targetElement, targetBound: true
+            )
+            guard targetWindowRead.0 == .success,
+                  let targetWindowValue = targetWindowRead.1,
                   CFGetTypeID(targetWindowValue) == AXUIElementGetTypeID() else { return .unavailable }
             if !CFEqual(window, targetWindowValue) { return .windowMismatch }
         }
-        var titleValue: CFTypeRef?
-        let title: String? = AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleValue) == .success
-            ? titleValue as? String : nil
+        let titleRead = copyAXAttribute(kAXTitleAttribute as String, from: window, targetBound: true)
+        let title: String? = titleRead.0 == .success ? titleRead.1 as? String : nil
         guard let size = Self.sizeAttribute(kAXSizeAttribute, from: window) else { return .unavailable }
         return .available(FocusedWindowFingerprint(title: title, size: size))
+    }
+
+    private static func copyAXAttribute(
+        _ attribute: String,
+        from element: AXUIElement,
+        targetBound: Bool
+    ) -> (AXError, CFTypeRef?) {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        var value: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+        AXReadEvidenceRuntime.shared.record(
+            AXReadEvidenceRuntime.sample(
+                source: "window_monitor",
+                attribute: attribute,
+                element: element,
+                startedAt: startedAt,
+                status: status,
+                targetBound: targetBound
+            )
+        )
+        return (status, value)
     }
 
     private static func matches(_ fingerprint: FocusedWindowFingerprint, window: SCWindow) -> Bool {
@@ -724,9 +744,9 @@ final class DiagnosticWindowFrameRecorder {
     }
 
     private static func sizeAttribute(_ attribute: String, from element: AXUIElement) -> CGSize? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
-              let value,
+        let read = copyAXAttribute(attribute, from: element, targetBound: true)
+        guard read.0 == .success,
+              let value = read.1,
               CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
         let axValue = value as! AXValue
         var size = CGSize.zero

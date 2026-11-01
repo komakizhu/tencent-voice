@@ -359,6 +359,7 @@ final class InputFailureContextRecorder {
     private var applicationObserver: NSObjectProtocol?
     private let probeQueue = DispatchQueue(label: "local.tencent.voice.mvp.failure-context", qos: .utility)
     private let probe: any InputContextSampling
+    private let axReadEvidenceCollector: AXReadEvidenceCollector
     private let inputSourceIdentifierProvider: () -> String?
     private var previousSample: [String: String]?
     private var lastActivity: Date = .distantPast
@@ -443,9 +444,14 @@ final class InputFailureContextRecorder {
             InputFailureContextRecorder.currentInputSourceIdentifier()
         }
     ) {
+        let collector = AXReadEvidenceCollector()
+        self.axReadEvidenceCollector = collector
         self.axNotificationObserver = axNotificationObserver ?? SystemInputFailureAXNotificationObserver()
         self.probe = probe
         self.inputSourceIdentifierProvider = inputSourceIdentifierProvider
+        if let probe = probe as? InputContextAXProbe {
+            probe.readObserver = { sample in collector.record(sample) }
+        }
     }
 
     var latestFailure: InputFailureEvidence? {
@@ -469,11 +475,33 @@ final class InputFailureContextRecorder {
 
     func sessionBegan(_ sessionID: UUID) {
         activeSessionID = sessionID
+        axReadEvidenceCollector.endTarget()
     }
 
     func sessionEnded() {
         activeSessionID = nil
+        axReadEvidenceCollector.endTarget()
         stopAXNotificationObserver(status: "session_ended")
+    }
+
+    func configureDiagnosticCollection(failureContextEnabled: Bool, persistentLoggingEnabled: Bool) {
+        let enabled = failureContextEnabled || persistentLoggingEnabled
+        axReadEvidenceCollector.setEnabled(enabled)
+        var observer: (@Sendable (AXReadEvidenceSample) -> Void)?
+        if enabled {
+            let collector = axReadEvidenceCollector
+            observer = { sample in collector.record(sample) }
+        } else {
+            observer = nil
+        }
+        AXReadEvidenceRuntime.shared.setObserver(observer)
+    }
+
+    func axReadEvidence(at date: Date) -> AXReadEvidenceReport {
+        axReadEvidenceCollector.snapshot(
+            at: date,
+            permission: AXIsProcessTrusted() ? "granted" : "denied"
+        )
     }
 
     func observeSessionEntry(_ entry: SessionLogEntry, logger: SessionLogger) {
@@ -572,9 +600,15 @@ final class InputFailureContextRecorder {
         let token = generation
         let probe = self.probe
         let queue = probeQueue
+        let targetGeneration = axReadEvidenceCollector.currentTargetGeneration
         Task { @MainActor [weak self] in
             let details = await withCheckedContinuation { continuation in
                     queue.async {
+                        if let probe = probe as? InputContextAXProbe {
+                            probe.sampleSource = "operation"
+                            probe.sampleOperationID = Int(diagnostic.fields["operationID"] ?? "")
+                            probe.sampleTargetGeneration = targetGeneration
+                        }
                         continuation.resume(returning: probe.sample(
                             pid: pid,
                             target: reference.element,
@@ -621,6 +655,13 @@ final class InputFailureContextRecorder {
         observedAXTargetPID = processID
         observedAXTargetID = targetObservationID
         observedAXTargetElement = target
+        let targetGeneration = axReadEvidenceCollector.beginTarget(
+            sessionID: activeSessionID,
+            processID: Int32(processID)
+        )
+        if let probe = probe as? InputContextAXProbe {
+            probe.sampleTargetGeneration = targetGeneration
+        }
         axNotificationGeneration += 1
         let token = axNotificationGeneration
         axNotificationStatus = axNotificationObserver.start(
@@ -748,6 +789,9 @@ final class InputFailureContextRecorder {
             "sessionOperationAndTargetIDsIncludedWhenAvailable": "true",
             "editorProbeNodeLimit": "160", "editorProbeDepthLimit": "64",
             "editorProbeTraversal": "reverse_depth_first", "editorProbeBudgetMilliseconds": "250"]
+        window.collectionStatus["axReadEvidenceScope"] = "source_attribute_timing_return_code_session_operation_target_process_generation_only"
+        window.collectionStatus["axReadEvidenceRetention"] = "memory_only_60_seconds_max_16384_samples"
+        window.collectionStatus["axReadEvidenceSensitiveValues"] = "not_recorded"
         window.collectionStatus["safariContinuityDiagnosticScope"] = "AX_editor_rebuild_scan_and_previous_handle_role_read_only"
         window.collectionStatus["safariContinuityDiagnosticTextCaptured"] = "false"
         window.collectionStatus["safariContinuityDiagnosticAudioCaptured"] = "false"
@@ -878,6 +922,11 @@ final class InputFailureContextRecorder {
             let probe = self.probe
             let details = await withCheckedContinuation { continuation in
                 probeQueue.async {
+                    if let probe = probe as? InputContextAXProbe {
+                        probe.sampleSource = "periodic"
+                        probe.sampleOperationID = nil
+                        probe.sampleTargetGeneration = self.axReadEvidenceCollector.currentTargetGeneration
+                    }
                     continuation.resume(returning: probe.sample(pid: pid, target: nil, includeEditors: true))
                 }
             }
@@ -936,6 +985,7 @@ struct InputFailureReport: Codable, Sendable {
     var latestFailure: InputFailureEvidence? = nil
     var sessionEvidenceSummaries: [DiagnosticSessionSummary]? = nil
     var firstFailure: InputFailureEvidence? = nil
+    var axReadEvidence: AXReadEvidenceReport? = nil
     let evidenceScopeNote: String?
     var windowFrameCapture: DiagnosticWindowFrameEvidence? = nil
 
@@ -950,6 +1000,7 @@ struct InputFailureReport: Codable, Sendable {
             latestFailure: latestFailure,
             sessionEvidenceSummaries: sessionEvidenceSummaries,
             firstFailure: firstFailure,
+            axReadEvidence: axReadEvidence,
             evidenceScopeNote: evidenceScopeNote,
             windowFrameCapture: windowFrameCapture
         )
@@ -966,6 +1017,7 @@ struct InputFailureReport: Codable, Sendable {
             latestFailure: latestFailure,
             sessionEvidenceSummaries: sessionEvidenceSummaries,
             firstFailure: firstFailure,
+            axReadEvidence: axReadEvidence,
             evidenceScopeNote: evidenceScopeNote,
             windowFrameCapture: evidence
         )

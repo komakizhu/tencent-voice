@@ -4,12 +4,14 @@ import Foundation
 final class TextInjector {
     private final class KeyboardWriteOperationState {
         var fields: [String: String]
+        private var dispatchStarted = false
 
         init(fields: [String: String]) {
             self.fields = fields
         }
 
         func markDispatch() {
+            dispatchStarted = true
             let timestamp = TextInputDiagnosticClock.milliseconds()
             fields["operationStatus"] = "dispatching"
             fields["dispatchStartedMonotonicMilliseconds"] = String(timestamp)
@@ -21,7 +23,18 @@ final class TextInjector {
             fields["operationCompletedMonotonicMilliseconds"] = String(timestamp)
             fields["operationStatus"] = status
             fields["targetCompletionConfirmed"] = String(status == "acknowledged")
-            fields["localDispatchCompleted"] = String(status != "cancelled")
+            let dispatchOutcome: String
+            if status == "acknowledged" {
+                dispatchOutcome = "true"
+            } else if dispatchStarted {
+                dispatchOutcome = "unknown"
+            } else {
+                dispatchOutcome = "false"
+            }
+            fields["localDispatchCompleted"] = dispatchOutcome
+            fields["dispatchOutcome"] = dispatchOutcome == "true"
+                ? "completed_and_acknowledged"
+                : (dispatchOutcome == "unknown" ? "started_but_unconfirmed" : "not_started")
             if status == "acknowledged" {
                 fields["feedbackObservedMonotonicMilliseconds"] = String(timestamp)
             } else {
@@ -1073,6 +1086,8 @@ final class TextInjector {
         let dispatchStarted = TextInputDiagnosticClock.milliseconds()
         fields["operationStatus"] = "dispatching"
         fields["dispatchStartedMonotonicMilliseconds"] = String(dispatchStarted)
+        fields["localDispatchCompleted"] = "unknown"
+        fields["dispatchOutcome"] = "started_but_unconfirmed"
         do {
             try action()
             let dispatchEnded = TextInputDiagnosticClock.milliseconds()
@@ -1080,6 +1095,8 @@ final class TextInjector {
             fields["feedbackObservedMonotonicMilliseconds"] = "unknown"
             fields["operationCompletedMonotonicMilliseconds"] = String(dispatchEnded)
             fields["operationStatus"] = "submitted"
+            fields["localDispatchCompleted"] = "true"
+            fields["dispatchOutcome"] = "completed_without_target_confirmation"
             recordDiagnostic("input_operation", fields)
         } catch {
             let failed = TextInputDiagnosticClock.milliseconds()

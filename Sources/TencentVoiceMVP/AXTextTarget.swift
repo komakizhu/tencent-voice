@@ -4094,8 +4094,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                     "actualStrategy": currentStrategy.diagnosticName,
                     "actualReason": currentStrategy.diagnosticReason,
                     "currentRole": context?.role ?? "unknown",
-                    "isReadOnly": "unknown",
-                    "isSecure": "false",
+                    "isReadOnly": context?.isReadOnly.map(String.init) ?? "unknown",
+                    "isSecure": context?.isSecure.map(String.init) ?? "unknown",
                     "retryWindow": "existing_keyboard_preflight"
                 ])
                 codexEditabilityRetryDiagnosticRecorded = true
@@ -4184,8 +4184,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
               application?.bundleIdentifier == "com.openai.codex",
               application?.processIdentifier == targetApplicationProcessID,
               context?.role == "AXTextArea" || context?.role == "AXTextField",
-              context?.isReadOnly == nil,
-              context?.isSecure == false else {
+              context?.isReadOnly != true,
+              context?.isSecure != true else {
             return false
         }
         return currentStrategy == .safeStop(reason: "codex_editability_unknown")
@@ -5260,8 +5260,15 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
 
         static let system = ContinuityAXReader(
             copyAttributeValue: { element, name in
+                let startedAt = DispatchTime.now().uptimeNanoseconds
                 var value: CFTypeRef?
                 let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+                AXReadEvidenceRuntime.shared.record(
+                    SystemAXTextTargetAccess.readEvidenceSample(
+                        source: "input_continuity", attribute: name, element: element,
+                        startedAt: startedAt, status: status
+                    )
+                )
                 return (status, value)
             },
             setMessagingTimeout: { AXUIElementSetMessagingTimeout($0, $1) },
@@ -5281,6 +5288,22 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
     }
 
     private let continuityAXReader: ContinuityAXReader
+
+    nonisolated fileprivate static func readEvidenceSample(
+        source: String,
+        attribute: String,
+        element: AXUIElement,
+        startedAt: UInt64,
+        status: AXError
+    ) -> AXReadEvidenceSample {
+        AXReadEvidenceRuntime.sample(
+            source: source,
+            attribute: attribute,
+            element: element,
+            startedAt: startedAt,
+            status: status
+        )
+    }
 
     init(continuityAXReader: ContinuityAXReader = .system) {
         self.continuityAXReader = continuityAXReader
@@ -6271,12 +6294,17 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
             throw TextTargetError.writeFailed
         }
         var result: CFTypeRef?
+        let startedAt = DispatchTime.now().uptimeNanoseconds
         let status = AXUIElementCopyParameterizedAttributeValue(
             element,
             kAXStringForRangeParameterizedAttribute as CFString,
             rangeValue,
             &result
         )
+        AXReadEvidenceRuntime.shared.record(Self.readEvidenceSample(
+            source: "input", attribute: kAXStringForRangeParameterizedAttribute as String,
+            element: element, startedAt: startedAt, status: status
+        ))
         recordReadStatus(status, attribute: kAXStringForRangeParameterizedAttribute as String)
         switch status {
         case .success:
@@ -6380,7 +6408,11 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
     private func stringAttributeState(_ name: String, from element: AXUIElement) -> (value: String?, known: Bool) {
         var value: CFTypeRef?
         AXUIElementSetMessagingTimeout(element, 0.03)
+        let startedAt = DispatchTime.now().uptimeNanoseconds
         let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        AXReadEvidenceRuntime.shared.record(Self.readEvidenceSample(
+            source: "input", attribute: name, element: element, startedAt: startedAt, status: status
+        ))
         switch status {
         case .success:
             if let text = value as? String { return (text, true) }
@@ -6415,7 +6447,11 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
     private func boolAttribute(_ name: String, from element: AXUIElement) -> Bool? {
         var value: CFTypeRef?
         AXUIElementSetMessagingTimeout(element, 0.03)
+        let startedAt = DispatchTime.now().uptimeNanoseconds
         let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        AXReadEvidenceRuntime.shared.record(Self.readEvidenceSample(
+            source: "input", attribute: name, element: element, startedAt: startedAt, status: status
+        ))
         guard status != .noValue else { return false }
         guard status == .success, let value else {
             recordReadStatus(status, attribute: name)
@@ -6437,7 +6473,11 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
     private func parentElementAttribute(_ name: String, from element: AXUIElement) throws -> AXUIElement? {
         var value: CFTypeRef?
         AXUIElementSetMessagingTimeout(element, 0.03)
+        let startedAt = DispatchTime.now().uptimeNanoseconds
         let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        AXReadEvidenceRuntime.shared.record(Self.readEvidenceSample(
+            source: "input", attribute: name, element: element, startedAt: startedAt, status: status
+        ))
         switch status {
         case .success:
             guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
@@ -6455,7 +6495,11 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
     private func attribute(_ name: String, from element: AXUIElement) throws -> CFTypeRef? {
         var value: CFTypeRef?
         AXUIElementSetMessagingTimeout(element, 0.03)
+        let startedAt = DispatchTime.now().uptimeNanoseconds
         let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        AXReadEvidenceRuntime.shared.record(Self.readEvidenceSample(
+            source: "input", attribute: name, element: element, startedAt: startedAt, status: status
+        ))
         if [kAXFocusedUIElementAttribute, kAXValueAttribute, kAXSelectedTextRangeAttribute].contains(name) {
             recordReadStatus(status, attribute: name)
         }

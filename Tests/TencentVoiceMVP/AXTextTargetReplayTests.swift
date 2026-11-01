@@ -4894,6 +4894,51 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertFalse(diagnostics.contains { $0.event == "input_strategy_changed" })
     }
 
+    func testCodexRetriesTemporaryUnknownSecurityStatesWithoutDuplicateDispatch() async throws {
+        let unknownStates: [AXTextInputTargetContext] = [
+            AXTextInputTargetContext(
+                role: "AXTextArea", hasWebAreaAncestor: false, webURL: nil,
+                isReadOnly: false, isSecure: nil
+            ),
+            AXTextInputTargetContext(
+                role: "AXTextArea", hasWebAreaAncestor: false, webURL: nil,
+                isReadOnly: nil, isSecure: nil
+            )
+        ]
+
+        for unknown in unknownStates {
+            let access = ReplayAXTextTargetAccess(
+                text: "已有正文",
+                selection: .init(location: 4, length: 0),
+                application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+            )
+            let sender = ReplayKeyboardEventSender(access: access)
+            var clock: UInt64 = 0
+            let target = AXTextTarget(
+                access: access,
+                keyboardEventSender: sender,
+                writeTiming: .init(now: { clock }, sleep: { clock += $0 })
+            )
+            _ = try target.capture()
+            access.queuedTextInputContexts = [
+                unknown,
+                AXTextInputTargetContext(
+                    role: "AXTextArea", hasWebAreaAncestor: false, webURL: nil,
+                    isReadOnly: false, isSecure: false
+                )
+            ]
+
+            try await target.writeKeyboardText(previousText: "", with: "补全")
+
+            XCTAssertEqual(access.rawText, "已有正文补全")
+            XCTAssertEqual(sender.totalPosts, 1)
+            let diagnostics = target.drainDiagnostics()
+            XCTAssertTrue(diagnostics.contains { $0.event == "input_strategy_read_retryable" })
+            XCTAssertTrue(diagnostics.contains { $0.event == "keyboard_write_acknowledged" })
+            XCTAssertFalse(diagnostics.contains { $0.event == "input_strategy_changed" })
+        }
+    }
+
     func testCodexStopsAfterBoundedUnknownReadOnlyAndDoesNotDispatch() async throws {
         let access = ReplayAXTextTargetAccess(
             text: "已有正文",

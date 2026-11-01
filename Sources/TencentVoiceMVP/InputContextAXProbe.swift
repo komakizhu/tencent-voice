@@ -52,6 +52,12 @@ final class InputContextAXProbe: InputContextSampling, @unchecked Sendable {
     private let isTrusted: () -> Bool
     private let secureInputActive: () -> Bool
     private let readAttribute: ((String, AXUIElement) -> (AXError, CFTypeRef?))?
+    var readObserver: (@Sendable (AXReadEvidenceSample) -> Void)?
+    var sampleSource = "unknown"
+    var sampleOperationID: Int?
+    var sampleTargetGeneration: UInt64?
+    private var sampleProcessID: pid_t?
+    private var sampleTargetBound = false
 
     init(isTrusted: @escaping () -> Bool = { AXIsProcessTrusted() },
          secureInputActive: @escaping () -> Bool = { IsSecureEventInputEnabled() },
@@ -64,6 +70,8 @@ final class InputContextAXProbe: InputContextSampling, @unchecked Sendable {
     func sample(pid: pid_t, target: AXUIElement? = nil, includeEditors: Bool = false) -> [String: String] {
         guard isTrusted() else { return ["axAvailable": "false"] }
         let start = Date()
+        sampleProcessID = pid
+        sampleTargetBound = target != nil
         deadline = start.addingTimeInterval(0.25)
         status = [:]
         let app = AXUIElementCreateApplication(pid)
@@ -216,6 +224,7 @@ final class InputContextAXProbe: InputContextSampling, @unchecked Sendable {
 
     private func attribute(_ name: String, in node: AXUIElement) -> CFTypeRef? {
         guard Date() < deadline else { status["queryBudgetExceeded"] = "true"; return nil }
+        let startedAt = DispatchTime.now().uptimeNanoseconds
         var value: CFTypeRef?
         let code: AXError
         if let readAttribute {
@@ -225,6 +234,17 @@ final class InputContextAXProbe: InputContextSampling, @unchecked Sendable {
             code = AXUIElementCopyAttributeValue(node, name as CFString, &value)
         }
         if code != .success { status["element\(identity(node)).\(name).status"] = String(code.rawValue) }
+        readObserver?(AXReadEvidenceSample(
+            source: sampleSource,
+            attribute: name,
+            processID: sampleProcessID,
+            targetBound: sampleTargetBound,
+            operationID: sampleOperationID,
+            targetGeneration: sampleTargetGeneration,
+            startedAtMonotonicNanoseconds: startedAt,
+            endedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds,
+            status: code.rawValue
+        ))
         return code == .success ? value : nil
     }
 

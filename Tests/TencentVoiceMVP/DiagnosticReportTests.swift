@@ -64,6 +64,46 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertNil(decoded.desktopContext.events.first?.sessionID)
     }
 
+    func testInputFailureReportCarriesAXReadEvidenceWithoutSensitiveValues() throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let context = InputContextWindow(
+            requestedStart: timestamp.addingTimeInterval(-60), recordingStartedAt: nil,
+            capturedAt: timestamp, enabled: true, droppedEventCount: 0, events: []
+        )
+        let report = InputFailureReport(
+            schemaVersion: 7,
+            id: UUID(),
+            generatedAt: timestamp,
+            desktopContext: context,
+            diagnosticReport: DiagnosticReport(
+                app: appInfo(), permissions: PrivacyPermissionReport(statuses: []),
+                credentials: DiagnosticCredentialInfo(state: .configured, detail: "configured"),
+                settings: DiagnosticSettingsInfo(shortcut: "test", engineModelType: "test", persistentSessionLogEnabled: false),
+                events: [], logDirectoryPath: "/tmp/logs"
+            ),
+            diagnosticEventsTruncated: false,
+            axReadEvidence: AXReadEvidenceReport(
+                schemaVersion: 1, enabled: true, permission: "granted", capturedAt: timestamp,
+                windowStart: timestamp.addingTimeInterval(-60), retentionSeconds: 60,
+                maxSampleCount: 16_384, sampleCount: 1, droppedSampleCount: 0,
+                scope: "metadata only",
+                samples: [AXReadEvidenceSample(
+                    source: "operation", attribute: "AXSecureTextField", processID: 9001,
+                    targetBound: true, startedAtMonotonicNanoseconds: 10,
+                    endedAtMonotonicNanoseconds: 20, status: -25204
+                )]
+            ),
+            evidenceScopeNote: "test"
+        )
+
+        let data = try DiagnosticJSON.encoder().encode(report)
+        let decoded = try DiagnosticJSON.decoder().decode(InputFailureReport.self, from: data)
+        XCTAssertEqual(decoded.schemaVersion, 7)
+        XCTAssertEqual(decoded.axReadEvidence?.samples.count, 1)
+        XCTAssertEqual(decoded.axReadEvidence?.samples.first?.status, -25204)
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("AXValue"))
+    }
+
     func testReportExplainsSafariContinuityScanFailureAndRendersAXStatus() {
         let event = SessionLogEntry(
             sessionID: UUID(),

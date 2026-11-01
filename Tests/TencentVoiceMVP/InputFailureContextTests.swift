@@ -4,6 +4,83 @@ import XCTest
 @testable import TencentVoiceMVP
 
 final class InputFailureContextTests: XCTestCase {
+    func testAXReadEvidenceCollectorKeepsOnlyBoundedCallMetadataAndClearsWhenDisabled() {
+        let collector = AXReadEvidenceCollector()
+        let start = DispatchTime.now().uptimeNanoseconds
+        collector.setEnabled(true)
+        collector.beginTarget(sessionID: nil, processID: 9001)
+        collector.record(AXReadEvidenceSample(
+            source: "operation", attribute: "AXSecureTextField", processID: 9001,
+            targetBound: true, startedAtMonotonicNanoseconds: start,
+            endedAtMonotonicNanoseconds: start + 1_000_000, status: -25204
+        ))
+
+        let snapshot = collector.snapshot(at: Date(), permission: "granted")
+        XCTAssertTrue(snapshot.enabled)
+        XCTAssertEqual(snapshot.sampleCount, 1)
+        XCTAssertEqual(snapshot.samples.first?.attribute, "AXSecureTextField")
+        XCTAssertEqual(snapshot.samples.first?.status, -25204)
+        XCTAssertTrue(snapshot.samples.first?.targetBound == true)
+
+        collector.setEnabled(false)
+        let cleared = collector.snapshot(at: Date(), permission: "granted")
+        XCTAssertFalse(cleared.enabled)
+        XCTAssertEqual(cleared.sampleCount, 0)
+        XCTAssertEqual(cleared.droppedSampleCount, 0)
+    }
+
+    func testAXReadEvidenceCollectorExpiresSamplesAndRejectsStaleTargetGeneration() {
+        let collector = AXReadEvidenceCollector()
+        let start = DispatchTime.now().uptimeNanoseconds
+        collector.setEnabled(true)
+        let generation = collector.beginTarget(sessionID: nil, processID: 9001)
+        collector.record(AXReadEvidenceSample(
+            source: "periodic", attribute: "AXValue", processID: 9001,
+            targetBound: true, targetGeneration: generation,
+            startedAtMonotonicNanoseconds: start - 61_000_000_000,
+            endedAtMonotonicNanoseconds: start - 61_000_000_000, status: -25204
+        ))
+        collector.record(AXReadEvidenceSample(
+            source: "operation", attribute: "AXValue", processID: 9001,
+            targetBound: true, targetGeneration: generation,
+            startedAtMonotonicNanoseconds: start,
+            endedAtMonotonicNanoseconds: start, status: 0
+        ))
+        let retained = collector.snapshot(at: Date(), permission: "granted")
+        XCTAssertEqual(retained.sampleCount, 1)
+        XCTAssertEqual(retained.samples.first?.source, "operation")
+
+        let nextGeneration = collector.beginTarget(sessionID: nil, processID: 9002)
+        collector.record(AXReadEvidenceSample(
+            source: "operation", attribute: "AXValue", processID: 9001,
+            targetBound: true, targetGeneration: generation,
+            startedAtMonotonicNanoseconds: start,
+            endedAtMonotonicNanoseconds: start, status: 0
+        ))
+        let isolated = collector.snapshot(at: Date(), permission: "granted")
+        XCTAssertEqual(nextGeneration, generation + 1)
+        XCTAssertEqual(isolated.sampleCount, 0)
+        XCTAssertEqual(isolated.droppedSampleCount, 1)
+    }
+
+    func testAXReadEvidenceCollectorCapsSamplesAndCountsEvictions() {
+        let collector = AXReadEvidenceCollector()
+        let start = DispatchTime.now().uptimeNanoseconds
+        collector.setEnabled(true)
+        let generation = collector.beginTarget(sessionID: nil, processID: 9001)
+        for _ in 0...AXReadEvidenceCollector.maxSampleCount {
+            collector.record(AXReadEvidenceSample(
+                source: "operation", attribute: "AXValue", processID: 9001,
+                targetBound: true, targetGeneration: generation,
+                startedAtMonotonicNanoseconds: start,
+                endedAtMonotonicNanoseconds: start, status: 0
+            ))
+        }
+        let snapshot = collector.snapshot(at: Date(), permission: "granted")
+        XCTAssertEqual(snapshot.sampleCount, AXReadEvidenceCollector.maxSampleCount)
+        XCTAssertEqual(snapshot.droppedSampleCount, 1)
+    }
+
     @MainActor
     func testDiagnosticOnlyTargetTimelineEventsDoNotRunAXProbe() {
         let probe = CountingInputContextProbe()
