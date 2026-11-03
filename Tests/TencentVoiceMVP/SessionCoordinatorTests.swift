@@ -34,6 +34,66 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertFalse(progress.metadata.values.contains { $0.contains("正文") })
     }
 
+    func testASRFinalizationEvidenceTracksCompletionWithoutKeepingAudioOrText() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        let audio = FakeAudioCapture()
+        let evidenceBuffer = ASRFinalizationEvidenceBuffer()
+        let start = Date()
+        evidenceBuffer.setEnabled(true, at: start)
+        let coordinator = SessionCoordinator(
+            asr: asr,
+            audio: audio,
+            textTarget: FakeTextTarget(text: "", supportsAXReplacement: false),
+            settingsStore: UserDefaultsSettingsStore(suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"),
+            credentialStore: InMemoryCredentialStore(
+                TencentCredentials(appID: "credential-marker", secretID: "secret-id-marker", secretKey: "secret-key-marker")
+            ),
+            keyboardSmoothing: .immediate,
+            onFinalizationEvidence: { evidenceBuffer.append($0) },
+            onStateChange: { _ in }
+        )
+
+        try await coordinator.begin()
+        audio.emit(Data(repeating: 0x5A, count: 3_200))
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 1,
+            segmentText: "ASR正文秘密",
+            phase: .partial
+        ))
+        await settleCoordinator()
+        let ending = Task { @MainActor in try? await coordinator.end() }
+        await settleCoordinator()
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 2,
+            segmentText: "ASR正文秘密已完成",
+            phase: .final,
+            wireFinal: true
+        ))
+        asr.emit(.streamEnded)
+        asr.finishStream()
+        await ending.value
+
+        let evidence = evidenceBuffer.snapshot().evidence
+        let encoded = try DiagnosticJSON.encoder().encode(evidence)
+        let serialized = String(decoding: encoded, as: UTF8.self)
+        XCTAssertEqual(evidence.audioUploadCompleted, true)
+        XCTAssertEqual(evidence.serviceConfirmedComplete, true)
+        XCTAssertEqual(evidence.textDeliveryStatus, .submittedUnconfirmed)
+        XCTAssertEqual(evidence.textWriteConfirmed, false)
+        XCTAssertTrue(evidence.events.contains { $0.kind == .audioCaptured })
+        XCTAssertTrue(evidence.events.contains { $0.kind == .audioUploaded })
+        XCTAssertTrue(evidence.events.contains { $0.kind == .serviceFinalSignalReceived })
+        XCTAssertFalse(serialized.contains("ASR正文秘密"))
+        XCTAssertFalse(serialized.contains("credential-marker"))
+        XCTAssertFalse(serialized.contains("secret-key-marker"))
+        XCTAssertFalse(serialized.contains("5A5A5A"))
+    }
+
     func testRecordingDisplaySnapshotTracksRecoveryStopAndFreshSessionState() async throws {
         let asr = FakeRealtimeASRClient()
         let audio = FakeAudioCapture()
@@ -104,6 +164,10 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(stopping.state, .stopping)
         XCTAssertFalse(stopping.isCapturing)
         XCTAssertEqual(stopping.audio.durationSeconds, 0.3, accuracy: 0.000_001)
+        audio.emit(Data(repeating: 0x50, count: 3_200))
+        await settleCoordinator()
+        XCTAssertEqual(coordinator.recordingDisplaySnapshot().audio, stopping.audio)
+        XCTAssertEqual(audio.stopCallCount, 1)
 
         asr.finishStream()
         await ending.value
@@ -139,12 +203,10 @@ final class SessionCoordinatorTests: XCTestCase {
 
     func testStopFlushesPendingKeyboardSmoothingCharacters() async throws {
         let asr = FakeRealtimeASRClient()
-        asr.finishCompletesStream = false
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         let coordinator = makeCoordinator(
             asr: asr,
             target: target,
-            finishTimeoutNanoseconds: 10_000_000,
             keyboardSmoothing: .live
         )
 
@@ -170,6 +232,8 @@ final class SessionCoordinatorTests: XCTestCase {
         let target = FakeTextTarget(text: "", supportsAXReplacement: false)
         target.keyboardAvailability = .temporarilyAway
         var pendingStates: [Bool] = []
+        let evidence = ASRFinalizationEvidenceBuffer()
+        evidence.setEnabled(true)
         let coordinator = SessionCoordinator(
             asr: asr,
             audio: FakeAudioCapture(),
@@ -178,6 +242,7 @@ final class SessionCoordinatorTests: XCTestCase {
             credentialStore: InMemoryCredentialStore(TencentCredentials(appID: "app", secretID: "id", secretKey: "key")),
             keyboardSmoothing: .immediate,
             onPendingCompletionChange: { pendingStates.append($0) },
+            onFinalizationEvidence: { evidence.append($0) },
             onStateChange: { _ in }
         )
 
@@ -190,12 +255,14 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.state, .idle, "Waiting to complete text must not keep recording active")
         XCTAssertEqual(target.text, "")
         XCTAssertEqual(pendingStates, [true])
+        XCTAssertEqual(evidence.snapshot().evidence.textDeliveryStatus, .waitingForTarget)
 
         target.keyboardAvailability = .active
         await coordinator.pollTargetAvailabilityForTesting()
         XCTAssertEqual(target.text, "123")
         XCTAssertEqual(target.pastedTexts, ["123"])
         XCTAssertEqual(pendingStates, [true, false])
+        XCTAssertEqual(evidence.snapshot().evidence.textDeliveryStatus, .submittedUnconfirmed)
 
         asr.emit(ASRUpdate(text: "late callback", isFinal: true, sequence: 1))
         await settleCoordinator()
@@ -288,7 +355,6 @@ final class SessionCoordinatorTests: XCTestCase {
         let coordinator = makeCoordinator(
             asr: asr,
             target: target,
-            finishTimeoutNanoseconds: 3_000_000_000,
             keyboardSmoothing: .live,
             pacingClock: clock
         )
@@ -422,7 +488,6 @@ final class SessionCoordinatorTests: XCTestCase {
         let coordinator = makeCoordinator(
             asr: asr,
             target: target,
-            finishTimeoutNanoseconds: 3_000_000_000,
             keyboardSmoothing: .live,
             pacingClock: clock
         )
@@ -790,12 +855,126 @@ final class SessionCoordinatorTests: XCTestCase {
         asr.sendAudioDelayNanoseconds = 10_000_000
         let audio = FakeAudioCapture()
         audio.dataToEmitOnStop = Data([1, 2, 3])
-        let coordinator = makeCoordinator(asr: asr, audio: audio, target: FakeTextTarget(text: ""))
+        let coordinator = makeCoordinator(
+            asr: asr, audio: audio, target: FakeTextTarget(text: ""),
+            onStateChange: { state in
+                guard state == .stopping else { return }
+                XCTAssertEqual(audio.stopCallCount, 1, "Capture must stop before any state observer runs")
+                audio.emit(Data([9, 9]))
+            }
+        )
 
         try await coordinator.begin()
         try await coordinator.end()
 
         XCTAssertEqual(asr.eventOrder, ["audio", "finish"])
+        audio.emit(Data([4, 5, 6]))
+        await settleCoordinator()
+        XCTAssertEqual(asr.eventOrder, ["audio", "finish"], "Stopped capture must not submit more audio")
+    }
+
+    func testUploadFailurePreservesTextAndDoesNotSendEndMarker() async throws {
+        let asr = FakeRealtimeASRClient()
+        let audio = FakeAudioCapture()
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let coordinator = makeCoordinator(asr: asr, audio: audio, target: target)
+        try await coordinator.begin()
+        asr.emit(.init(text: "已有文字", isFinal: false, sequence: 0))
+        await settleCoordinator()
+        audio.dataToEmitOnStop = Data([1, 2])
+        asr.sendAudioOperation = { throw TencentASRError.server(code: 500, message: "上传失败") }
+        try await coordinator.end()
+        guard case .error = coordinator.state else { return XCTFail("Upload failure must be incomplete") }
+        XCTAssertEqual(target.text, "已有文字")
+        XCTAssertEqual(asr.finishCallCount, 0)
+    }
+
+    func testUserCanEndWaitDuringHungUploadWithoutWaitingForSendCallback() async throws {
+        let asr = FakeRealtimeASRClient()
+        let audio = FakeAudioCapture()
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let coordinator = makeCoordinator(asr: asr, audio: audio, target: target)
+        try await coordinator.begin()
+        asr.emit(.init(text: "保留文字", isFinal: false, sequence: 0))
+        await settleCoordinator()
+        let suspension = SuspendedASROperation()
+        asr.sendAudioOperation = { await suspension.wait() }
+        audio.dataToEmitOnStop = Data([1, 2])
+        let ended = expectation(description: "end without hung upload")
+        let ending = Task { @MainActor in
+            try? await coordinator.end()
+            ended.fulfill()
+        }
+        for _ in 0..<200 where !suspension.isWaiting { await Task.yield() }
+        XCTAssertTrue(suspension.isWaiting)
+        coordinator.endFinalizationWaitPreservingText()
+        await fulfillment(of: [ended], timeout: 2)
+        XCTAssertTrue(suspension.isWaiting)
+        XCTAssertEqual(target.text, "保留文字")
+        XCTAssertEqual(asr.finishCallCount, 0)
+        suspension.resume()
+        await ending.value
+    }
+
+    func testFinalSignalWaitsForEndMarkerAcknowledgementAndRepeatedStopIsIdempotent() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        let suspension = SuspendedASROperation()
+        asr.finishOperation = { await suspension.wait() }
+        let coordinator = makeCoordinator(asr: asr, target: FakeTextTarget(text: ""))
+        try await coordinator.begin()
+        let ending = Task { @MainActor in try? await coordinator.end() }
+        for _ in 0..<200 where !suspension.isWaiting { await Task.yield() }
+        asr.finishStream()
+        await settleCoordinator()
+        try await coordinator.end()
+        XCTAssertEqual(coordinator.state, .stopping)
+        XCTAssertEqual(asr.finishCallCount, 1)
+        suspension.resume()
+        await ending.value
+        XCTAssertEqual(coordinator.state, .idle)
+    }
+
+    func testCancelledFinishCallbackCannotClearOrFailNextSession() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        let suspension = SuspendedASROperation()
+        asr.finishOperation = { await suspension.wait() }
+        let coordinator = makeCoordinator(asr: asr, target: FakeTextTarget(text: ""))
+        try await coordinator.begin()
+        let ending = Task { @MainActor in try? await coordinator.end() }
+        for _ in 0..<200 where !suspension.isWaiting { await Task.yield() }
+        coordinator.cancel()
+        await ending.value
+        try await coordinator.begin()
+        suspension.resume()
+        await settleCoordinator()
+        XCTAssertEqual(coordinator.state, .listening)
+        coordinator.cancel()
+    }
+
+    func testContinuousRecognitionProgressHasNoTotalDeadline() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        let clock = ManualKeyboardPacingClock()
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let coordinator = makeCoordinator(asr: asr, target: target, finalizationClock: clock)
+        try await coordinator.begin()
+        let ending = Task { @MainActor in try? await coordinator.end() }
+        await settleCoordinator()
+        for sequence in 1...10 {
+            clock.advance(by: 20_000_000_000)
+            asr.emit(.init(
+                segmentID: 0, segmentOrder: 0, sequence: sequence,
+                segmentText: "持续修订\(sequence)", phase: sequence == 10 ? .final : .partial
+            ))
+            await settleCoordinator()
+            XCTAssertEqual(coordinator.state, .stopping)
+        }
+        asr.finishStream()
+        await ending.value
+        XCTAssertEqual(target.text, "持续修订10")
+        XCTAssertEqual(coordinator.state, .idle)
     }
 
     func testKeyboardSegmentsAreAppendedInOrder() async throws {
@@ -970,10 +1149,11 @@ final class SessionCoordinatorTests: XCTestCase {
         let asr = FakeRealtimeASRClient()
         asr.finishCompletesStream = false
         let target = FakeTextTarget(text: "已有文字", supportsAXReplacement: false)
+        let warningClock = ManualKeyboardPacingClock()
         let coordinator = makeCoordinator(
             asr: asr,
             target: target,
-            finishTimeoutNanoseconds: 10_000_000
+            finalizationClock: warningClock
         )
 
         try await coordinator.begin()
@@ -984,10 +1164,189 @@ final class SessionCoordinatorTests: XCTestCase {
             segmentText: "收尾中的文字",
             phase: .partial
         ))
-        try await coordinator.end()
+        let ending = Task { @MainActor in try? await coordinator.end() }
+        await settleCoordinator()
+        warningClock.advance(by: 30_000_000_000)
+        await settleCoordinator()
 
         XCTAssertEqual(target.text, "已有文字收尾中的文字")
+        XCTAssertEqual(coordinator.state, .stoppingUnresponsive)
+        XCTAssertEqual(coordinator.recordingDisplaySnapshot().isCapturing, false)
+
+        coordinator.endFinalizationWaitPreservingText()
+        await ending.value
+
+        XCTAssertEqual(target.text, "已有文字收尾中的文字")
+        guard case .error = coordinator.state else {
+            return XCTFail("主动结束等待必须标记收尾未完成")
+        }
+    }
+
+    func testStopWaitsPastThreeSecondsForTheFinalRecognitionRevision() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let warningClock = ManualKeyboardPacingClock()
+        let coordinator = makeCoordinator(asr: asr, target: target, finalizationClock: warningClock)
+
+        try await coordinator.begin()
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 0,
+            segmentText: "最后一句还没",
+            phase: .partial
+        ))
+        await settleCoordinator()
+        let ending = Task { @MainActor in try? await coordinator.end() }
+        await settleCoordinator()
+
+        warningClock.advance(by: 31_000_000_000)
+        await settleCoordinator()
+        XCTAssertEqual(coordinator.state, .stoppingUnresponsive)
+        XCTAssertFalse(coordinator.recordingDisplaySnapshot().isCapturing)
+        XCTAssertEqual(target.text, "最后一句还没")
+
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 1,
+            segmentText: "最后一句已经识别完毕",
+            phase: .final,
+            wireFinal: true
+        ))
+        asr.finishStream()
+        await ending.value
+
+        XCTAssertEqual(target.text, "最后一句已经识别完毕")
         XCTAssertEqual(coordinator.state, .idle)
+    }
+
+    func testRepeatedRecognitionRevisionDoesNotResetNoProgressWarning() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        let warningClock = ManualKeyboardPacingClock()
+        let coordinator = makeCoordinator(
+            asr: asr,
+            target: FakeTextTarget(text: "", supportsAXReplacement: false),
+            finalizationClock: warningClock
+        )
+
+        try await coordinator.begin()
+        let partial = ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 0,
+            segmentText: "识别进行中",
+            phase: .partial
+        )
+        asr.emit(partial)
+        await settleCoordinator()
+        let ending = Task { @MainActor in try? await coordinator.end() }
+        await settleCoordinator()
+
+        warningClock.advance(by: 15_000_000_000)
+        await settleCoordinator()
+        asr.emit(partial)
+        await settleCoordinator()
+        warningClock.advance(by: 15_000_000_000)
+        await settleCoordinator()
+
+        XCTAssertEqual(coordinator.state, .stoppingUnresponsive)
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 1,
+            segmentText: "识别进行中的最终修订",
+            phase: .final,
+            wireFinal: true
+        ))
+        await settleCoordinator()
+        XCTAssertEqual(coordinator.state, .stopping)
+        asr.finishStream()
+        await ending.value
+        XCTAssertEqual(coordinator.state, .idle)
+    }
+
+    func testASRReceiveErrorDuringFinalizationIsNotReportedAsSuccess() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let coordinator = makeCoordinator(asr: asr, target: target)
+
+        try await coordinator.begin()
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 0,
+            segmentText: "已收到的安全文字",
+            phase: .partial
+        ))
+        await settleCoordinator()
+        let ending = Task { @MainActor in try? await coordinator.end() }
+        await settleCoordinator()
+
+        asr.fail(TencentASRError.server(code: 500, message: "测试错误"))
+        await ending.value
+
+        guard case .error = coordinator.state else {
+            return XCTFail("接收错误不能把收尾会话标记为正常完成")
+        }
+        XCTAssertEqual(target.text, "已收到的安全文字")
+    }
+
+    func testStreamClosingWithoutFinalSignalMarksFinalizationIncomplete() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        let target = FakeTextTarget(text: "", supportsAXReplacement: false)
+        let coordinator = makeCoordinator(asr: asr, target: target)
+
+        try await coordinator.begin()
+        asr.emit(ASRUpdate(
+            segmentID: 1,
+            segmentOrder: 0,
+            sequence: 0,
+            segmentText: "连接关闭前的安全文字",
+            phase: .partial
+        ))
+        await settleCoordinator()
+        let ending = Task { @MainActor in try? await coordinator.end() }
+        await settleCoordinator()
+
+        asr.closeStreamWithoutFinalSignal()
+        await ending.value
+
+        guard case .error = coordinator.state else {
+            return XCTFail("没有整段完成信号的正常关闭必须标记收尾未完成")
+        }
+        XCTAssertEqual(target.text, "连接关闭前的安全文字")
+    }
+
+    func testEndMarkerSendErrorIsNotDiscardedDuringFinalization() async throws {
+        let asr = FakeRealtimeASRClient()
+        asr.finishCompletesStream = false
+        asr.finishError = TencentASRError.server(code: 500, message: "结束标记发送失败")
+        let logger = SessionLogger(enabled: { false })
+        let coordinator = SessionCoordinator(
+            asr: asr,
+            audio: FakeAudioCapture(),
+            textTarget: FakeTextTarget(text: "", supportsAXReplacement: false),
+            settingsStore: UserDefaultsSettingsStore(suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"),
+            credentialStore: InMemoryCredentialStore(
+                TencentCredentials(appID: "app", secretID: "id", secretKey: "key")
+            ),
+            logger: logger,
+            onStateChange: { _ in }
+        )
+
+        try await coordinator.begin()
+        let ending = Task { @MainActor in try? await coordinator.end() }
+        await ending.value
+
+        guard case .error = coordinator.state else {
+            return XCTFail("结束标记发送失败不能被吞掉并报告为正常完成")
+        }
+        XCTAssertNotNil(logger.recentEntries().first { $0.event == "asr_finalization_error" })
     }
 
     func testASRErrorFinalizesLastSafeProjectionWithoutDeletingIt() async throws {
@@ -1137,9 +1496,11 @@ private func makeCoordinator(
     target: TextTarget,
     credentials: TencentCredentials? = TencentCredentials(appID: "app", secretID: "id", secretKey: "key"),
     settingsStore: SettingsStore? = nil,
-    finishTimeoutNanoseconds: UInt64 = 3_000_000_000,
+    finalizationWarningNanoseconds: UInt64 = 30_000_000_000,
     keyboardSmoothing: KeyboardSmoothingConfiguration = .immediate,
-    pacingClock: KeyboardPacingClock? = nil
+    pacingClock: KeyboardPacingClock? = nil,
+    finalizationClock: KeyboardPacingClock? = nil,
+    onStateChange: @escaping (SessionState) -> Void = { _ in }
 ) -> SessionCoordinator {
     SessionCoordinator(
         asr: asr,
@@ -1148,10 +1509,11 @@ private func makeCoordinator(
         settingsStore: settingsStore
             ?? UserDefaultsSettingsStore(suiteName: "TencentVoiceMVPTests.\(UUID().uuidString)"),
         credentialStore: InMemoryCredentialStore(credentials),
-        finishTimeoutNanoseconds: finishTimeoutNanoseconds,
+        finalizationWarningNanoseconds: finalizationWarningNanoseconds,
         keyboardSmoothing: keyboardSmoothing,
         pacingClock: pacingClock,
-        onStateChange: { _ in }
+        finalizationClock: finalizationClock,
+        onStateChange: onStateChange
     )
 }
 

@@ -1,6 +1,6 @@
 import Foundation
 
-enum ASRSegmentPhase: String, Equatable, Sendable {
+enum ASRSegmentPhase: String, Codable, Equatable, Sendable {
     case started
     case partial
     case final

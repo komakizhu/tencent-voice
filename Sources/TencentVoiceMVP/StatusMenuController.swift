@@ -7,6 +7,7 @@ final class StatusMenuController: NSObject {
     private var calibrateUsageMenuItem: NSMenuItem?
     private var settingsMenuItem: NSMenuItem?
     private var recordMenuItem: NSMenuItem?
+    private var endFinalizationMenuItem: NSMenuItem?
     private var pendingCompletionMenuItem: NSMenuItem?
     private var cancelPendingCompletionMenuItem: NSMenuItem?
     private var autoStartMenuItem: NSMenuItem?
@@ -15,6 +16,7 @@ final class StatusMenuController: NSObject {
     private var onSettings: (() -> Void)?
     private var onCalibrateUsage: (() -> Void)?
     private var onToggleRecording: (() -> Void)?
+    private var onEndFinalizationWait: (() -> Void)?
     private var onCancelPendingCompletion: (() -> Void)?
     private var onToggleAutoStart: (() -> Void)?
     private var onSelectRimeTheme: ((String) -> Void)?
@@ -118,6 +120,14 @@ final class StatusMenuController: NSObject {
         autoStart.toolTip = "登录 macOS 账户后自动启动 Rime Voice。"
         menu.addItem(settings)
         menu.addItem(record)
+        let endFinalization = NSMenuItem(
+            title: "结束等待，保留已有文字",
+            action: #selector(endFinalizationWaitPressed),
+            keyEquivalent: ""
+        )
+        endFinalization.target = self
+        endFinalization.isHidden = true
+        menu.addItem(endFinalization)
         let pendingCompletion = NSMenuItem(title: "已停止录音，等待返回补齐", action: nil, keyEquivalent: "")
         pendingCompletion.isEnabled = false
         pendingCompletion.isHidden = true
@@ -154,6 +164,7 @@ final class StatusMenuController: NSObject {
         calibrateUsageMenuItem = calibrateUsage
         settingsMenuItem = settings
         recordMenuItem = record
+        endFinalizationMenuItem = endFinalization
         pendingCompletionMenuItem = pendingCompletion
         cancelPendingCompletionMenuItem = cancelPendingCompletion
         autoStartMenuItem = autoStart
@@ -201,7 +212,7 @@ final class StatusMenuController: NSObject {
         sessionState = recordingState
         if changed {
             switch recordingState {
-            case .idle, .recovering, .stopping, .error:
+            case .idle, .recovering, .stopping, .stoppingUnresponsive, .error:
                 waveformDisplayModel.reset()
             case .connecting, .listening:
                 break
@@ -243,6 +254,7 @@ final class StatusMenuController: NSObject {
         onSettings: @escaping () -> Void,
         onCalibrateUsage: @escaping () -> Void = {},
         onToggleRecording: @escaping () -> Void,
+        onEndFinalizationWait: @escaping () -> Void = {},
         onToggleAutoStart: @escaping () -> Void,
         onSelectRimeTheme: @escaping (String) -> Void,
         onManageRimeDictionary: @escaping () -> Void,
@@ -256,6 +268,7 @@ final class StatusMenuController: NSObject {
         self.onSettings = onSettings
         self.onCalibrateUsage = onCalibrateUsage
         self.onToggleRecording = onToggleRecording
+        self.onEndFinalizationWait = onEndFinalizationWait
         self.onCancelPendingCompletion = onCancelPendingCompletion
         self.onToggleAutoStart = onToggleAutoStart
         self.onSelectRimeTheme = onSelectRimeTheme
@@ -285,6 +298,7 @@ final class StatusMenuController: NSObject {
     @objc private func reportInputFailurePressed() { onReportInputFailure?() }
     @objc private func openFailureReportsPressed() { onOpenFailureReports?() }
     @objc private func cancelPendingCompletionPressed() { onCancelPendingCompletion?() }
+    @objc private func endFinalizationWaitPressed() { onEndFinalizationWait?() }
 
     private func updateRecordMenuItem() {
         let isStopping: Bool
@@ -296,8 +310,16 @@ final class StatusMenuController: NSObject {
             recordMenuItem?.title = "停止录音"
             isStopping = false
         case .stopping:
-            recordMenuItem?.title = "收尾中…"
+            recordMenuItem?.title = "正在整理文字…"
             isStopping = true
+            endFinalizationMenuItem?.isHidden = false
+        case .stoppingUnresponsive:
+            recordMenuItem?.title = "识别无进展，仍在等待…"
+            isStopping = true
+            endFinalizationMenuItem?.isHidden = false
+        }
+        if sessionState != .stopping && sessionState != .stoppingUnresponsive {
+            endFinalizationMenuItem?.isHidden = true
         }
         recordMenuItem?.isEnabled = !isStopping
     }
@@ -312,10 +334,12 @@ final class StatusMenuController: NSObject {
         let isCapturing = displaySnapshot?.isCapturing ?? false
         switch (menuBarDisplayMode, currentState, isCapturing) {
         case (.timer, .connecting, true), (.timer, .listening, true),
-             (.timer, .recovering, true), (.timer, .stopping, true):
+             (.timer, .recovering, true), (.timer, .stopping, true),
+             (.timer, .stoppingUnresponsive, true):
             interval = 0.25
         case (.waveform, .connecting, true), (.waveform, .listening, true),
-             (.waveform, .recovering, true), (.waveform, .stopping, true):
+             (.waveform, .recovering, true), (.waveform, .stopping, true),
+             (.waveform, .stoppingUnresponsive, true):
             interval = 1.0 / 30
         default:
             interval = nil

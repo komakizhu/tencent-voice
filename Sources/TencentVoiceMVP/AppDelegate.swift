@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let coordinator: SessionCoordinator
     private let sessionLogger: SessionLogger
     private let failureContext: InputFailureContextRecorder
+    private let asrFinalizationEvidenceBuffer: ASRFinalizationEvidenceBuffer
     private let diagnosticWindowFrameRecorder: DiagnosticWindowFrameRecorder
     private var failureReportTasks: [UUID: Task<Void, Never>] = [:]
     private var diagnosticReportInProgress = false
@@ -50,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let rimeThemeStore = RimeThemeStore()
         let permissionChecker = SystemPrivacyPermissionChecker()
         let failureContext = InputFailureContextRecorder()
+        let asrFinalizationEvidenceBuffer = ASRFinalizationEvidenceBuffer()
         let diagnosticWindowFrameRecorder = DiagnosticWindowFrameRecorder()
         diagnosticWindowFrameRecorder.setCaptureEnabled(settingsStore.load().captureDiagnosticWindowFrames)
         let sessionLogger = SessionLogger(enabled: { settingsStore.load().saveTextLogs })
@@ -102,6 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.rimeLocalDirectory = localRimeDirectory
         self.sessionLogger = sessionLogger
         self.failureContext = failureContext
+        self.asrFinalizationEvidenceBuffer = asrFinalizationEvidenceBuffer
         self.diagnosticWindowFrameRecorder = diagnosticWindowFrameRecorder
         sessionLogger.evidenceObserver = { [weak failureContext, weak sessionLogger] entry in
             guard let sessionLogger else { return }
@@ -137,6 +140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 menu.update(pendingCompletion: pending)
                 menu.update(status: pending ? "已停止录音，等待返回补齐" : "就绪")
             },
+            finalizationEvidenceRecorder: { asrFinalizationEvidenceBuffer.makeRecorder() },
             onStateChange: { state in
                 let diagnosticState: String = switch state {
                 case .idle: "idle"
@@ -144,6 +148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 case .listening: "listening"
                 case .recovering: "recovering"
                 case .stopping: "stopping"
+                case .stoppingUnresponsive: "stopping_unresponsive"
                 case .error: "error"
                 }
                 sessionLogger.recordDiagnosticAction("session_state_changed", fields: [
@@ -154,14 +159,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 case .connecting: menu.update(status: "连接中…")
                 case .listening: menu.update(status: "录音中…")
                 case .recovering: menu.update(status: "麦克风恢复中…")
-                case .stopping: menu.update(status: "收尾中…")
+                case .stopping: menu.update(status: "录音已停止，正在整理文字")
+                case .stoppingUnresponsive: menu.update(status: "录音已停止，识别尚未确认完成")
                 case let .error(message): menu.update(status: "错误：\(message)")
                 }
                 switch state {
                 case .idle, .error:
                     diagnosticWindowFrameRecorder.sessionEnded()
                     failureContext.sessionEnded()
-                case .stopping:
+                case .stopping, .stoppingUnresponsive:
                     diagnosticWindowFrameRecorder.sessionEnded()
                 case .connecting, .listening, .recovering:
                     break
@@ -172,9 +178,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         coordinator.setStateObserver { [weak self] state in
             guard let self else { return }
             menu.update(recordingState: state)
-            guard case .error = state else { return }
-            self.endTrackedUsageSession()
-            self.updateLocalUsageDisplay()
+            switch state {
+            case .stopping, .stoppingUnresponsive, .error:
+                // The stopping notification is delivered after audio.stop().
+                self.endTrackedUsageSession()
+                self.updateLocalUsageDisplay()
+            default:
+                break
+            }
         }
     }
 
@@ -195,6 +206,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Task { @MainActor [weak self] in
                     await self?.toggleRecording()
                 }
+            },
+            onEndFinalizationWait: { [weak self] in
+                self?.coordinator.endFinalizationWaitPreservingText()
             },
             onToggleAutoStart: { [weak self] in
                 self?.toggleAutoStart()
@@ -296,6 +310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        asrFinalizationEvidenceBuffer.setEnabled(false)
         failureContext.stop()
         failureReportTasks.values.forEach { $0.cancel() }
         failureReportTasks.removeAll()
@@ -612,6 +627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func applyFailureContextSetting() {
         let enabled = failureContextDefaults.bool(forKey: "inputFailureContextEnabled")
         failureContext.setEnabled(enabled)
+        asrFinalizationEvidenceBuffer.setEnabled(enabled)
         sessionLogger.setFailureContextEnabled(enabled)
         failureContext.configureDiagnosticCollection(
             failureContextEnabled: enabled,
@@ -636,6 +652,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let reportID = UUID()
         let now = Date()
         let requestedAtMonotonicNanoseconds = DispatchTime.now().uptimeNanoseconds
+        let asrFinalizationEvidenceSnapshot = asrFinalizationEvidenceBuffer.exportToken(at: now)
         menu.update(failureReportResult: "正在整理最近一分钟的完整诊断…")
         let snapshotStarted = requestedAtMonotonicNanoseconds
         let windowStart = now.addingTimeInterval(-60)
@@ -740,7 +757,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     )
                 }.value
                 let preliminaryReport = InputFailureReport(
-                    schemaVersion: 7,
+                    schemaVersion: 8,
                     id: reportID,
                     generatedAt: now,
                     desktopContext: context,
@@ -758,50 +775,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     firstFailure: scopedFailureEvidence.1,
                     axReadEvidence: axReadEvidence,
                     evidenceScopeNote: "主时间线严格限定为点击前60秒；另附最近故障点之前60秒的关联快照（若早于主窗口则会标注原始时间）。采集未开启、截断、权限不足、节流或读取失败时，报告会标明缺口。键盘事件提交、AX调用返回和AX通知都不证明编辑器已实际执行；AX证据不代表页面DOM或屏幕状态。新增AX调用证据只记录输入、周期、操作和窗口监测来源、属性名、单调时钟、返回码、目标进程绑定、会话/操作代次和调用耗时，不保存属性值、原始AX标识、网页文字、音频、标题或地址。Safari与Codex编辑器重建诊断记录首次身份依据是否保存、恢复比较的失败条件、扫描路径、属性错误码、候选数、操作状态和事件原始时间；对象代次和扫描编号只用于本次会话内关联。诊断沿用“输入失败上下文”和“自动保存诊断日志”两个现有开关；任一开启时记录本项诊断，全部关闭后清空未导出的临时身份摘要。只使用现有辅助功能权限，不请求新权限。每次扫描最多250毫秒、单次AX调用超时30毫秒、祖先最多64层、子树最多160个对象。AX调用证据只在内存保留60秒，最多16384条；切换目标进程或会话时清空旧代次，迟到结果丢弃；底层诊断队列最多16条；首次捕获和首次拒绝摘要各一份、每份最多8 KiB；上层目标事件最多4096条或16 MiB，操作背景最多2000条，达到上限时会报告丢失数量。诊断随现有60秒故障窗口保留；已导出的报告保留至用户手动删除。窗口画面采集默认关闭，仅在设置中主动开启后对已确认的前台目标窗口进行短时采集，不包含音频或上传；停止原因会区分窗口数量、窗口编号、焦点读取和窗口信息核对失败。",
-                    windowFrameCapture: frameSnapshot.evidence
+                    windowFrameCapture: frameSnapshot.evidence,
+                    asrFinalizationEvidence: .empty(
+                        enabled: asrFinalizationEvidenceSnapshot.enabledAtRequest,
+                        capturedAt: asrFinalizationEvidenceSnapshot.capturedAt
+                    )
                 )
                 menu.update(failureReportResult: "正在编码并保存报告…")
                 try await Task.detached(priority: .utility) {
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 }.value
-                let encodingStarted = DispatchTime.now().uptimeNanoseconds
-                var data = try await Task.detached(priority: .utility) {
-                    try DiagnosticJSON.encoder().encode(preliminaryReport)
-                }.value
-                var encodingMilliseconds = elapsedMilliseconds(since: encodingStarted)
-                let writingStarted = DispatchTime.now().uptimeNanoseconds
-                let destination: URL
-                if frameSnapshot.assets.isEmpty {
-                    try await Task.detached(priority: .utility) {
-                        try data.write(to: jsonDestination, options: .atomic)
-                    }.value
-                    destination = jsonDestination
-                } else {
-                    do {
-                        try await Task.detached(priority: .utility) {
-                            try DiagnosticWindowFrameArchiveWriter.write(
-                                reportData: data,
-                                snapshot: frameSnapshot,
-                                destination: archiveDestination
-                            )
-                        }.value
-                        destination = archiveDestination
-                    } catch {
-                        let failedEvidence = preliminaryReport.windowFrameCapture?.replacingArchiveStatus("failed")
-                        let fallbackReport = failedEvidence.map(preliminaryReport.replacingWindowFrameCapture)
-                            ?? preliminaryReport
-                        let fallbackEncodingStarted = DispatchTime.now().uptimeNanoseconds
-                        data = try await Task.detached(priority: .utility) {
-                            try DiagnosticJSON.encoder().encode(fallbackReport)
-                        }.value
-                        encodingMilliseconds += elapsedMilliseconds(since: fallbackEncodingStarted)
-                        try await Task.detached(priority: .utility) {
-                            try data.write(to: jsonDestination, options: .atomic)
-                        }.value
-                        destination = jsonDestination
+                let evidenceBuffer = asrFinalizationEvidenceBuffer
+                let exportResult = try await Task.detached(priority: .utility) {
+                    var currentEvidence = evidenceBuffer.currentEvidence(for: asrFinalizationEvidenceSnapshot)
+                    let stagedDestination = directory.appendingPathComponent(".pending-\(reportID.uuidString)")
+                    defer { try? FileManager.default.removeItem(at: stagedDestination) }
+                    while true {
+                        let report = preliminaryReport.replacingASRFinalizationEvidence(currentEvidence)
+                        var encodingMilliseconds = 0.0
+                        let encodingStarted = DispatchTime.now().uptimeNanoseconds
+                        var data = try DiagnosticJSON.encoder().encode(report)
+                        encodingMilliseconds += Double(
+                            DispatchTime.now().uptimeNanoseconds - encodingStarted
+                        ) / 1_000_000
+                        let writingStarted = DispatchTime.now().uptimeNanoseconds
+                        let destination: URL
+                        if frameSnapshot.assets.isEmpty {
+                            try data.write(to: stagedDestination, options: .atomic)
+                            destination = jsonDestination
+                        } else {
+                            do {
+                                try DiagnosticWindowFrameArchiveWriter.write(
+                                    reportData: data,
+                                    snapshot: frameSnapshot,
+                                    destination: stagedDestination
+                                )
+                                destination = archiveDestination
+                            } catch {
+                                let failedEvidence = report.windowFrameCapture?.replacingArchiveStatus("failed")
+                                let fallbackReport = failedEvidence.map(report.replacingWindowFrameCapture)
+                                    ?? report
+                                let fallbackEncodingStarted = DispatchTime.now().uptimeNanoseconds
+                                data = try DiagnosticJSON.encoder().encode(fallbackReport)
+                                encodingMilliseconds += Double(
+                                    DispatchTime.now().uptimeNanoseconds - fallbackEncodingStarted
+                                ) / 1_000_000
+                                try data.write(to: stagedDestination, options: .atomic)
+                                destination = jsonDestination
+                            }
+                        }
+                        let writingMilliseconds = Double(
+                            DispatchTime.now().uptimeNanoseconds - writingStarted
+                        ) / 1_000_000
+                        let published = try evidenceBuffer.publishIfCurrent(
+                            currentEvidence, for: asrFinalizationEvidenceSnapshot
+                        ) {
+                            try FileManager.default.moveItem(at: stagedDestination, to: destination)
+                        }
+                        if published {
+                            return (destination, encodingMilliseconds, writingMilliseconds)
+                        }
+                        // Collection was disabled or the evidence expired during preparation.
+                        // Delete the unpublished artifact and rebuild it without ASR evidence.
+                        try FileManager.default.removeItem(at: stagedDestination)
+                        currentEvidence = nil
                     }
-                }
-                let writingMilliseconds = elapsedMilliseconds(since: writingStarted)
+                }.value
+                let destination = exportResult.0
+                let encodingMilliseconds = exportResult.1
+                let writingMilliseconds = exportResult.2
                 let title = frameSnapshot.assets.isEmpty
                     ? (captureEnabledAtRequest ? "失效报告已保存" : "已保存诊断；采集未开启")
                     : (destination.pathExtension == "zip" ? "失效报告与目标窗口画面已保存" : "已保存 JSON；画面压缩失败")
@@ -1185,34 +1227,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .listening: "listening"
         case .recovering: "recovering"
         case .stopping: "stopping"
+        case .stoppingUnresponsive: "stopping_unresponsive"
         case .error: "error"
         }
-        sessionLogger.recordDiagnosticAction("recording_toggle_requested", fields: [
-            "state": stateName
-        ])
+        if coordinator.state != .listening && coordinator.state != .recovering {
+            sessionLogger.recordDiagnosticAction("recording_toggle_requested", fields: [
+                "state": stateName
+            ])
+        }
         switch coordinator.state {
         case .idle:
             await beginRecording()
         case .connecting:
             coordinator.cancel()
             updateLocalUsageDisplay()
-        case .listening:
-            let endingUsageSessionID = activeUsageSessionID
-            let stoppedAt = Date()
+        case .listening, .recovering:
             try? await coordinator.end()
-            if activeUsageSessionID == endingUsageSessionID {
-                endTrackedUsageSession(at: stoppedAt)
-                updateLocalUsageDisplay()
-            }
-        case .recovering:
-            let endingUsageSessionID = activeUsageSessionID
-            let stoppedAt = Date()
-            try? await coordinator.end()
-            if activeUsageSessionID == endingUsageSessionID {
-                endTrackedUsageSession(at: stoppedAt)
-                updateLocalUsageDisplay()
-            }
-        case .stopping:
+        case .stopping, .stoppingUnresponsive:
             // The stop request is already draining Tencent's final results.
             // A second shortcut must not cancel the transaction and delete text.
             return

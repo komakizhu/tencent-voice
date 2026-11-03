@@ -988,6 +988,7 @@ struct InputFailureReport: Codable, Sendable {
     var axReadEvidence: AXReadEvidenceReport? = nil
     let evidenceScopeNote: String?
     var windowFrameCapture: DiagnosticWindowFrameEvidence? = nil
+    var asrFinalizationEvidence: ASRFinalizationEvidence? = nil
 
     func replacingDiagnosticReport(_ diagnosticReport: DiagnosticReport) -> Self {
         Self(
@@ -1002,7 +1003,8 @@ struct InputFailureReport: Codable, Sendable {
             firstFailure: firstFailure,
             axReadEvidence: axReadEvidence,
             evidenceScopeNote: evidenceScopeNote,
-            windowFrameCapture: windowFrameCapture
+            windowFrameCapture: windowFrameCapture,
+            asrFinalizationEvidence: asrFinalizationEvidence
         )
     }
 
@@ -1019,7 +1021,26 @@ struct InputFailureReport: Codable, Sendable {
             firstFailure: firstFailure,
             axReadEvidence: axReadEvidence,
             evidenceScopeNote: evidenceScopeNote,
-            windowFrameCapture: evidence
+            windowFrameCapture: evidence,
+            asrFinalizationEvidence: asrFinalizationEvidence
+        )
+    }
+
+    func replacingASRFinalizationEvidence(_ evidence: ASRFinalizationEvidence?) -> Self {
+        Self(
+            schemaVersion: schemaVersion,
+            id: id,
+            generatedAt: generatedAt,
+            desktopContext: desktopContext,
+            diagnosticReport: diagnosticReport,
+            diagnosticEventsTruncated: diagnosticEventsTruncated,
+            latestFailure: latestFailure,
+            sessionEvidenceSummaries: sessionEvidenceSummaries,
+            firstFailure: firstFailure,
+            axReadEvidence: axReadEvidence,
+            evidenceScopeNote: evidenceScopeNote,
+            windowFrameCapture: windowFrameCapture,
+            asrFinalizationEvidence: evidence
         )
     }
 }

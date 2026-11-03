@@ -118,8 +118,12 @@ final class AppSmokeTests: XCTestCase {
             isCapturing: false
         )
         controller.update(recordingState: .stopping)
-        XCTAssertEqual(menu.items.first { $0.title == "收尾中…" }?.title, "收尾中…")
-        XCTAssertFalse(menu.items.first { $0.title == "收尾中…" }?.isEnabled ?? true)
+        XCTAssertEqual(menu.items.first { $0.title == "正在整理文字…" }?.title, "正在整理文字…")
+        XCTAssertFalse(menu.items.first { $0.title == "正在整理文字…" }?.isEnabled ?? true)
+        XCTAssertFalse(menu.items.first { $0.title == "结束等待，保留已有文字" }?.isHidden ?? true)
+        controller.update(recordingState: .stoppingUnresponsive)
+        XCTAssertFalse(menu.items.first { $0.title == "识别无进展，仍在等待…" }?.isEnabled ?? true)
+        XCTAssertFalse(menu.items.first { $0.title == "结束等待，保留已有文字" }?.isHidden ?? true)
         controller.update(menuBarDisplayMode: .timer)
         XCTAssertEqual(controller.statusButtonImageStyle, .application)
         XCTAssertEqual(controller.statusButtonTitle, "")
@@ -131,6 +135,7 @@ final class AppSmokeTests: XCTestCase {
         XCTAssertEqual(controller.statusButtonTitle, "")
         XCTAssertEqual(controller.statusButtonAccessibilityLabel, "Rime Voice，已就绪")
         XCTAssertEqual(menu.items.first { $0.title == "开始录音" }?.title, "开始录音")
+        XCTAssertTrue(menu.items.first { $0.title == "结束等待，保留已有文字" }?.isHidden ?? false)
     }
 
     func testStatusMenuShowsSeparateStoppedPendingCompletionAndCancelAction() {

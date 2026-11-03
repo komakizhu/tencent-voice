@@ -220,7 +220,10 @@ final class FakeRealtimeASRClient: RealtimeASRClient {
     private(set) var startedConfiguration: TencentSessionConfiguration?
     private(set) var eventOrder: [String] = []
     var finishCompletesStream = true
+    var finishError: Error?
     var sendAudioDelayNanoseconds: UInt64 = 0
+    var sendAudioOperation: (() async throws -> Void)?
+    var finishOperation: (() async throws -> Void)?
 
     func start(configuration: TencentSessionConfiguration) async throws -> AsyncThrowingStream<ASRUpdate, Error> {
         startedConfiguration = configuration
@@ -230,6 +233,7 @@ final class FakeRealtimeASRClient: RealtimeASRClient {
     }
 
     func sendAudio(_ data: Data) async throws {
+        try await sendAudioOperation?()
         if sendAudioDelayNanoseconds > 0 {
             try await Task.sleep(nanoseconds: sendAudioDelayNanoseconds)
         }
@@ -237,10 +241,16 @@ final class FakeRealtimeASRClient: RealtimeASRClient {
     }
 
     func finish() async throws {
+        let finishingContinuation = continuation
         finishCallCount += 1
         eventOrder.append("finish")
+        try await finishOperation?()
+        if let finishError {
+            throw finishError
+        }
         if finishCompletesStream {
-            finishStream()
+            finishingContinuation?.yield(.streamEnded)
+            finishingContinuation?.finish()
         }
     }
 
@@ -257,8 +267,31 @@ final class FakeRealtimeASRClient: RealtimeASRClient {
         continuation?.finish()
     }
 
+    func closeStreamWithoutFinalSignal() {
+        continuation?.finish()
+    }
+
     func fail(_ error: Error) {
         continuation?.finish(throwing: error)
+    }
+}
+
+final class SuspendedASROperation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    var isWaiting: Bool { lock.withLock { continuation != nil } }
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.withLock { self.continuation = continuation }
+        }
+    }
+    func resume() {
+        let pending = lock.withLock {
+            let pending = continuation
+            continuation = nil
+            return pending
+        }
+        pending?.resume()
     }
 }
 
@@ -271,7 +304,10 @@ final class FakeAudioCapture: AudioCapture {
     private var pendingStarts: [CheckedContinuation<Void, Error>] = []
     private var storedStartCallCount = 0
     private var storedLastSessionID: UUID?
+    private var storedStopCallCount = 0
+    private var isCapturing = false
     var startCallCount: Int { withStateLock { storedStartCallCount } }
+    var stopCallCount: Int { withStateLock { storedStopCallCount } }
     var lastSessionID: UUID? { withStateLock { storedLastSessionID } }
     var dataToEmitOnStop: Data?
     var holdsStarts = false
@@ -297,6 +333,7 @@ final class FakeAudioCapture: AudioCapture {
             levelHandler = onLevel
             eventHandler = onEvent
             storedLastSessionID = sessionID
+            isCapturing = true
             if !shouldHold { storedStartCallCount += 1 }
         }
         if shouldHold {
@@ -310,12 +347,18 @@ final class FakeAudioCapture: AudioCapture {
     }
 
     func stop() {
-        let pending = withStateLock { (dataToEmitOnStop, handler) }
-        if let data = pending.0 { pending.1?(data) }
+        let pending = withStateLock {
+            let pending = (dataToEmitOnStop, handler, isCapturing)
+            isCapturing = false
+            storedStopCallCount += 1
+            return pending
+        }
+        if pending.2, let data = pending.0 { pending.1?(data) }
     }
 
     func emit(_ data: Data) {
-        withStateLock { handler }?(data)
+        let pending = withStateLock { (handler, isCapturing) }
+        if pending.1 { pending.0?(data) }
     }
 
     func emit(_ event: AudioCaptureEvent) {

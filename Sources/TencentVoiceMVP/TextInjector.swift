@@ -385,6 +385,20 @@ final class TextInjector {
 
     var isAwaitingTargetReturn: Bool { mode == .pausedTarget }
 
+    /// Only acknowledging writers can establish that the target accepted the final text.
+    /// Legacy synchronous dispatch alone is not a write receipt.
+    var finalTextWriteConfirmed: Bool {
+        switch mode {
+        case .ax: return axWriter.map { !$0.hasPendingWork } ?? false
+        case .keyboardLiveTail: return keyboardWriter.map { !$0.hasPendingWork } ?? false
+        case .inactive, .safeCopy, .pausedTarget: return false
+        }
+    }
+
+    func hasCopiedFinalText(_ text: String) -> Bool {
+        !text.isEmpty && lastCopiedText == text
+    }
+
     /// Rechecks the captured target and writes only the latest, still-unconfirmed
     /// transcript. It never replays an operation already accepted by the writer.
     func resumeTargetIfAvailable() -> Bool {

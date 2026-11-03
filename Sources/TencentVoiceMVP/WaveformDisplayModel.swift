@@ -31,7 +31,7 @@ struct StatusButtonPresentation: Equatable {
         let spokenTime = "\(max(0, Int(duration))) 秒"
         let activelyCapturing = isCapturing && {
             switch state {
-            case .connecting, .listening, .recovering, .stopping: return true
+            case .connecting, .listening, .recovering, .stopping, .stoppingUnresponsive: return true
             case .idle, .error: return false
             }
         }()
@@ -41,7 +41,8 @@ struct StatusButtonPresentation: Equatable {
         case .connecting: detail = isCapturing ? "正在连接语音识别" : "准备录音中"
         case .listening: detail = isCapturing ? "正在录音" : "录音已暂停"
         case .recovering: detail = "麦克风恢复中"
-        case .stopping: detail = "语音收尾中"
+        case .stopping: detail = "录音已停止，正在整理文字"
+        case .stoppingUnresponsive: detail = "录音已停止，识别尚未确认完成"
         case let .error(message): detail = "发生错误：\(message)"
         }
 
@@ -123,7 +124,7 @@ struct WaveformDisplayModel {
         case .idle, .error:
             reset()
             return barLevels
-        case .connecting, .listening, .recovering, .stopping:
+        case .connecting, .listening, .recovering, .stopping, .stoppingUnresponsive:
             break
         }
         if lastSessionID != snapshot.sessionID {

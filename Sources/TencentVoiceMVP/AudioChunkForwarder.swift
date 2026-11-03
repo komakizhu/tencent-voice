@@ -10,9 +10,12 @@ final class AudioChunkForwarder: @unchecked Sendable {
     private let lock = NSLock()
     private let continuation: AsyncStream<(@Sendable () async -> Void)>.Continuation
     private let worker: Task<Void, Never>
+    private let drainGate: DrainGate
     private var accepting = true
 
     init() {
+        let drainGate = DrainGate()
+        self.drainGate = drainGate
         var streamContinuation: AsyncStream<(@Sendable () async -> Void)>.Continuation?
         let stream = AsyncStream<(@Sendable () async -> Void)> { continuation in
             streamContinuation = continuation
@@ -20,8 +23,10 @@ final class AudioChunkForwarder: @unchecked Sendable {
         continuation = streamContinuation!
         worker = Task {
             for await operation in stream {
+                if Task.isCancelled { break }
                 await operation()
             }
+            drainGate.resolve()
         }
     }
 
@@ -47,7 +52,7 @@ final class AudioChunkForwarder: @unchecked Sendable {
     }
 
     func drain() async {
-        await worker.value
+        await drainGate.wait()
     }
 
     func cancel() {
@@ -56,5 +61,38 @@ final class AudioChunkForwarder: @unchecked Sendable {
         continuation.finish()
         worker.cancel()
         lock.unlock()
+        drainGate.resolve()
+    }
+}
+
+private final class DrainGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isResolved = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if isResolved {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            waiters.append(continuation)
+            lock.unlock()
+        }
+    }
+
+    func resolve() {
+        lock.lock()
+        guard !isResolved else {
+            lock.unlock()
+            return
+        }
+        isResolved = true
+        let pending = waiters
+        waiters.removeAll(keepingCapacity: false)
+        lock.unlock()
+        pending.forEach { $0.resume() }
     }
 }

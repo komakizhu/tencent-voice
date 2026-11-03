@@ -93,7 +93,7 @@ final class StatusMenuBarDisplayTests: XCTestCase {
                 XCTAssertEqual(controller.statusButtonTitle, "")
                 XCTAssertEqual(renderButton(button).tiffRepresentation, ready, "未采集时必须直接显示未录音样式")
             }
-            for state in [SessionState.connecting, .listening, .recovering, .stopping] {
+            for state in [SessionState.connecting, .listening, .recovering, .stopping, .stoppingUnresponsive] {
                 snapshot = makeSnapshot(state: state, isCapturing: true)
                 controller.update(recordingState: state)
                 let expected: StatusButtonImageStyle
@@ -258,7 +258,7 @@ final class StatusMenuBarDisplayTests: XCTestCase {
             let expected = try XCTUnwrap(renderButton(reference).tiffRepresentation)
             for mode in MenuBarDisplayMode.allCases {
                 controller.update(menuBarDisplayMode: mode)
-                for state in [SessionState.idle, .connecting, .recovering, .stopping] {
+                for state in [SessionState.idle, .connecting, .recovering, .stopping, .stoppingUnresponsive] {
                     snapshot = makeSnapshot(state: state, isCapturing: false)
                     controller.update(recordingState: state)
                     XCTAssertEqual(button.image?.size, original.size)
@@ -275,7 +275,9 @@ final class StatusMenuBarDisplayTests: XCTestCase {
             .deletingLastPathComponent().appendingPathComponent("Resources/brand-kit-graphite/statusbar-matched.png")
     }
 
-    private var states: [SessionState] { [.idle, .connecting, .listening, .recovering, .stopping, .error("failure")] }
+    private var states: [SessionState] {
+        [.idle, .connecting, .listening, .recovering, .stopping, .stoppingUnresponsive, .error("failure")]
+    }
 
     private func makeSnapshot(
         state: SessionState = .listening, isCapturing: Bool = true,

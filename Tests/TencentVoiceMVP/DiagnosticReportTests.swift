@@ -62,6 +62,7 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertNil(decoded.desktopContext.recordingStartedAtMonotonicNanoseconds)
         XCTAssertNil(decoded.desktopContext.events.first?.monotonicTimestampNanoseconds)
         XCTAssertNil(decoded.desktopContext.events.first?.sessionID)
+        XCTAssertNil(decoded.asrFinalizationEvidence)
     }
 
     func testInputFailureReportCarriesAXReadEvidenceWithoutSensitiveValues() throws {
@@ -102,6 +103,86 @@ final class DiagnosticReportTests: XCTestCase {
         XCTAssertEqual(decoded.axReadEvidence?.samples.count, 1)
         XCTAssertEqual(decoded.axReadEvidence?.samples.first?.status, -25204)
         XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("AXValue"))
+    }
+
+    func testInputFailureReportCopiesRetainASRFinalizationEvidence() throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let evidence = ASRFinalizationEvidence(
+            enabled: true,
+            scopeNote: ASRFinalizationEvidence.scopeDescription,
+            capturedAt: timestamp,
+            coverageStartedAt: timestamp.addingTimeInterval(-10),
+            coverageEndedAt: timestamp,
+            maximumRetentionSeconds: 1_800,
+            maximumEventCount: 2_048,
+            maximumByteCount: 512 * 1_024,
+            omittedEventCount: 0,
+            summarySessionID: nil,
+            audioUploadCompleted: true,
+            serviceConfirmedComplete: false,
+            textDeliveryStatus: .safeCopy,
+            events: []
+        )
+        let report = InputFailureReport(
+            schemaVersion: 8,
+            id: UUID(),
+            generatedAt: timestamp,
+            desktopContext: InputContextWindow(
+                requestedStart: timestamp.addingTimeInterval(-60),
+                recordingStartedAt: nil,
+                capturedAt: timestamp,
+                enabled: false,
+                droppedEventCount: 0,
+                events: []
+            ),
+            diagnosticReport: DiagnosticReport(
+                app: appInfo(),
+                permissions: PrivacyPermissionReport(statuses: []),
+                credentials: DiagnosticCredentialInfo(state: .configured, detail: "configured"),
+                settings: DiagnosticSettingsInfo(
+                    shortcut: "test",
+                    engineModelType: "test",
+                    persistentSessionLogEnabled: false
+                ),
+                events: [],
+                logDirectoryPath: "/tmp/logs"
+            ),
+            diagnosticEventsTruncated: false,
+            evidenceScopeNote: "test",
+            asrFinalizationEvidence: evidence
+        )
+
+        let decoded = try DiagnosticJSON.decoder().decode(
+            InputFailureReport.self,
+            from: DiagnosticJSON.encoder().encode(report.replacingDiagnosticReport(report.diagnosticReport))
+        )
+        let replacedWindow = try XCTUnwrap(
+            decoded.replacingWindowFrameCapture(DiagnosticWindowFrameEvidence(
+                enabled: false,
+                status: "disabled",
+                permissionGranted: false,
+                sessionID: nil,
+                targetPID: nil,
+                targetBundleIdentifier: nil,
+                targetWindowID: nil,
+                startedAt: nil,
+                stoppedAt: timestamp,
+                maximumFramesPerSecond: 0,
+                ringDurationSeconds: 0,
+                memoryLimitBytes: 0,
+                ringMemoryLimitBytes: 0,
+                retainedFrameCount: 0,
+                droppedFrameCount: 0,
+                retainedBytes: 0,
+                frames: [],
+                archiveStatus: "disabled"
+            ))
+                .asrFinalizationEvidence
+        )
+        XCTAssertEqual(decoded.schemaVersion, 8)
+        XCTAssertEqual(decoded.asrFinalizationEvidence?.events.count, 0)
+        XCTAssertEqual(replacedWindow.serviceConfirmedComplete, false)
+        XCTAssertEqual(replacedWindow.textDeliveryStatus, .safeCopy)
     }
 
     func testReportExplainsSafariContinuityScanFailureAndRendersAXStatus() {

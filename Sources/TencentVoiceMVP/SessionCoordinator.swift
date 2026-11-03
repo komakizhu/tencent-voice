@@ -8,6 +8,7 @@ enum SessionState: Equatable, Sendable {
     case listening
     case recovering
     case stopping
+    case stoppingUnresponsive
     case error(String)
 }
 
@@ -18,6 +19,7 @@ enum SessionError: Error, LocalizedError {
     case busy
     case cancelled
     case recognitionEnded
+    case finalizationIncomplete
 
     var errorDescription: String? {
         switch self {
@@ -27,8 +29,16 @@ enum SessionError: Error, LocalizedError {
         case .busy: return "上一段语音还没有结束"
         case .cancelled: return "语音会话已取消"
         case .recognitionEnded: return "识别连接意外结束，录音已停止；已收到的文字已保留，请重新开始录音"
+        case .finalizationIncomplete: return "录音已停止，但最后的识别尚未确认完成；已收到的文字已保留"
         }
     }
+}
+
+private enum ASRFinalizationOutcome: Equatable {
+    case completed
+    case failed(String)
+    case userEnded
+    case cancelled
 }
 
 private enum ASRFinalizationPhase: String {
@@ -55,6 +65,8 @@ final class SessionCoordinator: SessionCoordinating {
         let deadlineNanoseconds: UInt64
         let finalText: String
         let injector: TextInjector
+        let evidenceStartedAt: UInt64
+        let evidenceRecorder: @Sendable (ASRFinalizationEvidenceEvent) -> Void
     }
 
     private static let pendingCompletionWindowNanoseconds: UInt64 = 60_000_000_000
@@ -67,18 +79,16 @@ final class SessionCoordinator: SessionCoordinating {
     private let onSessionStart: (UUID) -> Void
     private let onStateChange: (SessionState) -> Void
     private let onPendingCompletionChange: (Bool) -> Void
+    private var onFinalizationEvidence: @Sendable (ASRFinalizationEvidenceEvent) -> Void
+    private let finalizationEvidenceRecorder: (() -> @Sendable (ASRFinalizationEvidenceEvent) -> Void)?
     private var stateObserver: ((SessionState) -> Void)?
-    private(set) var state: SessionState = .idle {
-        didSet {
-            onStateChange(state)
-            stateObserver?(state)
-        }
-    }
+    private(set) var state: SessionState = .idle
 
     private var injector: TextInjector?
     private var prebuffer: AudioPrebuffer?
     private var audioForwarder: AudioChunkForwarder?
     private var eventTask: Task<Void, Never>?
+    private var finishTask: Task<Void, Never>?
     private var progressTask: Task<Void, Never>?
     private var pendingCompletionTask: Task<Void, Never>?
     private var pendingKeyboardCompletion: PendingKeyboardCompletion?
@@ -91,7 +101,16 @@ final class SessionCoordinator: SessionCoordinating {
     private var asrReady = false
     private var audioRecovering = false
     private var sessionID: UUID?
-    private let finishTimeoutNanoseconds: UInt64
+    private let finalizationWarningNanoseconds: UInt64
+    private let finalizationClock: KeyboardPacingClock
+    private var finalizationOutcome: ASRFinalizationOutcome?
+    private var finalizationContinuation: CheckedContinuation<ASRFinalizationOutcome, Never>?
+    private var finalizationWarningTask: Task<Void, Never>?
+    private var finalizationProgressGeneration: UInt64 = 0
+    private var finalizationFinishSentSuccessfully = false
+    private var finalizationOperationGeneration: UInt64?
+    private var finalizationAudioUploadCompleted = false
+    private var sessionStartedAtUptimeNanoseconds: UInt64?
     private let keyboardSmoothing: KeyboardSmoothingConfiguration
     private let pacingClock: KeyboardPacingClock
     private let monotonicNow: () -> UInt64
@@ -107,12 +126,15 @@ final class SessionCoordinator: SessionCoordinating {
         settingsStore: SettingsStore,
         credentialStore: CredentialStore,
         logger: SessionLogger? = nil,
-        finishTimeoutNanoseconds: UInt64 = 3_000_000_000,
+        finalizationWarningNanoseconds: UInt64 = 30_000_000_000,
         keyboardSmoothing: KeyboardSmoothingConfiguration = .live,
         pacingClock: KeyboardPacingClock? = nil,
+        finalizationClock: KeyboardPacingClock? = nil,
         monotonicNow: @escaping () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
         onSessionStart: @escaping (UUID) -> Void = { _ in },
         onPendingCompletionChange: @escaping (Bool) -> Void = { _ in },
+        onFinalizationEvidence: @escaping @Sendable (ASRFinalizationEvidenceEvent) -> Void = { _ in },
+        finalizationEvidenceRecorder: (() -> @Sendable (ASRFinalizationEvidenceEvent) -> Void)? = nil,
         onStateChange: @escaping (SessionState) -> Void
     ) {
         self.asr = asr
@@ -121,12 +143,15 @@ final class SessionCoordinator: SessionCoordinating {
         self.settingsStore = settingsStore
         self.credentialStore = credentialStore
         self.logger = logger ?? SessionLogger(enabled: { false })
-        self.finishTimeoutNanoseconds = finishTimeoutNanoseconds
+        self.finalizationWarningNanoseconds = finalizationWarningNanoseconds
         self.keyboardSmoothing = keyboardSmoothing
         self.pacingClock = pacingClock ?? ContinuousKeyboardPacingClock()
+        self.finalizationClock = finalizationClock ?? ContinuousKeyboardPacingClock()
         self.monotonicNow = monotonicNow
         self.onSessionStart = onSessionStart
         self.onPendingCompletionChange = onPendingCompletionChange
+        self.onFinalizationEvidence = onFinalizationEvidence
+        self.finalizationEvidenceRecorder = finalizationEvidenceRecorder
         self.onStateChange = onStateChange
     }
 
@@ -135,9 +160,16 @@ final class SessionCoordinator: SessionCoordinating {
         cancelPendingCompletion(reason: "new_recording_started")
         operationGeneration &+= 1
         let id = UUID()
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        sessionStartedAtUptimeNanoseconds = startedAt
+        if let finalizationEvidenceRecorder {
+            onFinalizationEvidence = finalizationEvidenceRecorder()
+        }
+        finalizationAudioUploadCompleted = false
         sessionID = id
         onSessionStart(id)
         setState(.connecting)
+        recordFinalizationEvidence(kind: .sessionStarted, stage: .recording)
         do {
             guard let credentials = try credentialStore.load() else {
                 throw SessionError.credentialsMissing
@@ -180,6 +212,8 @@ final class SessionCoordinator: SessionCoordinating {
             let buffer = AudioPrebuffer()
             let forwarder = AudioChunkForwarder()
             let progress = AudioPipelineProgress()
+            let evidenceRecorder = onFinalizationEvidence
+            let evidenceOperationGeneration = operationGeneration
             audioProgress = progress
             prebuffer = buffer
             audioForwarder = forwarder
@@ -188,6 +222,23 @@ final class SessionCoordinator: SessionCoordinating {
                 onChunk: { [weak self, weak buffer] chunk in
                 guard let buffer else { return }
                 progress.captured(pcm: chunk)
+                let now = DispatchTime.now().uptimeNanoseconds
+                evidenceRecorder(ASRFinalizationEvidenceEvent(
+                    recordedAt: Date(),
+                    elapsedMilliseconds: now >= startedAt ? (now - startedAt) / 1_000_000 : 0,
+                    sessionID: id,
+                    operationGeneration: evidenceOperationGeneration,
+                    kind: .audioCaptured,
+                    stage: .recording,
+                    audioProgress: progress.finalizationEvidenceSnapshot(),
+                    recognitionSequence: nil,
+                    recognitionPhase: nil,
+                    recognizedCharacterCount: nil,
+                    finalSignalReceived: nil,
+                    failureCategory: nil,
+                    errorCode: nil,
+                    textDeliveryStatus: nil
+                ))
                 forwarder.submit { [weak self, weak buffer] in
                     guard let buffer else { return }
                     do {
@@ -218,10 +269,28 @@ final class SessionCoordinator: SessionCoordinating {
             guard sessionID == id,
                   state == .connecting || state == .recovering || state == .listening
             else { throw SessionError.cancelled }
-            try await buffer.attach { [weak self, asr] chunk in
+            try await buffer.attach { [weak self, asr, evidenceRecorder] chunk in
                 do {
                     try await asr.sendAudio(chunk)
                     progress.uploaded(byteCount: chunk.count)
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    evidenceRecorder(ASRFinalizationEvidenceEvent(
+                        recordedAt: Date(),
+                        elapsedMilliseconds: now >= startedAt ? (now - startedAt) / 1_000_000 : 0,
+                        sessionID: id,
+                        operationGeneration: evidenceOperationGeneration,
+                        kind: .audioUploaded,
+                        stage: .uploadingTail,
+                        audioProgress: progress.finalizationEvidenceSnapshot(),
+                        recognitionSequence: nil,
+                        recognitionPhase: nil,
+                        recognizedCharacterCount: nil,
+                        finalSignalReceived: nil,
+                        failureCategory: nil,
+                        errorCode: nil,
+                        textDeliveryStatus: nil
+                    ))
+                    await self?.noteFinalizationProgress(sessionID: id, reason: "audio_uploaded")
                 } catch {
                     await self?.handleAudioError(error, sessionID: id)
                     throw error
@@ -291,7 +360,7 @@ final class SessionCoordinator: SessionCoordinating {
             cancel()
             return
         }
-        guard state != .stopping else { return }
+        guard state != .stopping, state != .stoppingUnresponsive else { return }
         // Startup still owns setup until the connection and prebuffer are ready.
         // Do not run graceful end concurrently with cancelled-start cleanup.
         guard asrReady else {
@@ -303,58 +372,63 @@ final class SessionCoordinator: SessionCoordinating {
             return
         }
         let stopRequestedAtNanoseconds = monotonicNow()
-        setState(.stopping)
+        let evidenceStartedAt = sessionStartedAtUptimeNanoseconds ?? DispatchTime.now().uptimeNanoseconds
+        let evidenceRecorder = onFinalizationEvidence
+        let endingOperationGeneration = operationGeneration
+        // Set the guard immediately, but notify observers only after capture stops.
+        state = .stopping
         asrFinalizationPhase = .finalizing
+        finalizationOperationGeneration = endingOperationGeneration
+        let currentAudioForwarder = audioForwarder
+        // Stop input before logging, target reconciliation, or any async work.
+        audio.stop()
+        audioProgress?.setCapturing(false)
+        setState(.stopping)
+        startFinalizationProgressWatch(endingSessionID)
+        recordFinalizationEvidence(kind: .stopRequested, stage: .stoppingCapture)
+        stateObserver?(state)
         log(event: "stop_requested")
+        log(event: "audio_capture_stop_requested")
         injector?.beginFinalization()
         log(event: "asr_finalization_started")
         logDegradationIfNeeded(projection: latestProjection)
-        let currentAudioForwarder = audioForwarder
-        audio.stop()
-        log(event: "audio_capture_stop_requested")
-        audioProgress?.setCapturing(false)
         // AudioCapture.stop() synchronously flushes the final partial PCM chunk.
-        // Publish the refreshed counters while the finalizing state is still visible.
-        stateObserver?(state)
+        // Drain every callback accepted before stop before sending the end marker.
         currentAudioForwarder?.stopAccepting()
         await currentAudioForwarder?.drain()
+        guard isCurrentFinalization(sessionID: endingSessionID, operationGeneration: endingOperationGeneration),
+              state == .stopping || state == .stoppingUnresponsive
+        else { return }
         log(event: "audio_capture_drained")
-        var finishTask: Task<Void, Never>?
-        if !finishSent {
-            finishSent = true
-            log(event: "asr_finish_requested")
-            // Sending the end marker must not block the UI if the socket is stuck.
-            finishTask = Task { [asr] in try? await asr.finish() }
-        }
-
-        var streamCompleted = true
-        if let eventTask {
-            streamCompleted = await waitForEventTask(
-                eventTask,
-                timeoutNanoseconds: finishTimeoutNanoseconds
+        if finalizationOutcome == nil {
+            finalizationAudioUploadCompleted = true
+            recordFinalizationEvidence(kind: .audioUploadCompleted, stage: .waitingForService)
+        } else if !finalizationAudioUploadCompleted {
+            recordFinalizationEvidence(
+                kind: .audioUploadIncomplete,
+                stage: finalizationOutcome == .userEnded ? .userEnded : .failed
             )
-            if !streamCompleted {
-                eventTask.cancel()
-                asr.cancel()
-                log(event: "finish_timeout")
-                log(event: "asr_finalization_timeout")
-            } else if asrStreamEnded {
-                log(event: "asr_finalization_stream_ended")
-            }
         }
-        finishTask?.cancel()
+        let finalizationOutcome = await waitForASRFinalization(
+            sessionID: endingSessionID,
+            operationGeneration: endingOperationGeneration
+        )
 
-        guard sessionID == endingSessionID, state == .stopping else { return }
+        guard isCurrentFinalization(sessionID: endingSessionID, operationGeneration: endingOperationGeneration),
+              state == .stopping || state == .stoppingUnresponsive
+        else { return }
 
         let finalCompletionText = latestProjection?.text ?? ""
         var injectorAwaitingTargetReturn: TextInjector?
+        var visibleError: String?
+        var textDeliveryStatus: ASRFinalizationEvidenceEvent.TextDeliveryStatus = .notAttempted
         if let injector {
             do {
                 try await injector.finish(finalText: finalCompletionText)
-                asrFinalizationPhase = .finalized
-                logDegradationIfNeeded(projection: latestProjection)
-                log(event: streamCompleted ? "finished" : "finished_timeout", projection: latestProjection)
+                guard isCurrentFinalization(sessionID: endingSessionID, operationGeneration: endingOperationGeneration)
+                else { return }
                 if injector.isAwaitingTargetReturn {
+                    textDeliveryStatus = .waitingForTarget
                     injectorAwaitingTargetReturn = injector
                     logger.recordDiagnosticAction(
                         "input_waiting_for_target_return",
@@ -362,24 +436,59 @@ final class SessionCoordinator: SessionCoordinating {
                         fields: ["deadlineMilliseconds": "60000", "operationGeneration": String(operationGeneration)]
                     )
                 } else {
+                    textDeliveryStatus = deliveryStatus(for: injector, finalText: finalCompletionText)
                     injector.cancel()
                 }
             } catch {
+                guard isCurrentFinalization(sessionID: endingSessionID, operationGeneration: endingOperationGeneration)
+                else { return }
                 logDegradationIfNeeded(projection: latestProjection)
                 log(event: "finish_error", error: error)
-                setState(.error(error.localizedDescription))
-                resetSession()
-                throw error
+                visibleError = error.localizedDescription
+                textDeliveryStatus = .failed
             }
         } else {
             injector?.cancel()
         }
+        recordFinalizationEvidence(
+            kind: .textDeliveryResult,
+            stage: .writingText,
+            failureCategory: textDeliveryStatus == .failed ? .textDelivery : nil,
+            textDeliveryStatus: textDeliveryStatus
+        )
+
+        switch finalizationOutcome {
+        case .completed:
+            asrFinalizationPhase = .finalized
+            log(event: "asr_finalization_completed", projection: latestProjection)
+        case let .failed(message):
+            asrFinalizationPhase = .hardStopped
+            visibleError = "录音已停止，收尾未完成：\(message)"
+            log(event: "asr_finalization_error", projection: latestProjection,
+                failureCode: "asr_finalization_incomplete")
+        case .cancelled:
+            asrFinalizationPhase = .hardStopped
+            log(event: "asr_finalization_cancelled", projection: latestProjection)
+        case .userEnded:
+            asrFinalizationPhase = .hardStopped
+            visibleError = SessionError.finalizationIncomplete.localizedDescription
+            log(event: "asr_finalization_user_ended_wait", projection: latestProjection,
+                failureCode: "asr_finalization_user_ended")
+        }
         logAudioProgress()
         asr.cancel()
         await prebuffer?.clear()
+        guard isCurrentFinalization(sessionID: endingSessionID, operationGeneration: endingOperationGeneration)
+        else { return }
         eventTask?.cancel()
+        finalizationWarningTask?.cancel()
+        finalizationWarningTask = nil
         resetSession()
-        setState(.idle)
+        if let visibleError {
+            setState(.error(visibleError))
+        } else {
+            setState(.idle)
+        }
         if let injectorAwaitingTargetReturn {
             let pending = PendingKeyboardCompletion(
                 token: UUID(),
@@ -387,7 +496,9 @@ final class SessionCoordinator: SessionCoordinating {
                 operationGeneration: operationGeneration,
                 deadlineNanoseconds: stopRequestedAtNanoseconds &+ Self.pendingCompletionWindowNanoseconds,
                 finalText: finalCompletionText,
-                injector: injectorAwaitingTargetReturn
+                injector: injectorAwaitingTargetReturn,
+                evidenceStartedAt: evidenceStartedAt,
+                evidenceRecorder: evidenceRecorder
             )
             pendingKeyboardCompletion = pending
             onPendingCompletionChange(true)
@@ -397,6 +508,13 @@ final class SessionCoordinator: SessionCoordinating {
     }
 
     func cancel() {
+        if let sessionID {
+            recordFinalizationEvidence(kind: .sessionCancelled, stage: .cancelled)
+            if !finalizationAudioUploadCompleted {
+                recordFinalizationEvidence(kind: .audioUploadIncomplete, stage: .cancelled)
+            }
+            resolveASRFinalization(.cancelled, sessionID: sessionID)
+        }
         cancelPendingCompletion(reason: "session_cancelled")
         asrFinalizationPhase = .hardStopped
         log(event: "cancel_requested")
@@ -405,6 +523,7 @@ final class SessionCoordinator: SessionCoordinating {
         audio.stop()
         audioProgress?.setCapturing(false)
         asr.cancel()
+        finishTask?.cancel()
         eventTask?.cancel()
         eventTask = nil
         Task { [prebuffer] in await prebuffer?.clear() }
@@ -413,14 +532,37 @@ final class SessionCoordinator: SessionCoordinating {
         setState(.idle)
     }
 
+    func endFinalizationWaitPreservingText() {
+        guard state == .stopping || state == .stoppingUnresponsive,
+              finalizationOutcome == nil, let sessionID else { return }
+        log(event: "asr_finalization_user_ended_wait")
+        recordFinalizationEvidence(kind: .userEndedWait, stage: .userEnded)
+        if !finalizationAudioUploadCompleted {
+            recordFinalizationEvidence(kind: .audioUploadIncomplete, stage: .userEnded)
+        }
+        audioForwarder?.cancel()
+        asr.cancel()
+        finishTask?.cancel()
+        eventTask?.cancel()
+        resolveASRFinalization(.userEnded, sessionID: sessionID)
+    }
+
     private func process(_ update: ASRUpdate, sessionID: UUID) {
         guard self.sessionID == sessionID else { return }
-        guard state == .listening || state == .stopping || state == .recovering else { return }
+        guard finalizationOutcome == nil else { return }
+        guard state == .listening || state == .stopping || state == .stoppingUnresponsive || state == .recovering else { return }
         let recognitionObservedAt = Date()
         let recognitionMonotonic = TextInputDiagnosticClock.milliseconds()
         audioProgress?.receivedRecognitionUpdate()
         if update.isStreamEnded {
             asrStreamEnded = true
+            recordFinalizationEvidence(
+                kind: .serviceFinalSignalReceived,
+                stage: .writingText,
+                update: update,
+                finalSignalReceived: true
+            )
+            noteFinalizationProgress(sessionID: sessionID, reason: "stream_ended")
             if let projection = projectionAccumulator.apply(update) {
                 latestProjection = projection
                 injector?.apply(projection: projection)
@@ -428,19 +570,33 @@ final class SessionCoordinator: SessionCoordinating {
                     recognitionObservation: (recognitionObservedAt, recognitionMonotonic))
                 logDegradationIfNeeded(update: update, projection: projection)
             }
+            resolveCompletedFinalizationIfReady(sessionID: sessionID)
             return
         }
+        recordFinalizationEvidence(
+            kind: .recognitionUpdate,
+            stage: state == .stopping || state == .stoppingUnresponsive ? .waitingForService : .recording,
+            update: update,
+            finalSignalReceived: update.wireFinal
+        )
         guard let projection = projectionAccumulator.apply(update) else {
             discardCount += 1
             log(event: "discarded", update: update, projection: latestProjection,
                 recognitionObservation: (recognitionObservedAt, recognitionMonotonic))
             return
         }
+        let previousProjection = latestProjection
+        let meaningfulProgress = previousProjection?.text != projection.text
+            || previousProjection?.activeSegmentID != projection.activeSegmentID
+            || previousProjection?.isFinal != projection.isFinal
         latestProjection = projection
         injector?.apply(projection: projection)
         log(event: projection.isFinal ? "final" : "partial", update: update, projection: projection,
             recognitionObservation: (recognitionObservedAt, recognitionMonotonic))
         logDegradationIfNeeded(update: update, projection: projection)
+        if meaningfulProgress {
+            noteFinalizationProgress(sessionID: sessionID, reason: projection.isFinal ? "segment_final" : "recognition_changed")
+        }
     }
 
     private var projectionAccumulator = ASRProjectionAccumulator()
@@ -464,6 +620,25 @@ final class SessionCoordinator: SessionCoordinating {
 
     private func handleASRError(_ error: Error, sessionID: UUID? = nil) {
         if let sessionID, self.sessionID != sessionID { return }
+        if state == .stopping || state == .stoppingUnresponsive {
+            if asrStreamEnded,
+               let sessionError = error as? SessionError,
+               case .recognitionEnded = sessionError {
+                return
+            }
+            guard let currentSessionID = self.sessionID else { return }
+            let isUnexpectedClosure = (error as? SessionError).map {
+                if case .recognitionEnded = $0 { return true }
+                return false
+            } ?? false
+            handleFinalizationError(
+                error,
+                sessionID: currentSessionID,
+                kind: isUnexpectedClosure ? .streamClosedWithoutFinal : .receiveFailed,
+                failureCategory: isUnexpectedClosure ? .streamClosedWithoutFinal : .asrReceive
+            )
+            return
+        }
         guard state == .connecting || state == .listening || state == .recovering else { return }
         asrFinalizationPhase = .hardStopped
         audioForwarder?.cancel()
@@ -471,6 +646,12 @@ final class SessionCoordinator: SessionCoordinating {
         audioProgress?.setCapturing(false)
         asr.cancel()
         errorCount += 1
+        recordFinalizationEvidence(
+            kind: .receiveFailed,
+            stage: .failed,
+            failureCategory: .asrReceive,
+            error: error
+        )
         log(event: "error", error: error)
         let finalProjection = latestProjection
         do {
@@ -479,6 +660,11 @@ final class SessionCoordinator: SessionCoordinating {
             errorCount += 1
             log(event: "finish_error", projection: finalProjection, error: error)
         }
+        recordFinalizationEvidence(
+            kind: .textDeliveryResult,
+            stage: .failed,
+            textDeliveryStatus: injector?.modeDescription == "safe_copy" ? .safeCopy : .submittedUnconfirmed
+        )
         logDegradationIfNeeded(projection: finalProjection)
         logAudioProgress()
         let currentPrebuffer = prebuffer
@@ -489,6 +675,17 @@ final class SessionCoordinator: SessionCoordinating {
     }
 
     private func handleAudioError(_ error: Error, sessionID: UUID? = nil) {
+        if state == .stopping || state == .stoppingUnresponsive,
+           let currentSessionID = self.sessionID,
+           sessionID == nil || sessionID == currentSessionID {
+            handleFinalizationError(
+                error,
+                sessionID: currentSessionID,
+                kind: .audioUploadFailed,
+                failureCategory: .audioUpload
+            )
+            return
+        }
         handleASRError(error, sessionID: sessionID)
     }
 
@@ -568,6 +765,7 @@ final class SessionCoordinator: SessionCoordinating {
         audio.stop()
         asr.cancel()
         await prebuffer?.clear()
+        guard sessionID == expectedSessionID else { return }
         eventTask?.cancel()
         eventTask = nil
         injector?.cancel()
@@ -577,6 +775,17 @@ final class SessionCoordinator: SessionCoordinating {
     private func resetSession() {
         progressTask?.cancel()
         progressTask = nil
+        finalizationWarningTask?.cancel()
+        finalizationWarningTask = nil
+        finishTask?.cancel()
+        finishTask = nil
+        finalizationContinuation = nil
+        finalizationOutcome = nil
+        finalizationProgressGeneration = 0
+        finalizationFinishSentSuccessfully = false
+        finalizationOperationGeneration = nil
+        finalizationAudioUploadCompleted = false
+        sessionStartedAtUptimeNanoseconds = nil
         audioProgress = nil
         injector = nil
         prebuffer = nil
@@ -686,6 +895,7 @@ final class SessionCoordinator: SessionCoordinating {
         pendingCompletionTask?.cancel()
         pendingCompletionTask = nil
         pendingKeyboardCompletion = nil
+        recordPendingTextDelivery(pending)
         pending.injector.cancel()
         onPendingCompletionChange(false)
         if sessionID == nil { removeApplicationActivationObserver() }
@@ -701,6 +911,7 @@ final class SessionCoordinator: SessionCoordinating {
             "operationGeneration": String(pending.operationGeneration)
         ])
         pending.injector.cancelPendingCompletion()
+        recordPendingTextDelivery(pending)
         pending.injector.cancel()
         onPendingCompletionChange(false)
         if sessionID == nil { removeApplicationActivationObserver() }
@@ -730,33 +941,220 @@ final class SessionCoordinator: SessionCoordinating {
         log(event: "audio_pipeline_progress", metadata: audioProgress.metadata())
     }
 
-    private func setState(_ newState: SessionState) {
-        state = newState
+    private func deliveryStatus(
+        for injector: TextInjector,
+        finalText: String
+    ) -> ASRFinalizationEvidenceEvent.TextDeliveryStatus {
+        if finalText.isEmpty { return .notAttempted }
+        if injector.isAwaitingTargetReturn { return .waitingForTarget }
+        if injector.modeDescription == "safe_copy" {
+            return injector.hasCopiedFinalText(finalText) ? .safeCopy : .failed
+        }
+        return injector.finalTextWriteConfirmed ? .confirmed : .submittedUnconfirmed
     }
 
-    private func waitForEventTask(
-        _ task: Task<Void, Never>,
-        timeoutNanoseconds: UInt64
-    ) async -> Bool {
-        await withTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                await task.value
-                return true
+    private func recordPendingTextDelivery(_ pending: PendingKeyboardCompletion) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let status = deliveryStatus(for: pending.injector, finalText: pending.finalText)
+        pending.evidenceRecorder(ASRFinalizationEvidenceEvent(
+            recordedAt: Date(),
+            elapsedMilliseconds: now >= pending.evidenceStartedAt ? (now - pending.evidenceStartedAt) / 1_000_000 : 0,
+            sessionID: pending.sessionID,
+            operationGeneration: pending.operationGeneration,
+            kind: .textDeliveryResult,
+            stage: .writingText,
+            audioProgress: nil,
+            recognitionSequence: nil,
+            recognitionPhase: nil,
+            recognizedCharacterCount: pending.finalText.count,
+            finalSignalReceived: nil,
+            failureCategory: status == .failed ? .textDelivery : nil,
+            errorCode: nil,
+            textDeliveryStatus: status
+        ))
+    }
+
+    private func recordFinalizationEvidence(
+        kind: ASRFinalizationEvidenceEvent.Kind,
+        stage: ASRFinalizationEvidenceEvent.Stage,
+        update: ASRUpdate? = nil,
+        finalSignalReceived: Bool? = nil,
+        failureCategory: ASRFinalizationEvidenceEvent.FailureCategory? = nil,
+        error: Error? = nil,
+        textDeliveryStatus: ASRFinalizationEvidenceEvent.TextDeliveryStatus? = nil
+    ) {
+        guard let sessionID, let sessionStartedAtUptimeNanoseconds else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        let errorCode: Int?
+        if let error, case let TencentASRError.server(code, _) = error {
+            errorCode = code
+        } else {
+            errorCode = nil
+        }
+        onFinalizationEvidence(ASRFinalizationEvidenceEvent(
+            recordedAt: Date(),
+            elapsedMilliseconds: now >= sessionStartedAtUptimeNanoseconds
+                ? (now - sessionStartedAtUptimeNanoseconds) / 1_000_000 : 0,
+            sessionID: sessionID,
+            operationGeneration: operationGeneration,
+            kind: kind,
+            stage: stage,
+            audioProgress: audioProgress?.finalizationEvidenceSnapshot(),
+            recognitionSequence: update?.sequence,
+            recognitionPhase: update?.isStreamEnded == true ? nil : update?.phase,
+            recognizedCharacterCount: update?.isStreamEnded == true ? nil : update?.segmentText.count,
+            finalSignalReceived: finalSignalReceived ?? update?.wireFinal,
+            failureCategory: failureCategory,
+            errorCode: errorCode,
+            textDeliveryStatus: textDeliveryStatus
+        ))
+    }
+
+    private func setState(_ newState: SessionState) {
+        state = newState
+        onStateChange(state)
+        stateObserver?(state)
+    }
+
+    private func waitForASRFinalization(
+        sessionID: UUID,
+        operationGeneration: UInt64
+    ) async -> ASRFinalizationOutcome {
+        await withCheckedContinuation { continuation in
+            guard isCurrentFinalization(sessionID: sessionID, operationGeneration: operationGeneration) else {
+                continuation.resume(returning: .cancelled)
+                return
             }
-            group.addTask {
+            if let finalizationOutcome {
+                continuation.resume(returning: finalizationOutcome)
+                return
+            }
+
+            finalizationContinuation = continuation
+            noteFinalizationProgress(sessionID: sessionID, reason: "waiting_for_service")
+            guard !finishSent else { return }
+            finishSent = true
+            recordFinalizationEvidence(kind: .finishMarkerRequested, stage: .waitingForService)
+            log(event: "asr_finish_requested")
+            finishTask = Task { [weak self, asr] in
                 do {
-                    try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                    return false
+                    try await asr.finish()
+                    self?.handleFinishMarkerSent(
+                        sessionID: sessionID,
+                        operationGeneration: operationGeneration
+                    )
                 } catch {
-                    return false
+                    self?.handleFinalizationSendError(
+                        error,
+                        sessionID: sessionID,
+                        operationGeneration: operationGeneration
+                    )
                 }
             }
-            let completed = await group.next() ?? false
-            if !completed {
-                task.cancel()
+        }
+    }
+
+    private func handleFinishMarkerSent(sessionID: UUID, operationGeneration: UInt64) {
+        guard isCurrentFinalization(sessionID: sessionID, operationGeneration: operationGeneration),
+              finalizationOutcome == nil,
+              state == .stopping || state == .stoppingUnresponsive else { return }
+        finalizationFinishSentSuccessfully = true
+        recordFinalizationEvidence(kind: .finishMarkerSent, stage: .waitingForService)
+        log(event: "asr_finish_sent")
+        noteFinalizationProgress(sessionID: sessionID, reason: "finish_marker_sent")
+        resolveCompletedFinalizationIfReady(sessionID: sessionID)
+    }
+
+    private func resolveCompletedFinalizationIfReady(sessionID: UUID) {
+        guard finalizationFinishSentSuccessfully, asrStreamEnded else { return }
+        resolveASRFinalization(.completed, sessionID: sessionID)
+    }
+
+    private func handleFinalizationSendError(
+        _ error: Error,
+        sessionID: UUID,
+        operationGeneration: UInt64
+    ) {
+        guard isCurrentFinalization(sessionID: sessionID, operationGeneration: operationGeneration),
+              state == .stopping || state == .stoppingUnresponsive else { return }
+        handleFinalizationError(
+            error,
+            sessionID: sessionID,
+            kind: .finishMarkerFailed,
+            failureCategory: .finishMarkerSend
+        )
+    }
+
+    private func handleFinalizationError(
+        _ error: Error,
+        sessionID: UUID,
+        kind: ASRFinalizationEvidenceEvent.Kind = .receiveFailed,
+        failureCategory: ASRFinalizationEvidenceEvent.FailureCategory = .asrReceive
+    ) {
+        guard self.sessionID == sessionID,
+              state == .stopping || state == .stoppingUnresponsive,
+              finalizationOutcome == nil else { return }
+        errorCount += 1
+        recordFinalizationEvidence(
+            kind: kind,
+            stage: .failed,
+            failureCategory: failureCategory,
+            error: error
+        )
+        log(event: "asr_finalization_error", error: error)
+        audioForwarder?.cancel()
+        asr.cancel()
+        finishTask?.cancel()
+        eventTask?.cancel()
+        resolveASRFinalization(.failed(error.localizedDescription), sessionID: sessionID)
+    }
+
+    private func resolveASRFinalization(
+        _ outcome: ASRFinalizationOutcome,
+        sessionID expectedSessionID: UUID?
+    ) {
+        guard let expectedSessionID, self.sessionID == expectedSessionID,
+              finalizationOutcome == nil else { return }
+        finalizationOutcome = outcome
+        finalizationWarningTask?.cancel()
+        finalizationWarningTask = nil
+        finalizationContinuation?.resume(returning: outcome)
+        finalizationContinuation = nil
+    }
+
+    private func isCurrentFinalization(sessionID: UUID, operationGeneration: UInt64) -> Bool {
+        self.sessionID == sessionID
+            && self.operationGeneration == operationGeneration
+            && finalizationOperationGeneration == operationGeneration
+    }
+
+    private func startFinalizationProgressWatch(_ sessionID: UUID) {
+        noteFinalizationProgress(sessionID: sessionID, reason: "audio_capture_stopped")
+    }
+
+    private func noteFinalizationProgress(sessionID: UUID, reason: String) {
+        guard self.sessionID == sessionID,
+              state == .stopping || state == .stoppingUnresponsive else { return }
+        finalizationProgressGeneration &+= 1
+        let generation = finalizationProgressGeneration
+        finalizationWarningTask?.cancel()
+        if state == .stoppingUnresponsive {
+            setState(.stopping)
+        }
+        finalizationWarningTask = Task { [weak self, finalizationClock, finalizationWarningNanoseconds] in
+            do {
+                try await finalizationClock.sleep(nanoseconds: finalizationWarningNanoseconds)
+            } catch {
+                return
             }
-            group.cancelAll()
-            return completed
+            guard let self, !Task.isCancelled,
+                  self.sessionID == sessionID,
+                  self.finalizationProgressGeneration == generation,
+                  self.finalizationOutcome == nil,
+                  self.state == .stopping else { return }
+            self.setState(.stoppingUnresponsive)
+            self.recordFinalizationEvidence(kind: .noProgressWarning, stage: .waitingForService)
+            self.log(event: "asr_finalization_no_progress_warning", metadata: ["stage": reason])
         }
     }
 
@@ -778,6 +1176,7 @@ final class SessionCoordinator: SessionCoordinating {
         case .listening: "listening"
         case .recovering: "recovering"
         case .stopping: "stopping"
+        case .stoppingUnresponsive: "stopping_unresponsive"
         case .error: "error"
         }
         let errorCode: Int?

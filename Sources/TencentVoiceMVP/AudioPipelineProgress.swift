@@ -149,4 +149,16 @@ final class AudioPipelineProgress: @unchecked Sendable {
         ]
     }
 
+    func finalizationEvidenceSnapshot() -> ASRFinalizationAudioProgress {
+        lock.lock()
+        defer { lock.unlock() }
+        return ASRFinalizationAudioProgress(
+            capturedChunkCount: capturedChunks,
+            uploadedChunkCount: uploadedChunks,
+            capturedDurationMilliseconds: capturedBytes / 32,
+            uploadedDurationMilliseconds: uploadedBytes / 32,
+            recognitionUpdateCount: recognitionUpdates
+        )
+    }
+
 }

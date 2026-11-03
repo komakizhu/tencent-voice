@@ -393,6 +393,7 @@ extension SessionError {
         case .busy: return "session_busy"
         case .cancelled: return "session_cancelled"
         case .recognitionEnded: return "asr_stream_ended_unexpectedly"
+        case .finalizationIncomplete: return "asr_finalization_incomplete"
         }
     }
 }
