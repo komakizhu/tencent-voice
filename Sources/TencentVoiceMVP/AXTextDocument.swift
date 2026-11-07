@@ -463,15 +463,126 @@ struct AXPlaceholderEvidence: Equatable, Sendable {
     let explicitPlaceholder: String?
     let markedTexts: [String]
     let unmarkedTexts: [String]
+    let scanStatus: AXPlaceholderEvidenceScanStatus
 
     init(
         explicitPlaceholder: String? = nil,
         markedTexts: [String] = [],
-        unmarkedTexts: [String] = []
+        unmarkedTexts: [String] = [],
+        scanStatus: AXPlaceholderEvidenceScanStatus = .complete
     ) {
         self.explicitPlaceholder = explicitPlaceholder
         self.markedTexts = markedTexts
         self.unmarkedTexts = unmarkedTexts
+        self.scanStatus = scanStatus
+    }
+}
+
+enum AXPlaceholderEvidenceScanStatus: String, Equatable, Sendable {
+    case complete
+    case truncated
+    case readFailure
+}
+
+enum AXPlaceholderAttributeRead<Value> {
+    case available(Value)
+    case unavailable
+}
+
+struct AXPlaceholderNodeSnapshot<Node> {
+    let role: AXPlaceholderAttributeRead<String>
+    let classTokens: AXPlaceholderAttributeRead<Set<String>>
+    let text: AXPlaceholderAttributeRead<String?>
+    let children: AXPlaceholderAttributeRead<[Node]>
+
+    init(
+        role: AXPlaceholderAttributeRead<String>,
+        classTokens: AXPlaceholderAttributeRead<Set<String>>,
+        text: AXPlaceholderAttributeRead<String?>,
+        children: AXPlaceholderAttributeRead<[Node]>
+    ) {
+        self.role = role
+        self.classTokens = classTokens
+        self.text = text
+        self.children = children
+    }
+}
+
+enum AXPlaceholderEvidenceScanner {
+    static func scan<Node: Hashable>(
+        root: Node,
+        explicitPlaceholder: String? = nil,
+        nodeLimit: Int = 64,
+        depthLimit: Int = 6,
+        read: (Node) -> AXPlaceholderNodeSnapshot<Node>
+    ) -> AXPlaceholderEvidence {
+        var markedTexts: [String] = []
+        var unmarkedTexts: [String] = []
+        var visited = Set<Node>()
+        var visitedCount = 0
+        var status: AXPlaceholderEvidenceScanStatus = .complete
+
+        func markIncomplete(_ next: AXPlaceholderEvidenceScanStatus) {
+            if status == .complete || next == .truncated {
+                status = next
+            }
+        }
+
+        func visit(_ node: Node, depth: Int, inheritedPlaceholder: Bool, isRoot: Bool) {
+            guard depth <= depthLimit, visitedCount < nodeLimit else {
+                markIncomplete(.truncated)
+                return
+            }
+            guard visited.insert(node).inserted else {
+                markIncomplete(.truncated)
+                return
+            }
+            visitedCount += 1
+
+            let snapshot = read(node)
+            let role: String
+            switch snapshot.role {
+            case .available(let value): role = value
+            case .unavailable:
+                markIncomplete(.readFailure)
+                role = ""
+            }
+            let classTokens: Set<String>
+            switch snapshot.classTokens {
+            case .available(let value): classTokens = value
+            case .unavailable:
+                markIncomplete(.readFailure)
+                classTokens = []
+            }
+            let marked = inheritedPlaceholder || classTokens.contains("placeholder")
+            if !isRoot, role == "AXStaticText" {
+                switch snapshot.text {
+                case .available(let value):
+                    if let value, !value.isEmpty {
+                        if marked { markedTexts.append(value) }
+                        else { unmarkedTexts.append(value) }
+                    }
+                case .unavailable:
+                    markIncomplete(.readFailure)
+                }
+            }
+            switch snapshot.children {
+            case .available(let children):
+                for child in children {
+                    visit(child, depth: depth + 1, inheritedPlaceholder: marked, isRoot: false)
+                }
+            case .unavailable:
+                markIncomplete(.readFailure)
+            }
+        }
+
+        visit(root, depth: 0, inheritedPlaceholder: false, isRoot: true)
+        return AXPlaceholderEvidence(
+            explicitPlaceholder: explicitPlaceholder,
+            markedTexts: markedTexts,
+            unmarkedTexts: unmarkedTexts,
+            scanStatus: status
+        )
     }
 }
 
@@ -715,7 +826,8 @@ enum AXTextDocumentResolver {
         rawText: String,
         evidence: AXPlaceholderEvidence
     ) -> TextRange? {
-        guard evidence.unmarkedTexts.allSatisfy({ $0.isEmpty }) else {
+        guard evidence.scanStatus == .complete,
+              evidence.unmarkedTexts.allSatisfy({ $0.isEmpty }) else {
             return nil
         }
 

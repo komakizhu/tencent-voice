@@ -78,6 +78,150 @@ final class AXTextDocumentTests: XCTestCase {
         XCTAssertFalse(state.placeholderNormalized)
     }
 
+    func testPlaceholderScannerInheritsMarkedClassAndAllowsOnlyStructuralBoundaryNewline() throws {
+        let prompt = "输入消息，输入 / 选择工具或操作，输入 @ 引用话题"
+        let raw = prompt + "\n"
+        XCTAssertEqual(raw.utf16.count, 28)
+        let nodes: [Int: AXPlaceholderNodeSnapshot<Int>] = [
+            0: .init(
+                role: .available("AXTextArea"),
+                classTokens: .available([]),
+                text: .available(nil),
+                children: .available([1])
+            ),
+            1: .init(
+                role: .available("AXGroup"),
+                classTokens: .available(["placeholder", "has-focus"]),
+                text: .available(nil),
+                children: .available([2])
+            ),
+            2: .init(
+                role: .available("AXStaticText"),
+                classTokens: .available([]),
+                text: .available(prompt),
+                children: .available([])
+            )
+        ]
+        let evidence = AXPlaceholderEvidenceScanner.scan(root: 0) { identifier in
+            nodes[identifier] ?? AXPlaceholderNodeSnapshot(
+                role: .unavailable,
+                classTokens: .unavailable,
+                text: .unavailable,
+                children: .unavailable
+            )
+        }
+
+        XCTAssertEqual(evidence.scanStatus, .complete)
+        XCTAssertEqual(evidence.markedTexts, [prompt])
+        XCTAssertTrue(evidence.unmarkedTexts.isEmpty)
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: 0, length: 0),
+            placeholderEvidence: evidence,
+            probe: rangeProbe(raw)
+        )
+        XCTAssertEqual(state.text, "")
+        XCTAssertTrue(state.placeholderNormalized)
+    }
+
+    func testPlaceholderScannerPreservesUnmarkedDraftBesideMarkedPrompt() throws {
+        let prompt = "输入消息"
+        let draft = "真实草稿"
+        let raw = prompt + "\n" + draft
+        let nodes: [Int: AXPlaceholderNodeSnapshot<Int>] = [
+            0: .init(
+                role: .available("AXTextArea"), classTokens: .available([]), text: .available(nil),
+                children: .available([1, 3])
+            ),
+            1: .init(
+                role: .available("AXGroup"), classTokens: .available(["placeholder"]), text: .available(nil),
+                children: .available([2])
+            ),
+            2: .init(
+                role: .available("AXStaticText"), classTokens: .available([]), text: .available(prompt),
+                children: .available([])
+            ),
+            3: .init(
+                role: .available("AXStaticText"), classTokens: .available([]), text: .available(draft),
+                children: .available([])
+            )
+        ]
+        let evidence = AXPlaceholderEvidenceScanner.scan(root: 0) { identifier in
+            nodes[identifier] ?? AXPlaceholderNodeSnapshot(
+                role: .unavailable, classTokens: .unavailable, text: .unavailable, children: .unavailable
+            )
+        }
+
+        XCTAssertEqual(evidence.markedTexts, [prompt])
+        XCTAssertEqual(evidence.unmarkedTexts, [draft])
+        let state = try AXTextDocumentResolver.resolve(
+            rawText: raw,
+            selection: .init(location: 0, length: 0),
+            placeholderEvidence: evidence,
+            probe: rangeProbe(raw)
+        )
+        XCTAssertEqual(state.text, raw)
+        XCTAssertFalse(state.placeholderNormalized)
+    }
+
+    func testMarkedPlaceholderMustExplainTheEntireRawValueWithoutOrdinaryWhitespace() throws {
+        let prompt = "添加可选评论…"
+        for raw in [" " + prompt, prompt + "正文", String(prompt.dropLast())] {
+            let state = try AXTextDocumentResolver.resolve(
+                rawText: raw,
+                selection: .init(location: 0, length: 0),
+                placeholderEvidence: AXPlaceholderEvidence(markedTexts: [prompt]),
+                probe: rangeProbe(raw)
+            )
+            XCTAssertEqual(state.text, raw)
+            XCTAssertFalse(state.placeholderNormalized)
+        }
+    }
+
+    func testPlaceholderScannerReportsTruncationAndAttributeReadFailure() throws {
+        let prompt = "提示"
+        let nodes: [Int: AXPlaceholderNodeSnapshot<Int>] = [
+            0: .init(
+                role: .available("AXTextArea"), classTokens: .available([]), text: .available(nil),
+                children: .available([1])
+            ),
+            1: .init(
+                role: .available("AXGroup"), classTokens: .available(["placeholder"]), text: .available(nil),
+                children: .available([2])
+            ),
+            2: .init(
+                role: .available("AXStaticText"), classTokens: .available([]), text: .available(prompt),
+                children: .available([])
+            )
+        ]
+        let truncated = AXPlaceholderEvidenceScanner.scan(root: 0, nodeLimit: 2) { identifier in
+            nodes[identifier]!
+        }
+        XCTAssertEqual(truncated.scanStatus, .truncated)
+
+        let failedRead = AXPlaceholderEvidenceScanner.scan(root: 0) { identifier in
+            if identifier == 1 {
+                return AXPlaceholderNodeSnapshot(
+                    role: .available("AXGroup"), classTokens: .unavailable, text: .available(nil),
+                    children: .available([2])
+                )
+            }
+            return nodes[identifier]!
+        }
+        XCTAssertEqual(failedRead.scanStatus, .readFailure)
+
+        let rejected = try AXTextDocumentResolver.resolve(
+            rawText: prompt,
+            selection: .init(location: 0, length: 0),
+            placeholderEvidence: AXPlaceholderEvidence(
+                markedTexts: [prompt], scanStatus: truncated.scanStatus
+            ),
+            probe: rangeProbe(prompt)
+        )
+        XCTAssertEqual(rejected.text, prompt)
+        XCTAssertFalse(rejected.placeholderNormalized)
+    }
+
     func testAXCoordinatesCanExcludeOnlyProvenStructuralNewline() throws {
         let raw = "第一段\n第二段"
         let coordinateText = "第一段第二段"
