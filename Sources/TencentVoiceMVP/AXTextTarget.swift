@@ -103,6 +103,24 @@ private struct PendingKeyboardRepresentationTransition {
     let operationGeneration: UInt64
 }
 
+private struct AXWebRangeDocumentEvidence: Equatable {
+    let characterCount: Int
+    let text: String
+    let axValueLengthUTF16: Int
+    let axValueTrailingNewlineCount: Int
+    let objectGeneration: String
+}
+
+private struct UnmarkedWebEmptyDocumentBaseline: Equatable {
+    let objectGeneration: String
+    let axValueLengthUTF16: Int
+}
+
+private struct PendingWebRangeReceiptRead: Equatable {
+    let state: KeyboardDocumentState
+    let evidence: AXWebRangeDocumentEvidence
+}
+
 private struct KeyboardDiagnosticDiffRecord {
     let candidateIndex: Int
     let candidateMatched: Bool
@@ -530,6 +548,7 @@ protocol AXTextTargetAccess {
     func textInputContext(for element: AXUIElement) -> AXTextInputTargetContext?
     func text(in element: AXUIElement) throws -> String?
     func selection(in element: AXUIElement) throws -> TextRange?
+    func numberOfCharacters(in element: AXUIElement) throws -> Int?
     func coordinateText(for range: TextRange, in element: AXUIElement) throws -> String?
     func placeholderEvidence(in element: AXUIElement) -> AXPlaceholderEvidence
     func isAttributeSettable(_ attribute: String, on element: AXUIElement) -> Bool
@@ -543,6 +562,7 @@ protocol AXTextTargetAccess {
 
 extension AXTextTargetAccess {
     func textInputContext(for element: AXUIElement) -> AXTextInputTargetContext? { nil }
+    func numberOfCharacters(in element: AXUIElement) throws -> Int? { nil }
     func isProseMirrorEditor(_ element: AXUIElement) -> Bool { false }
     func elementValidity(_ element: AXUIElement) -> AXTextElementValidity { .unavailable }
     func editorContinuityEvidence(for element: AXUIElement) -> AXTextEditorContinuityEvidence? { nil }
@@ -973,6 +993,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
     private var isCodexTarget = false
     private var isObsidianTarget = false
     private var isSafariWebEditor = false
+    private var isWebTextInput = false
+    private var webRangeConfirmationMode = false
+    private var unmarkedWebEmptyDocumentBaseline: UnmarkedWebEmptyDocumentBaseline?
+    private var lastWebRangeDocumentEvidence: AXWebRangeDocumentEvidence?
     private var safariStrategyRetryDiagnosticRecorded = false
     private var safariStrategyRetryIsPending = false
     private var safariStrategyMismatchStartedAt: UInt64?
@@ -1248,6 +1272,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         var values: [(DiagnosticTextEvidenceKind, String)] = []
         if let raw = state.rawText { values.append((.axValue, raw)) }
         if state.mapping?.source == .axStringForRange { values.append((.axStringForRange, state.text)) }
+        if webRangeConfirmationMode,
+           let rangeEvidence = lastWebRangeDocumentEvidence {
+            values.append((.axStringForRange, rangeEvidence.text))
+        }
         return values.map { kind, text in
             DiagnosticTextEvidence(kind: kind, source: .observed, text: text,
                 revision: UInt64(context?.fields["revision"] ?? ""),
@@ -1341,6 +1369,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         lastKeyboardObservationTiming = nil
         expectedKeyboardSelection = nil
         activeInputStrategy = .accessibility
+        isWebTextInput = false
+        webRangeConfirmationMode = false
+        unmarkedWebEmptyDocumentBaseline = nil
+        lastWebRangeDocumentEvidence = nil
         let targetApplication = currentApplication()
         targetApplicationProcessID = targetApplication.map { pid_t($0.processIdentifier) }
         targetApplicationBundleIdentifier = targetApplication?.bundleIdentifier
@@ -1379,6 +1411,9 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         isSafariWebEditor = element.map {
             isEligibleSafariWebEditor($0, application: targetApplication, context: inputContext)
         } ?? false
+        isWebTextInput = !isCodexTarget
+            && inputContext?.hasWebAreaAncestor == true
+            && ["AXTextArea", "AXTextField"].contains(inputContext?.role ?? "")
         let continuityApplicable = isSafariWebEditor || (isCodexTarget && inputContext?.ancestorScanStatus == .webArea)
         let continuityTargetApplication = targetApplicationBundleIdentifier == "com.apple.Safari" || isCodexTarget
         access.setContinuityScanObjectGeneration(targetElementObservationID)
@@ -1433,6 +1468,33 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         }
         let rawSelection = readableKeyboardSelection
             ?? TextRange(location: rawText?.utf16.count ?? 0, length: 0)
+        let webEmptyBodyEvidence: AXWebRangeDocumentEvidence? = {
+            guard isWebTextInput,
+                  let element,
+                  let rawText,
+                  !rawText.isEmpty,
+                  let readableKeyboardSelection,
+                  readableKeyboardSelection == TextRange(location: 0, length: 0),
+                  let objectGeneration = targetElementObservationID else {
+                return nil
+            }
+            return try? unmarkedWebEmptyBodyEvidence(
+                in: element,
+                rawText: rawText,
+                selection: readableKeyboardSelection,
+                objectGeneration: objectGeneration
+            )
+        }()
+        if let webEmptyBodyEvidence,
+           webEmptyBodyEvidence.characterCount == 0,
+           webEmptyBodyEvidence.text.isEmpty {
+            webRangeConfirmationMode = true
+            lastWebRangeDocumentEvidence = webEmptyBodyEvidence
+            unmarkedWebEmptyDocumentBaseline = UnmarkedWebEmptyDocumentBaseline(
+                objectGeneration: webEmptyBodyEvidence.objectGeneration,
+                axValueLengthUTF16: webEmptyBodyEvidence.axValueLengthUTF16
+            )
+        }
         let inputStrategy = AXTextInputStrategy.select(
             application: targetApplication,
             context: inputContext,
@@ -1471,12 +1533,15 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 )
             }
         }
-        let text = codexState?.text ?? rawText ?? ""
-        let selection = codexState?.selection ?? rawSelection
+        let text = codexState?.text ?? (webRangeConfirmationMode ? "" : (rawText ?? ""))
+        let selection = codexState?.selection
+            ?? (webRangeConfirmationMode ? TextRange(location: 0, length: 0) : rawSelection)
         expectedKeyboardSelection = selection
         requiresKeyboardAcknowledgement = hasReadableAXTextState || inputStrategy.prefersAcknowledgedKeyboard
         confirmedKeyboardDocument = if let codexState {
             codexState.text
+        } else if webRangeConfirmationMode {
+            ""
         } else if !isCodexTarget, let rawText {
             rawText
         } else {
@@ -1491,6 +1556,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 rawText: codexState.rawText,
                 mapping: codexState.mapping
             )
+        } else if webRangeConfirmationMode {
+            KeyboardDocumentState(text: "", selection: TextRange(location: 0, length: 0))
         } else if !isCodexTarget, let rawText, let readableKeyboardSelection {
             KeyboardDocumentState(text: rawText, selection: readableKeyboardSelection)
         } else {
@@ -1518,7 +1585,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             "inputReadOnly": inputContext.flatMap { $0.isReadOnly }.map { String($0) } ?? "unknown",
             "inputSecure": inputContext.flatMap { $0.isSecure }.map { String($0) } ?? "unknown",
             "ancestorScanStatus": inputContext.map { $0.ancestorScanStatus.rawValue } ?? "unavailable",
-            "webAreaDepth": inputContext.flatMap { $0.webAreaDepth }.map(String.init) ?? "unknown"
+            "webAreaDepth": inputContext.flatMap { $0.webAreaDepth }.map(String.init) ?? "unknown",
+            "webEmptyBodyRangeConfirmed": String(webEmptyBodyEvidence?.characterCount == 0
+                && webEmptyBodyEvidence?.text.isEmpty == true),
+            "webRangeConfirmationMode": String(webRangeConfirmationMode)
         ])
         return TextSnapshot(
             element: element,
@@ -2495,7 +2565,9 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 "confirmationResult": "observed_for_comparison",
                 "coordinateMappingSource": state.mapping.map { String(describing: $0.source) } ?? "unavailable",
                 "coordinateDocumentLengthUTF16": String(state.text.utf16.count),
-                "rawDocumentLengthUTF16": String(state.rawText?.utf16.count ?? 0)
+                "rawDocumentLengthUTF16": String(state.rawText?.utf16.count
+                    ?? lastWebRangeDocumentEvidence?.axValueLengthUTF16
+                    ?? 0)
             ],
                 textEvidence: documentEvidence(state, requested: requestedAt,
                     started: readStartedAt, monotonic: readStartedMonotonic))
@@ -2568,6 +2640,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         let diagnosticOperation = pendingKeyboardDiagnosticOperation
         let preWriteConfirmedState = confirmedKeyboardState
         var pendingInitialInsertionCalibration: (position: Int, state: KeyboardDocumentState)?
+        var pendingWebRangeReceiptRead: PendingWebRangeReceiptRead?
         var lastObservedObjectGeneration: String?
         var calibratedInitialInsertion = false
         var lastObservedState: KeyboardDocumentState?
@@ -2615,6 +2688,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 }
                 return observed
             } catch {
+                pendingWebRangeReceiptRead = nil
                 acknowledgementTrace.recordReadError(
                     DiagnosticErrorFormatter.code(for: error),
                     elapsedMilliseconds: (self.writeTiming.now() - start) / 1_000_000
@@ -2640,8 +2714,50 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 isCodexTarget: self.isCodexTarget,
                 allowNewStructuralBoundary: self.lastKeyboardReadUsedStructuralFallback
             )
+            var confirmedByUnmarkedWebRange = false
+            let webBaseline = self.unmarkedWebEmptyDocumentBaseline
+            if let webBaseline,
+               let operation = diagnosticOperation,
+               operation.operationGeneration == 1,
+               operation.coordinateRange == TextRange(location: 0, length: 0),
+               let payload = operation.inputText,
+               payload == expected.text,
+               expected.text == receipt.text,
+               observed.text == receipt.text,
+               observed.selection == receipt.selection,
+               observed.selection == TextRange(location: payload.utf16.count, length: 0),
+               let rangeEvidence = self.lastWebRangeDocumentEvidence,
+               rangeEvidence.characterCount == payload.utf16.count,
+               rangeEvidence.text == payload,
+               rangeEvidence.objectGeneration == webBaseline.objectGeneration,
+               lastObservedObjectGeneration == webBaseline.objectGeneration,
+               self.targetElementObservationID == webBaseline.objectGeneration,
+               evaluated.matched {
+                let currentRead = PendingWebRangeReceiptRead(
+                    state: observed,
+                    evidence: rangeEvidence
+                )
+                if pendingWebRangeReceiptRead == currentRead {
+                    confirmedByUnmarkedWebRange = true
+                    pendingWebRangeReceiptRead = nil
+                    self.recordDiagnostic("keyboard_unmarked_web_empty_body_transition_confirmed", [
+                        "baselineAXValueLengthUTF16": String(webBaseline.axValueLengthUTF16),
+                        "finalAXValueLengthUTF16": String(rangeEvidence.axValueLengthUTF16),
+                        "logicalBodyLengthUTF16": String(rangeEvidence.characterCount),
+                        "payloadLengthUTF16": String(payload.utf16.count),
+                        "consecutiveMatchingRangeReads": "2",
+                        "editorIdentityContinuous": "true",
+                        "rangeTextMatchesExpected": "true"
+                    ], context: acknowledgementContext)
+                } else {
+                    pendingWebRangeReceiptRead = currentRead
+                }
+            } else if webBaseline != nil {
+                pendingWebRangeReceiptRead = nil
+            }
             var confirmedByInitialCalibration = false
-            if !evaluated.matched,
+            if webBaseline == nil,
+               !evaluated.matched,
                !calibratedInitialInsertion,
                let operation = diagnosticOperation,
                operation.operationGeneration == 1,
@@ -2688,11 +2804,21 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             } else {
                 pendingInitialInsertionCalibration = nil
             }
+            let receiptMatched = webBaseline != nil
+                ? confirmedByUnmarkedWebRange
+                : (evaluated.matched || confirmedByInitialCalibration)
             let candidateMatches = candidateStates.indices.map {
-                evaluated.matchedIndexes.contains($0)
+                receiptMatched && evaluated.matchedIndexes.contains($0)
             }
-            lastComparison = confirmedByInitialCalibration ? .matched : evaluated.comparison
-            if evaluated.matched, let matchedIndex = evaluated.matchedIndex {
+            let comparisonForTrace: KeyboardDocumentComparison = if receiptMatched {
+                .matched
+            } else if webBaseline != nil && evaluated.matched {
+                .documentMismatch
+            } else {
+                confirmedByInitialCalibration ? .matched : evaluated.comparison
+            }
+            lastComparison = comparisonForTrace
+            if receiptMatched, let matchedIndex = evaluated.matchedIndex {
                 lastComparison = .matched
                 matchedCandidateRegionWasResolved = true
                 if matchedIndex > 0 {
@@ -2708,7 +2834,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             }
             acknowledgementTrace.recordComparison(
                 evidence: self.keyboardStateEvidence(observed),
-                comparison: evaluated.comparison,
+                comparison: comparisonForTrace,
                 candidateMatches: candidateMatches,
                 observed: observed,
                 expectedCandidates: candidateStates,
@@ -2717,7 +2843,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 mappingValid: self.keyboardDiagnosticMappingIsValid(observed),
                 elapsedMilliseconds: (self.writeTiming.now() - start) / 1_000_000
             )
-            return evaluated.matched || confirmedByInitialCalibration
+            return receiptMatched
         }
         do {
             let acknowledgedState: KeyboardDocumentState
@@ -2773,13 +2899,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             pendingKeyboardRepresentationTransition = nil
             pendingKeyboardReplacement = nil
             pendingKeyboardRawInsertionRegion = nil
+            unmarkedWebEmptyDocumentBaseline = nil
             replacementWasSent = false
             let acknowledgementFields = [
                 "elapsedMilliseconds": String((writeTiming.now() - start) / 1_000_000),
                 "documentMatches": "true", "selectionMatches": "true",
                 "comparison": lastComparison?.rawValue ?? "matched",
                 "observedLengthUTF16": String(acknowledgedState.text.utf16.count),
-                "observedAXValueLengthUTF16": String(acknowledgedState.rawText?.utf16.count ?? 0),
+                "observedAXValueLengthUTF16": String(keyboardStateEvidence(acknowledgedState).axValueLengthUTF16),
                 "receiptRepresentationTransition": usedRepresentationTransition
                     ? pendingRepresentationTransition?.representation ?? "none"
                     : "none"
@@ -2830,6 +2957,22 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                     monotonicMilliseconds: timing?.monotonicMilliseconds
                 ))
             }
+            if webRangeConfirmationMode,
+               let rangeEvidence = lastWebRangeDocumentEvidence {
+                textEvidence.append(DiagnosticTextEvidence(
+                    kind: .axStringForRange, source: .observed, text: rangeEvidence.text,
+                    revision: UInt64(acknowledgementContext?.fields["revision"] ?? ""),
+                    operationID: acknowledgementContext.map { String($0.operationID) },
+                    targetApplicationBundleIdentifier: targetApplicationBundleIdentifier,
+                    targetApplicationProcessID: targetApplicationProcessID.map { Int32($0) },
+                    editorIdentity: targetElementObservationID,
+                    selectionLocationUTF16: acknowledgedState.selection.location,
+                    selectionLengthUTF16: acknowledgedState.selection.length,
+                    requestedAt: timing?.requested, readStartedAt: timing?.started, readFinishedAt: timing?.finished,
+                    observedAt: observedAt,
+                    monotonicMilliseconds: timing?.monotonicMilliseconds
+                ))
+            }
             recordDiagnostic("keyboard_write_acknowledged", mergedAcknowledgementFields,
                 context: acknowledgementContext, textEvidence: textEvidence)
         } catch {
@@ -2846,7 +2989,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 "code": DiagnosticErrorFormatter.code(for: error),
                 "comparison": lastComparison?.rawValue ?? "unreadable",
                 "observedLengthUTF16": String(lastObservedState?.text.utf16.count ?? 0),
-                "observedAXValueLengthUTF16": String(lastObservedState?.rawText?.utf16.count ?? 0),
+                "observedAXValueLengthUTF16": String(lastObservedState.map(keyboardStateEvidence)?.axValueLengthUTF16 ?? 0),
                 "receiptRepresentationTransition": pendingRepresentationTransition != nil
                     ? pendingRepresentationTransition?.representation ?? "none"
                     : "none"
@@ -2863,29 +3006,21 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             let mergedFailureFields = evidence
                 .merging(failureFields) { _, new in new }
                 .merging(failureEvidence) { _, new in new }
-            let textEvidence = lastObservedState.flatMap { observed -> [DiagnosticTextEvidence]? in
-                guard let rawText = observed.rawText else { return nil }
-                return [DiagnosticTextEvidence(
-                    kind: .axValue, source: .observed, text: rawText,
-                    revision: UInt64(acknowledgementContext?.fields["revision"] ?? ""),
-                    operationID: acknowledgementContext.map { String($0.operationID) },
-                    targetApplicationBundleIdentifier: targetApplicationBundleIdentifier,
-                    targetApplicationProcessID: targetApplicationProcessID.map { Int32($0) },
-                    editorIdentity: targetElementObservationID,
-                    selectionLocationUTF16: observed.selection.location,
-                    selectionLengthUTF16: observed.selection.length,
-                    requestedAt: lastKeyboardObservationTiming?.requested,
-                    readStartedAt: lastKeyboardObservationTiming?.started,
-                    readFinishedAt: lastKeyboardObservationTiming?.finished,
-                    observedAt: lastKeyboardObservationTiming?.finished,
-                    monotonicMilliseconds: lastKeyboardObservationTiming?.monotonicMilliseconds
-                )]
+            let textEvidence = lastObservedState.map { observed in
+                documentEvidence(
+                    observed,
+                    requested: lastKeyboardObservationTiming?.requested ?? Date(),
+                    started: lastKeyboardObservationTiming?.started ?? Date(),
+                    monotonic: lastKeyboardObservationTiming?.monotonicMilliseconds
+                        ?? (writeTiming.now() / 1_000_000)
+                )
             } ?? []
             recordDiagnostic("keyboard_write_unconfirmed", mergedFailureFields,
                 context: acknowledgementContext, textEvidence: textEvidence)
             pendingKeyboardDiagnosticOperation = nil
             pendingKeyboardRepresentationTransition = nil
             pendingKeyboardRawInsertionRegion = nil
+            unmarkedWebEmptyDocumentBaseline = nil
             confirmedKeyboardRawInsertionRegion = nil
             recoverPendingSelectionIfSafe(generation: generation)
             throw error
@@ -3564,11 +3699,15 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         )
         return KeyboardStateEvidence(
             coordinateLengthUTF16: state.text.utf16.count,
-            axValueLengthUTF16: state.rawText?.utf16.count ?? 0,
+            axValueLengthUTF16: state.rawText?.utf16.count
+                ?? lastWebRangeDocumentEvidence?.axValueLengthUTF16
+                ?? 0,
             selectionLocation: state.selection.location,
             selectionLength: state.selection.length,
             coordinateTrailingNewlineCount: trailingNewlineCount(in: state.text),
-            axValueTrailingNewlineCount: trailingNewlineCount(in: state.rawText ?? ""),
+            axValueTrailingNewlineCount: state.rawText.map {
+                trailingNewlineCount(in: $0)
+            } ?? lastWebRangeDocumentEvidence?.axValueTrailingNewlineCount ?? 0,
             mappingValid: mappingValid
         )
     }
@@ -3718,11 +3857,114 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         }
     }
 
+    private func unmarkedWebEmptyBodyEvidence(
+        in element: AXUIElement,
+        rawText: String,
+        selection: TextRange,
+        objectGeneration: String
+    ) throws -> AXWebRangeDocumentEvidence? {
+        guard selection == TextRange(location: 0, length: 0),
+              let evidence = try readWebRangeDocumentEvidence(
+                  in: element,
+                  rawText: rawText,
+                  objectGeneration: objectGeneration
+              ),
+              evidence.characterCount == 0,
+              evidence.text.isEmpty else {
+            return nil
+        }
+
+        let placeholder = placeholderEvidence(in: element)
+        guard placeholder.explicitPlaceholder?.isEmpty != false,
+              placeholder.markedTexts.isEmpty else {
+            return nil
+        }
+        return evidence
+    }
+
+    private func readWebRangeDocumentEvidence(
+        in element: AXUIElement,
+        rawText: String,
+        objectGeneration: String
+    ) throws -> AXWebRangeDocumentEvidence? {
+        guard let characterCount = try readAXNumberOfCharactersEvidence(in: element),
+              characterCount >= 0 else {
+            return nil
+        }
+        let requestedRange = TextRange(location: 0, length: characterCount)
+        let text = try readTextEvidence(.axStringForRange, fields: [
+            "requestedRangeLocationUTF16": String(requestedRange.location),
+            "requestedRangeLengthUTF16": String(requestedRange.length),
+            "rangeCharacterCountUTF16": String(characterCount)
+        ]) { try access.coordinateText(for: requestedRange, in: element) }
+        guard let text, text.utf16.count == characterCount else {
+            recordDiagnostic("web_text_range_evidence_rejected", [
+                "reason": "range_length_mismatch",
+                "reportedCharacterCount": String(characterCount),
+                "returnedTextLengthUTF16": "unavailable_or_mismatch",
+                "editorIdentity": objectGeneration
+            ])
+            return nil
+        }
+        return AXWebRangeDocumentEvidence(
+            characterCount: characterCount,
+            text: text,
+            axValueLengthUTF16: rawText.utf16.count,
+            axValueTrailingNewlineCount: trailingNewlineCount(in: rawText),
+            objectGeneration: objectGeneration
+        )
+    }
+
+    private func readAXNumberOfCharactersEvidence(in element: AXUIElement) throws -> Int? {
+        let startedAt = Date()
+        do {
+            let characterCount = try access.numberOfCharacters(in: element)
+            recordDiagnostic("ax_text_attribute_read", [
+                "attribute": "AXNumberOfCharacters",
+                "result": characterCount == nil ? "unavailable" : "observed",
+                "characterCountUTF16": characterCount.map { String($0) } ?? "unknown",
+                "selectionRelation": "separate_non_atomic_read",
+                "editorIdentityMeaning": "captured_handle_not_stable_editor_identity",
+                "requestedAt": startedAt.ISO8601Format(),
+                "readFinishedAt": Date().ISO8601Format()
+            ], context: diagnosticOperationContext ?? previousDiagnosticOperationContext)
+            return characterCount
+        } catch {
+            recordDiagnostic("ax_text_attribute_read", [
+                "attribute": "AXNumberOfCharacters",
+                "result": "failed",
+                "code": axReadDiagnosticCode(for: error),
+                "requestedAt": startedAt.ISO8601Format(),
+                "readFinishedAt": Date().ISO8601Format()
+            ], context: diagnosticOperationContext ?? previousDiagnosticOperationContext)
+            throw error
+        }
+    }
+
     private func readKeyboardDocumentState(in element: AXUIElement, confirming: Bool) throws -> KeyboardDocumentState {
         lastKeyboardReadUsedStructuralFallback = false
+        if webRangeConfirmationMode {
+            lastWebRangeDocumentEvidence = nil
+        }
         guard let rawText = try readTextEvidence(.axValue, read: { try access.text(in: element) }),
               let selection = try access.selection(in: element) else {
             throw KeyboardDocumentStateReadError.unavailable
+        }
+        if webRangeConfirmationMode {
+            if let baseline = unmarkedWebEmptyDocumentBaseline,
+               baseline.objectGeneration != targetElementObservationID {
+                throw TextTargetError.targetChanged
+            }
+            guard let objectGeneration = targetElementObservationID,
+                  let evidence = try readWebRangeDocumentEvidence(
+                      in: element,
+                      rawText: rawText,
+                      objectGeneration: objectGeneration
+                  ) else {
+                throw KeyboardWriteReadError.retryable
+            }
+            lastWebRangeDocumentEvidence = evidence
+            return KeyboardDocumentState(text: evidence.text, selection: selection)
         }
         if isCodexTarget {
             if AXTextDocumentResolver.isStaleAXValueBehindSelection(
@@ -6271,6 +6513,20 @@ final class SystemAXTextTargetAccess: AXTextTargetAccess {
         if let text = value as? String { return text }
         if let attributedText = value as? NSAttributedString { return attributedText.string }
         return nil
+    }
+
+    func numberOfCharacters(in element: AXUIElement) throws -> Int? {
+        let value: CFTypeRef?
+        do {
+            value = try attribute(kAXNumberOfCharactersAttribute as String, from: element)
+        } catch TextTargetError.unsupported {
+            return nil
+        }
+        guard let number = value as? NSNumber,
+              number.intValue >= 0 else {
+            return nil
+        }
+        return number.intValue
     }
 
     func selection(in element: AXUIElement) throws -> TextRange? {

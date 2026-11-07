@@ -4602,6 +4602,253 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertEqual(strategy, .safeStop(reason: "web_text_state_unreadable"))
     }
 
+    func testUnmarkedWebEmptyBodyRangeConfirmsFirstAndLaterCandidates() async throws {
+        let unmarkedPromptRepresentation = String(repeating: "提示", count: 14)
+        let access = ReplayAXTextTargetAccess(
+            text: unmarkedPromptRepresentation,
+            selection: .init(location: 0, length: 0),
+            application: .init(
+                name: "Cherry Studio",
+                bundleIdentifier: "com.kangfenmao.CherryStudio",
+                processIdentifier: 9001
+            )
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.coordinateOverride = ""
+        access.numberOfCharactersOverride = 0
+        let sender = ReplayKeyboardEventSender(access: access)
+        var firstAppend = true
+        sender.appendOverride = { text in
+            if firstAppend {
+                // Simulate a possible AX representation transition: the raw
+                // value becomes empty while the editor range exposes the body.
+                access.rawText = ""
+                access.coordinateOverride = text
+                firstAppend = false
+            } else {
+                access.coordinateOverride = (access.coordinateOverride ?? "") + text
+            }
+            access.numberOfCharactersOverride = access.coordinateOverride?.utf16.count
+            access.selection = .init(location: access.coordinateOverride?.utf16.count ?? 0, length: 0)
+            access.editorSelection = access.selection
+        }
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target, pacingClock: clock)
+
+        try injector.begin()
+        injector.apply(projection: projection("甲", revision: 1))
+        await finish(injector, finalText: "甲", advancing: clock)
+        injector.apply(projection: projection("甲乙", revision: 2))
+        await finish(injector, finalText: "甲乙", advancing: clock)
+
+        XCTAssertEqual(access.rawText, "")
+        XCTAssertEqual(access.coordinateText, "甲乙")
+        XCTAssertEqual(sender.totalPosts, 2)
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+        let diagnostics = injector.drainDiagnostics()
+        XCTAssertTrue(diagnostics.contains {
+            $0.event == "keyboard_unmarked_web_empty_body_transition_confirmed"
+                && $0.fields["consecutiveMatchingRangeReads"] == "2"
+                && $0.fields["editorIdentityContinuous"] == "true"
+        })
+        XCTAssertFalse(diagnostics.contains { $0.event == "keyboard_write_unconfirmed" })
+    }
+
+    func testUnmarkedPromptLikeDraftAndPromptWithDraftArePreserved() throws {
+        let cases: [(raw: String, coordinate: String, count: Int)] = [
+            ("添加可选评论…", "添加可选评论…", "添加可选评论…".utf16.count),
+            ("已有草稿添加可选评论…", "已有草稿", "已有草稿".utf16.count)
+        ]
+
+        for item in cases {
+            let access = ReplayAXTextTargetAccess(
+                text: item.raw,
+                selection: .init(location: 0, length: 0),
+                application: .init(
+                    name: "Cherry Studio",
+                    bundleIdentifier: "com.kangfenmao.CherryStudio",
+                    processIdentifier: 9001
+                )
+            )
+            access.configureWebAncestorChain(depth: 4)
+            access.coordinateOverride = item.coordinate
+            access.numberOfCharactersOverride = item.count
+            let target = AXTextTarget(access: access)
+
+            let snapshot = try target.capture()
+
+            XCTAssertEqual(snapshot.text, item.raw)
+            XCTAssertFalse(target.drainDiagnostics().contains {
+                $0.event == "input_target_captured" && $0.fields["webRangeConfirmationMode"] == "true"
+            })
+        }
+    }
+
+    func testUnmarkedWebEmptyBodyIsNotInferredWithoutRangeEvidence() throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "添加可选评论…",
+            selection: .init(location: 0, length: 0),
+            application: .init(
+                name: "Cherry Studio",
+                bundleIdentifier: "com.kangfenmao.CherryStudio",
+                processIdentifier: 9001
+            )
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.coordinateOverride = ""
+        access.numberOfCharactersOverride = 0
+        access.temporarilyUnavailableCoordinateRanges = [.init(location: 0, length: 0)]
+        let target = AXTextTarget(access: access)
+
+        let snapshot = try target.capture()
+
+        XCTAssertEqual(snapshot.text, "添加可选评论…")
+        let diagnostics = target.drainDiagnostics()
+        XCTAssertTrue(diagnostics.contains {
+            $0.event == "input_target_captured" && $0.fields["webRangeConfirmationMode"] == "false"
+        })
+    }
+
+    func testManualEditDuringUnmarkedWebFirstWriteFallsBackSafely() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "添加可选评论…",
+            selection: .init(location: 0, length: 0),
+            application: .init(
+                name: "Cherry Studio",
+                bundleIdentifier: "com.kangfenmao.CherryStudio",
+                processIdentifier: 9001
+            )
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.coordinateOverride = ""
+        access.numberOfCharactersOverride = 0
+        let sender = ReplayKeyboardEventSender(access: access)
+        sender.appendOverride = { _ in
+            access.rawText = "手动修改"
+            access.coordinateOverride = nil
+            access.numberOfCharactersOverride = nil
+            access.selection = .init(location: "手动修改".utf16.count, length: 0)
+            access.editorSelection = access.selection
+        }
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target, pacingClock: clock)
+
+        try injector.begin()
+        injector.apply(projection: projection("甲", revision: 1))
+        await finish(injector, finalText: "甲", advancing: clock)
+
+        XCTAssertEqual(access.rawText, "手动修改")
+        XCTAssertEqual(sender.totalPosts, 1)
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
+        XCTAssertEqual(injector.errorCount, 1)
+    }
+
+    func testUnmarkedWebRangeMismatchPreservesObservedDraftAndFallsBackSafely() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "添加可选评论…",
+            selection: .init(location: 0, length: 0),
+            application: .init(
+                name: "Cherry Studio",
+                bundleIdentifier: "com.kangfenmao.CherryStudio",
+                processIdentifier: 9001
+            )
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.coordinateOverride = ""
+        access.numberOfCharactersOverride = 0
+        let sender = ReplayKeyboardEventSender(access: access)
+        sender.appendOverride = { _ in
+            access.rawText = "AX 表示已变化"
+            access.coordinateOverride = "用户的真实草稿"
+            access.numberOfCharactersOverride = "用户的真实草稿".utf16.count
+            access.selection = .init(location: "用户的真实草稿".utf16.count, length: 0)
+            access.editorSelection = access.selection
+        }
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target, pacingClock: clock)
+
+        try injector.begin()
+        injector.apply(projection: projection("甲", revision: 1))
+        await finish(injector, finalText: "甲", advancing: clock)
+
+        XCTAssertEqual(access.coordinateText, "用户的真实草稿")
+        XCTAssertEqual(sender.totalPosts, 1)
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
+        XCTAssertEqual(injector.errorCount, 1)
+    }
+
+    func testWebTargetChangeDuringUnmarkedFirstWriteFallsBackSafely() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "添加可选评论…",
+            selection: .init(location: 0, length: 0),
+            application: .init(
+                name: "Cherry Studio",
+                bundleIdentifier: "com.kangfenmao.CherryStudio",
+                processIdentifier: 9001
+            )
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.coordinateOverride = ""
+        access.numberOfCharactersOverride = 0
+        let sender = ReplayKeyboardEventSender(access: access)
+        sender.appendOverride = { text in
+            access.rawText = text
+            access.coordinateOverride = nil
+            access.numberOfCharactersOverride = nil
+            access.selection = .init(location: text.utf16.count, length: 0)
+            access.editorSelection = access.selection
+            access.focusChanged = true
+        }
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target, pacingClock: clock)
+
+        try injector.begin()
+        injector.apply(projection: projection("甲", revision: 1))
+        await finish(injector, finalText: "甲", advancing: clock)
+
+        XCTAssertEqual(access.rawText, "甲")
+        XCTAssertEqual(sender.totalPosts, 1)
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
+        XCTAssertEqual(injector.errorCount, 1)
+    }
+
     func testAncestorScannerUsesSameBoundForDeepWebAreaAndStopsAtTruncation() {
         let deepChain = Dictionary(uniqueKeysWithValues: (0...11).map { ($0, $0 + 1) })
         let deepResult = AXTextAncestorScanner.scan(
@@ -7018,6 +7265,7 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     var failNextSelectionReads = 0
     var failNextCoordinateReads = 0
     var temporarilyUnavailableCoordinateRanges: [ReplayTextRange] = []
+    var numberOfCharactersOverride: Int?
     var permissionError: TextTargetError?
     var selectionRangeIsSettable = false
     var simulateAXSelectionWriteAcceptedButDoesNotMoveEditor = false
@@ -7318,6 +7566,10 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
             return nil
         }
         return (text as NSString).substring(with: NSRange(location: range.location, length: range.length))
+    }
+
+    func numberOfCharacters(in element: AXUIElement) throws -> Int? {
+        return numberOfCharactersOverride ?? coordinateText.utf16.count
     }
 
     func placeholderEvidence(in element: AXUIElement) -> AXPlaceholderEvidence {
