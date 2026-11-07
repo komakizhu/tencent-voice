@@ -4971,6 +4971,171 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertEqual(injector.errorCount, 1)
     }
 
+    func testMarkedWebAppendRecoversFromAXValueLagAfterWriteWasSent() async throws {
+        for laggingAttribute in ["AXValue", "AXNumberOfCharacters", "AXStringForRange", "AXSelectedTextRange"] {
+            let prompt = "输入消息，输入 / 选择工具或操作，输入 @ 引用话题"
+            let rawPrompt = prompt + "\n"
+            let access = ReplayAXTextTargetAccess(
+                text: rawPrompt,
+                selection: .init(location: 0, length: 0),
+                application: .init(
+                    name: "Cherry Studio",
+                    bundleIdentifier: "com.kangfenmao.CherryStudio",
+                    processIdentifier: 9001
+                )
+            )
+            access.configureWebAncestorChain(depth: 4)
+            access.coordinateOverride = rawPrompt
+            access.numberOfCharactersOverride = rawPrompt.utf16.count
+            access.configurePlaceholderTree(prompt: prompt)
+            let sender = ReplayKeyboardEventSender(access: access)
+            var dispatchCount = 0
+            sender.appendOverride = { text in
+                dispatchCount += 1
+                access.rawText = dispatchCount == 1 ? text : access.rawText + text
+                access.coordinateOverride = access.rawText
+                access.numberOfCharactersOverride = access.rawText.utf16.count
+                access.placeholderEvidenceTree = nil
+                access.selection = .init(location: access.rawText.utf16.count, length: 0)
+                access.editorSelection = access.selection
+                guard dispatchCount == 2 else { return }
+                switch laggingAttribute {
+                case "AXValue":
+                    access.queuedAXValueReads = ["甲乙丙"]
+                case "AXNumberOfCharacters":
+                    access.queuedCharacterCountReads = [3]
+                case "AXStringForRange":
+                    access.queuedCoordinateTextReads = ["甲乙丙"]
+                case "AXSelectedTextRange":
+                    access.queuedSelectionReads = [.init(location: 3, length: 0)]
+                default:
+                    XCTFail("Unexpected attribute: \(laggingAttribute)")
+                }
+            }
+            let clock = ManualKeyboardPacingClock()
+            let target = AXTextTarget(
+                access: access,
+                keyboardEventSender: sender,
+                writeTiming: .init(
+                    now: { clock.nowNanoseconds },
+                    sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+                ),
+                acknowledgementTimeoutNanoseconds: 100_000_000
+            )
+
+            func acknowledgeAndAdvanceClock() async throws {
+                let acknowledgement = Task { try await target.acknowledgeKeyboardWrite() }
+                for _ in 0..<100 {
+                    await Task.yield()
+                    clock.advance(by: 10_000_000)
+                }
+                try await acknowledgement.value
+            }
+
+            _ = try target.capture()
+            try target.paste("甲乙丙")
+            try await acknowledgeAndAdvanceClock()
+            try target.paste("丁")
+            try await acknowledgeAndAdvanceClock()
+
+            XCTAssertEqual(access.rawText, "甲乙丙丁", "laggingAttribute=\(laggingAttribute)")
+            XCTAssertEqual(access.coordinateText, "甲乙丙丁", "laggingAttribute=\(laggingAttribute)")
+            XCTAssertEqual(access.selection, .init(location: 4, length: 0), "laggingAttribute=\(laggingAttribute)")
+            XCTAssertEqual(sender.appendPosts, 2, "laggingAttribute=\(laggingAttribute): retry reads without resending")
+            XCTAssertEqual(dispatchCount, 2, "laggingAttribute=\(laggingAttribute)")
+            XCTAssertFalse(target.drainDiagnostics().contains { $0.event == "keyboard_write_ack_failed" },
+                           "laggingAttribute=\(laggingAttribute)")
+        }
+    }
+
+    func testMarkedWebEqualLengthReplacementRecoversFromOldAXValue() async throws {
+        let before = String(repeating: "甲", count: 96) + "乙"
+        let after = String(repeating: "甲", count: 96) + "丁"
+        let access = ReplayAXTextTargetAccess(
+            text: before,
+            selection: .init(location: 97, length: 0),
+            application: .init(
+                name: "Cherry Studio",
+                bundleIdentifier: "com.kangfenmao.CherryStudio",
+                processIdentifier: 9001
+            )
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.coordinateOverride = before
+        access.numberOfCharactersOverride = before.utf16.count
+        let sender = ReplayKeyboardEventSender(access: access)
+        sender.onReplacement = {
+            access.coordinateOverride = nil
+            access.queuedAXValueReads = [before]
+        }
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 100_000_000
+        )
+
+        _ = try target.capture()
+        try target.replaceTrailingText("乙", with: "丁")
+        let acknowledgement = Task { try await target.acknowledgeKeyboardWrite() }
+        for _ in 0..<100 {
+            await Task.yield()
+            clock.advance(by: 10_000_000)
+        }
+        try await acknowledgement.value
+
+        XCTAssertEqual(access.rawText, after)
+        XCTAssertEqual(access.coordinateText, after)
+        XCTAssertEqual(access.selection, .init(location: 97, length: 0))
+        XCTAssertEqual(before.utf16.count, after.utf16.count)
+        XCTAssertEqual(sender.replacementPosts, 1)
+    }
+
+    func testPreflightSelectionOnlyLagWaitsForCurrentSelection() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "草稿",
+            selection: .init(location: 2, length: 0),
+            application: .init(name: "Safari", bundleIdentifier: "com.apple.Safari", processIdentifier: 9001)
+        )
+        access.configureWebAncestorChain(depth: 4)
+        access.coordinateOverride = "草稿"
+        access.numberOfCharactersOverride = "草稿".utf16.count
+        let clock = ManualKeyboardPacingClock()
+        access.replayTime = { clock.nowNanoseconds }
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 100_000_000
+        )
+        let injector = TextInjector(target: target, pacingClock: clock)
+
+        try injector.begin()
+        access.queuedSelectionReads = [
+            .init(location: 0, length: 0),
+            .init(location: 2, length: 0)
+        ]
+        injector.apply(projection: projection("新", revision: 1))
+        await finish(injector, finalText: "新", advancing: clock)
+
+        XCTAssertEqual(access.rawText, "草稿新")
+        XCTAssertEqual(access.selection, .init(location: 3, length: 0))
+        XCTAssertEqual(sender.totalPosts, 1)
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+        XCTAssertTrue(injector.drainDiagnostics().contains {
+            $0.event == "keyboard_selection_observation_unsettled" && $0.fields["phase"] == "preflight"
+        })
+    }
+
     func testMarkedWebPlaceholderRequiresTwoReadsAfterReadFailure() async throws {
         let prompt = "输入消息，输入 / 选择工具或操作，输入 @ 引用话题"
         let rawPrompt = prompt + "\n"
@@ -7668,6 +7833,10 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     private(set) var focusedElementReadCount = 0
     var readSnapshotsAfterNextWrite: [ReplayAXSnapshot] = []
     var queuedTextReadSnapshots: [ReplayAXSnapshot] = []
+    var queuedAXValueReads: [String] = []
+    var queuedCharacterCountReads: [Int] = []
+    var queuedCoordinateTextReads: [String] = []
+    var queuedSelectionReads: [ReplayTextRange] = []
     var queuedTextInputContexts: [AXTextInputTargetContext?] = []
     var textInputContextOverride: ((AXUIElement) -> AXTextInputTargetContext?)?
     var coordinateIncludesStructuralSeparators = false
@@ -7878,6 +8047,9 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
             onTextReadFailure = nil
             throw error
         }
+        if !queuedAXValueReads.isEmpty {
+            return queuedAXValueReads.removeFirst()
+        }
         if !queuedTextReadSnapshots.isEmpty {
             let snapshot = queuedTextReadSnapshots.removeFirst()
             rawText = snapshot.rawText
@@ -7895,6 +8067,9 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     }
 
     func selection(in element: AXUIElement) throws -> ReplayTextRange? {
+        if !queuedSelectionReads.isEmpty {
+            return queuedSelectionReads.removeFirst()
+        }
         if staleSelectionReadsRemaining > 0, let staleSelectionValue {
             staleSelectionReadsRemaining -= 1
             recordTimingEvent("ax_selection_read_stale", observedAXSelection: staleSelectionValue)
@@ -7926,6 +8101,9 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
             temporarilyUnavailableCoordinateRanges.remove(at: unavailableIndex)
             return nil
         }
+        if !queuedCoordinateTextReads.isEmpty {
+            return queuedCoordinateTextReads.removeFirst()
+        }
         let text = coordinateText
         guard range.location >= 0,
               range.length >= 0,
@@ -7937,6 +8115,9 @@ private final class ReplayAXTextTargetAccess: AXTextTargetAccess {
     }
 
     func numberOfCharacters(in element: AXUIElement) throws -> Int? {
+        if !queuedCharacterCountReads.isEmpty {
+            return queuedCharacterCountReads.removeFirst()
+        }
         return numberOfCharactersOverride ?? coordinateText.utf16.count
     }
 

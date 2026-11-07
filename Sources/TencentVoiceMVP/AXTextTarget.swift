@@ -2267,6 +2267,15 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         try ensureKeyboardTargetIdentityIsSafe()
         let before = try keyboardDocumentState(in: targetElement, confirming: true)
         guard before.compare(to: expected, allowingStructuralRawDifference: false) == .matched else {
+            if keyboardStateDiffersOnlyBySelection(before, from: expected) {
+                recordDiagnostic("keyboard_selection_observation_unsettled", [
+                    "phase": "selection_stabilization_before_set",
+                    "expectedSelectionLocation": String(expected.selection.location),
+                    "actualSelectionLocation": String(before.selection.location),
+                    "confirmationResult": "not_confirmed"
+                ])
+                throw KeyboardWriteReadError.retryable
+            }
             invalidateKeyboardRawInsertionRegion()
             recordDiagnostic("keyboard_selection_stabilization_failed", [
                 "phase": "before_set",
@@ -2279,6 +2288,16 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         let after = try keyboardDocumentState(in: targetElement, confirming: true)
         let comparison = after.compare(to: expected, allowingStructuralRawDifference: false)
         guard comparison == .matched else {
+            if keyboardStateDiffersOnlyBySelection(after, from: expected) {
+                recordDiagnostic("keyboard_selection_observation_unsettled", [
+                    "phase": "selection_stabilization_after_set",
+                    "axSelectionRequestID": axSelectionRequestID,
+                    "expectedSelectionLocation": String(expected.selection.location),
+                    "actualSelectionLocation": String(after.selection.location),
+                    "confirmationResult": "not_confirmed"
+                ])
+                throw KeyboardWriteReadError.retryable
+            }
             invalidateKeyboardRawInsertionRegion()
             recordDiagnostic("keyboard_selection_stabilization_failed", [
                 "phase": "after_set",
@@ -2499,6 +2518,16 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 phase: "preflight"
             )
             guard observed.state == expected else {
+                if self.keyboardStateDiffersOnlyBySelection(observed.state, from: expected) {
+                    self.recordDiagnostic("keyboard_selection_observation_unsettled", [
+                        "phase": "preflight",
+                        "expectedSelectionLocation": String(expected.selection.location),
+                        "actualSelectionLocation": String(observed.state.selection.location),
+                        "objectGeneration": observed.objectGeneration,
+                        "confirmationResult": "not_confirmed"
+                    ])
+                    throw KeyboardWriteReadError.retryable
+                }
                 self.recordDiagnostic("keyboard_confirmed_state_changed", [
                     "expectedDocumentLength": String(expected.text.utf16.count),
                     "actualDocumentLength": String(observed.state.text.utf16.count),
@@ -2510,6 +2539,16 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             }
             return observed.state
         }
+    }
+
+    private func keyboardStateDiffersOnlyBySelection(
+        _ observed: KeyboardDocumentState,
+        from expected: KeyboardDocumentState
+    ) -> Bool {
+        observed.selection != expected.selection
+            && observed.text == expected.text
+            && observed.rawText == expected.rawText
+            && observed.mapping == expected.mapping
     }
 
     private func readKeyboardDocumentObservation(
@@ -2545,8 +2584,32 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         let readStartedAt = Date()
         let readStartedMonotonic = writeTiming.now() / 1_000_000
         do {
-            let state = try KeyboardWriteAcknowledgement.readObservation {
-                try self.keyboardDocumentState(in: element, confirming: true)
+            let state: KeyboardDocumentState
+            do {
+                state = try KeyboardWriteAcknowledgement.readObservation {
+                    try self.keyboardDocumentState(in: element, confirming: true)
+                }
+            } catch KeyboardWriteReadError.retryable,
+                    KeyboardDocumentStateReadError.retryable,
+                    KeyboardDocumentStateReadError.unavailable {
+                // AX attributes are separate, non-atomic reads. Even when one
+                // read is mixed or temporarily unavailable, verify that the
+                // observation still belongs to the captured target before
+                // allowing the acknowledgement loop to retry it.
+                try ensureKeyboardReadTargetIsFrontmost(phase: phase)
+                let afterElement = try focusedElement()
+                if !CFEqual(afterElement, targetElement) {
+                    guard isSafariWebEditor || isCodexTarget else {
+                        invalidateKeyboardRawInsertionRegion()
+                        throw TextTargetError.targetChanged
+                    }
+                    _ = try acceptKeyboardTargetRebuild(afterElement, phase: "\(phase)_after_retryable_read")
+                    throw KeyboardWriteReadError.retryable
+                }
+                guard targetElementObservationID == objectGeneration else {
+                    throw KeyboardWriteReadError.retryable
+                }
+                throw KeyboardWriteReadError.retryable
             }
             try ensureKeyboardReadTargetIsFrontmost(phase: phase)
             let afterElement = try focusedElement()
@@ -4171,12 +4234,15 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             }
             if webMarkedPlaceholderTransitionConfirmed,
                evidence.axValueText != evidence.text {
-                recordDiagnostic("web_confirmed_representation_relation_changed", [
+                recordDiagnostic("web_ax_document_attributes_inconsistent", [
+                    "reason": "ax_value_and_full_range_disagree",
                     "axValueLengthUTF16": String(evidence.axValueLengthUTF16),
                     "rangeLengthUTF16": String(evidence.characterCount),
-                    "editorIdentity": objectGeneration
+                    "editorIdentity": objectGeneration,
+                    "sendState": pendingKeyboardWrite == nil ? "not_in_flight" : "sent_unconfirmed",
+                    "confirmationResult": "not_confirmed"
                 ])
-                throw TextTargetError.targetChanged
+                throw KeyboardWriteReadError.retryable
             }
             lastWebRangeDocumentEvidence = evidence
             return KeyboardDocumentState(text: evidence.text, selection: selection)
