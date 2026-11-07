@@ -992,7 +992,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
     private var confirmedKeyboardRawText: String?
     private var confirmedKeyboardMapping: AXTextCoordinateMapping?
     private var lastResolvedCodexDocument: AXTextDocumentState?
-    private var codexPlaceholderEvidence: AXPlaceholderEvidence?
+    private var mappedPlaceholderEvidence: AXPlaceholderEvidence?
     private var codexAXValueFallbackAllowed = false
     private var keyboardGeneration: UInt64 = 0
     private var keyboardOperationGeneration: UInt64 = 0
@@ -1001,6 +1001,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
     private var isObsidianTarget = false
     private var isSafariWebEditor = false
     private var isWebTextInput = false
+    private var usesMappedWebText = false
     private var webRangeConfirmationMode = false
     private var webMarkedPlaceholderTransitionConfirmed = false
     private var unmarkedWebEmptyDocumentBaseline: UnmarkedWebEmptyDocumentBaseline?
@@ -1353,7 +1354,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         confirmedKeyboardRawText = nil
         confirmedKeyboardMapping = nil
         lastResolvedCodexDocument = nil
-        codexPlaceholderEvidence = nil
+        mappedPlaceholderEvidence = nil
         codexAXValueFallbackAllowed = false
         confirmedKeyboardDocument = nil
         confirmedKeyboardState = nil
@@ -1380,6 +1381,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         expectedKeyboardSelection = nil
         activeInputStrategy = .accessibility
         isWebTextInput = false
+        usesMappedWebText = false
         webRangeConfirmationMode = false
         webMarkedPlaceholderTransitionConfirmed = false
         unmarkedWebEmptyDocumentBaseline = nil
@@ -1427,8 +1429,10 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         isWebTextInput = !isCodexTarget
             && inputContext?.hasWebAreaAncestor == true
             && ["AXTextArea", "AXTextField"].contains(inputContext?.role ?? "")
-        let continuityApplicable = isSafariWebEditor || (isCodexTarget && inputContext?.ancestorScanStatus == .webArea)
-        let continuityTargetApplication = targetApplicationBundleIdentifier == "com.apple.Safari" || isCodexTarget
+        usesMappedWebText = isCodexTarget || isWebTextInput
+        let continuityApplicable = isSafariWebEditor
+            || (usesMappedWebText && inputContext?.ancestorScanStatus == .webArea)
+        let continuityTargetApplication = targetApplicationBundleIdentifier == "com.apple.Safari" || usesMappedWebText
         access.setContinuityScanObjectGeneration(targetElementObservationID)
         editorContinuity = continuityApplicable
             ? element.flatMap { access.editorContinuityEvidence(for: $0) }
@@ -1510,7 +1514,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                     webPlaceholderAdoptionReason = "range_character_count_mismatch"
                 } else if rangeEvidence.text != rawText {
                     webPlaceholderAdoptionReason = "range_text_mismatch"
-                } else if let document = try? readCodexTextDocument(
+                } else if let document = try? readMappedTextDocument(
                     rawText: rawText,
                     selection: readableKeyboardSelection,
                     evidence: evidence,
@@ -1572,25 +1576,33 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 axValueLengthUTF16: webEmptyBodyEvidence.axValueLengthUTF16
             )
         }
-        let inputStrategy = AXTextInputStrategy.select(
+        // These two verified placeholder cases have their own receipt protocol:
+        // the marked case confirms the placeholder-to-body transition, and the
+        // unmarked case confirms the initially empty editor range. They do not
+        // expose an ordinary AX coordinate document until that transition is
+        // complete, so keep them on those bounded protocols instead of forcing
+        // the general mapped-web confirmation path onto placeholder text.
+        if webMarkedPlaceholderDocument != nil || webRangeConfirmationMode {
+            usesMappedWebText = false
+        }
+        var inputStrategy = AXTextInputStrategy.select(
             application: targetApplication,
             context: inputContext,
             hasReadableTextState: hasReadableAXTextState
         )
-        activeInputStrategy = inputStrategy
-        var codexState: AXTextDocumentState?
-        if isCodexTarget, let element, let rawText, let readableKeyboardSelection {
+        var mappedDocumentState: AXTextDocumentState?
+        if usesMappedWebText, let element, let rawText, let readableKeyboardSelection {
             let evidence = placeholderEvidence(in: element)
-            codexPlaceholderEvidence = evidence
+            mappedPlaceholderEvidence = evidence
             do {
-                let state = try readCodexTextDocument(
+                let state = try readMappedTextDocument(
                     rawText: rawText,
                     selection: readableKeyboardSelection,
                     evidence: evidence,
                     element: element
                 )
-                codexState = state
-                lastResolvedCodexDocument = state
+                mappedDocumentState = state
+                if isCodexTarget { lastResolvedCodexDocument = state }
                 recordCoordinateResolution(state: state, evidence: evidence)
             } catch let error as AXTextDocumentResolutionError {
                 recordCoordinateResolutionFailure(
@@ -1610,7 +1622,21 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 )
             }
         }
-        let capturedCoordinateDocument = codexState ?? webMarkedPlaceholderDocument
+        if isWebTextInput,
+           mappedDocumentState == nil,
+           webMarkedPlaceholderDocument == nil,
+           !webRangeConfirmationMode {
+            if !inputStrategy.requiresSafeStop {
+                inputStrategy = .safeStop(reason: "web_coordinate_mapping_unavailable")
+            }
+            recordDiagnostic("ax_coordinate_mapping_failed", [
+                "reason": "web_coordinate_mapping_unavailable",
+                "application": targetApplicationBundleIdentifier ?? "unknown",
+                "policy": "verified_web_coordinate_mapping_required"
+            ])
+        }
+        activeInputStrategy = inputStrategy
+        let capturedCoordinateDocument = mappedDocumentState ?? webMarkedPlaceholderDocument
         let text = capturedCoordinateDocument?.text
             ?? (webRangeConfirmationMode ? "" : (rawText ?? ""))
         let selection = capturedCoordinateDocument?.selection
@@ -1621,7 +1647,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             capturedCoordinateDocument.text
         } else if webRangeConfirmationMode {
             ""
-        } else if !isCodexTarget, let rawText {
+        } else if !usesMappedWebText, let rawText {
             rawText
         } else {
             nil
@@ -1637,10 +1663,28 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             )
         } else if webRangeConfirmationMode {
             KeyboardDocumentState(text: "", selection: TextRange(location: 0, length: 0))
-        } else if !isCodexTarget, let rawText, let readableKeyboardSelection {
+        } else if !usesMappedWebText, let rawText, let readableKeyboardSelection {
             KeyboardDocumentState(text: rawText, selection: readableKeyboardSelection)
         } else {
             nil
+        }
+        let coordinateEvidencePolicy: String
+        if isCodexTarget {
+            coordinateEvidencePolicy = mappedDocumentState == nil
+                ? "codex_coordinate_mapping_unavailable"
+                : "codex_coordinate_document"
+        } else if isWebTextInput {
+            if mappedDocumentState != nil {
+                coordinateEvidencePolicy = "verified_web_coordinate_document"
+            } else if webMarkedPlaceholderDocument != nil {
+                coordinateEvidencePolicy = "verified_marked_web_placeholder"
+            } else if webRangeConfirmationMode {
+                coordinateEvidencePolicy = "verified_unmarked_empty_web_range"
+            } else {
+                coordinateEvidencePolicy = "verified_web_coordinate_mapping_unavailable"
+            }
+        } else {
+            coordinateEvidencePolicy = "raw_accessibility_value"
         }
         recordDiagnostic("input_target_captured", [
             "hasElement": String(element != nil), "hasReadableState": String(hasReadableAXTextState),
@@ -1651,11 +1695,12 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             "valueSettable": String(element.map { valueIsSettable(on: $0) } ?? false),
             "documentLength": String(text.utf16.count),
             "axValueLengthUTF16": String(rawText?.utf16.count ?? 0),
-            "axCoordinateLengthUTF16": String(codexState?.text.utf16.count ?? text.utf16.count),
+            "axCoordinateLengthUTF16": String(mappedDocumentState?.text.utf16.count ?? text.utf16.count),
             "selectionLocation": String(selection.location), "selectionLength": String(selection.length),
             "keyboardCompatibility": String(
-                isCodexTarget || isSafariWebEditor || inputStrategy.prefersAcknowledgedKeyboard
+                usesMappedWebText || isSafariWebEditor || inputStrategy.prefersAcknowledgedKeyboard
             ),
+            "coordinateEvidencePolicy": coordinateEvidencePolicy,
             "safariWebEditor": String(isSafariWebEditor),
             "inputStrategy": inputStrategy.diagnosticName,
             "inputStrategyReason": inputStrategy.diagnosticReason,
@@ -1685,9 +1730,9 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             } ?? false),
             targetApplication: targetApplication,
             rawText: rawText ?? text,
-            coordinateText: codexState?.text ?? text,
-            placeholderNormalized: codexState?.placeholderNormalized ?? false,
-            coordinateMapping: codexState?.mapping,
+            coordinateText: mappedDocumentState?.text ?? text,
+            placeholderNormalized: mappedDocumentState?.placeholderNormalized ?? false,
+            coordinateMapping: mappedDocumentState?.mapping,
             preferredInputStrategy: inputStrategy
         )
     }
@@ -2560,7 +2605,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         try ensureKeyboardReadTargetIsFrontmost(phase: phase)
         let element = try focusedElement()
         if let targetElement, !CFEqual(element, targetElement) {
-            guard isSafariWebEditor || isCodexTarget else {
+            guard isSafariWebEditor || usesMappedWebText else {
                 invalidateKeyboardRawInsertionRegion()
                 throw TextTargetError.targetChanged
             }
@@ -2599,7 +2644,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 try ensureKeyboardReadTargetIsFrontmost(phase: phase)
                 let afterElement = try focusedElement()
                 if !CFEqual(afterElement, targetElement) {
-                    guard isSafariWebEditor || isCodexTarget else {
+                    guard isSafariWebEditor || usesMappedWebText else {
                         invalidateKeyboardRawInsertionRegion()
                         throw TextTargetError.targetChanged
                     }
@@ -2614,7 +2659,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             try ensureKeyboardReadTargetIsFrontmost(phase: phase)
             let afterElement = try focusedElement()
             if !CFEqual(afterElement, targetElement) {
-                guard isSafariWebEditor || isCodexTarget else {
+                guard isSafariWebEditor || usesMappedWebText else {
                     invalidateKeyboardRawInsertionRegion()
                     throw TextTargetError.targetChanged
                 }
@@ -2859,7 +2904,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 observed: observed,
                 operation: diagnosticOperation,
                 isCodexTarget: self.isCodexTarget,
-                allowNewStructuralBoundary: self.lastKeyboardReadUsedStructuralFallback
+                allowNewStructuralBoundary: self.lastKeyboardReadUsedStructuralFallback,
+                usesCoordinateMapping: self.usesMappedWebText
             )
             var confirmedByUnmarkedWebRange = false
             let webBaseline = self.unmarkedWebEmptyDocumentBaseline
@@ -3259,7 +3305,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
               range.location <= document.utf16.count,
               range.length <= document.utf16.count - range.location else { throw TextTargetError.targetChanged }
         let nsRange = NSRange(location: range.location, length: range.length)
-        let previousCoordinateTexts = isCodexTarget
+        let previousCoordinateTexts = usesMappedWebText
             ? coordinateTextCandidates(forKeyboardText: previousText ?? "")
             : [coordinateText(forKeyboardText: previousText ?? "")]
         if previousText != nil,
@@ -3268,7 +3314,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
            }) {
             throw TextTargetError.targetChanged
         }
-        let coordinateTexts = isCodexTarget
+        let coordinateTexts = usesMappedWebText
             ? coordinateTextCandidates(forKeyboardText: text)
             : [coordinateText(forKeyboardText: text)]
         var rawDocumentForTransition: String?
@@ -3276,7 +3322,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         var mappingForTransition: AXTextCoordinateMapping?
         var anchoredReplacement: KeyboardRawInsertionUpdate?
         var candidateStates: [KeyboardRepresentationCandidate] = []
-        if isCodexTarget {
+        if usesMappedWebText {
             guard let rawDocument = confirmedKeyboardRawText,
                   let mapping = confirmedKeyboardMapping else {
                 throw TextTargetError.targetChanged
@@ -3396,7 +3442,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         }
 
         let primary: KeyboardDocumentState
-        if isCodexTarget {
+        if usesMappedWebText {
             guard let first = candidateStates.first else { throw TextTargetError.targetChanged }
             primary = first.state
         } else {
@@ -3414,7 +3460,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             )
         }
 
-        var alternates = isCodexTarget
+        var alternates = usesMappedWebText
             ? Array(candidateStates.dropFirst())
             : []
         if previousText == nil,
@@ -3469,7 +3515,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 alternates.append(candidate)
             }
         }
-        if isCodexTarget {
+        if usesMappedWebText {
             let generation = operationGeneration ?? keyboardOperationGeneration
             func attachInsertionRegion(
                 _ candidate: KeyboardRepresentationCandidate
@@ -3916,7 +3962,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
     private func keyboardStateEvidence(_ state: KeyboardDocumentState) -> KeyboardStateEvidence {
         let mappingValid = KeyboardWriteConfirmation.mappingIsValid(
             state,
-            isCodexTarget: isCodexTarget
+            requiresCoordinateMapping: usesMappedWebText
         )
         return KeyboardStateEvidence(
             coordinateLengthUTF16: state.text.utf16.count,
@@ -3936,7 +3982,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
     private func keyboardDiagnosticMappingIsValid(_ state: KeyboardDocumentState) -> Bool {
         KeyboardWriteConfirmation.mappingIsValid(
             state,
-            isCodexTarget: isCodexTarget
+            requiresCoordinateMapping: usesMappedWebText
         )
     }
 
@@ -3962,7 +4008,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
     }
 
     private func coordinateLength(forKeyboardText text: String) -> Int {
-        if isCodexTarget {
+        if usesMappedWebText {
             return coordinateTextCandidates(forKeyboardText: text).first?.utf16.count
                 ?? text.utf16.count
         }
@@ -3970,7 +4016,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
     }
 
     private func coordinateTextForConfirmedReplacement(_ text: String) -> String {
-        guard isCodexTarget else { return coordinateText(forKeyboardText: text) }
+        guard usesMappedWebText else { return coordinateText(forKeyboardText: text) }
         guard let document = confirmedKeyboardDocument,
               let selection = expectedKeyboardSelection else {
             return coordinateText(forKeyboardText: text)
@@ -4060,7 +4106,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             // same focused AX element can be retried. A newly created AX
             // element must re-establish editor identity before reusing the
             // previous position; matching text alone is not enough.
-            if (isSafariWebEditor || isCodexTarget), failure.status == AXError.invalidUIElement.rawValue,
+            if (isSafariWebEditor || usesMappedWebText), failure.status == AXError.invalidUIElement.rawValue,
                [kAXValueAttribute as String, kAXSelectedTextRangeAttribute as String].contains(failure.attribute) {
                 try ensureTargetApplicationIsFrontmost()
                 let focused = try focusedElement()
@@ -4187,7 +4233,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                       rangeEvidence.text == rawText else {
                     throw TextTargetError.targetChanged
                 }
-                let document = try readCodexTextDocument(
+                let document = try readMappedTextDocument(
                     rawText: rawText,
                     selection: selection,
                     evidence: evidence,
@@ -4247,7 +4293,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             lastWebRangeDocumentEvidence = evidence
             return KeyboardDocumentState(text: evidence.text, selection: selection)
         }
-        if isCodexTarget {
+        if usesMappedWebText {
             if AXTextDocumentResolver.isStaleAXValueBehindSelection(
                 rawText: rawText,
                 selection: selection,
@@ -4266,18 +4312,19 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 }
                 throw KeyboardDocumentStateReadError.retryable
             }
-            let evidence = codexPlaceholderEvidence ?? placeholderEvidence(in: element)
+            let evidence = mappedPlaceholderEvidence ?? placeholderEvidence(in: element)
+            if isCodexTarget { mappedPlaceholderEvidence = evidence }
             do {
                 let document = try AXTextDocumentResolver.readDuringReplacement(
                     rawText: rawText,
                     selection: selection,
                     acknowledgedSelection: replacementWasSent ? pendingKeyboardReplacement?.selected : nil
                 ) {
-                    try readCodexTextDocument(
+                    try readMappedTextDocument(
                         rawText: rawText, selection: selection, evidence: evidence, element: element
                     )
                 }
-                lastResolvedCodexDocument = document
+                if isCodexTarget { lastResolvedCodexDocument = document }
                 return KeyboardDocumentState(
                     text: document.text,
                     selection: document.selection,
@@ -4285,14 +4332,14 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                     mapping: document.mapping
                 )
             } catch KeyboardWriteReadError.retryable {
-                if let fallback = exactPendingReceiptState(
+                if isCodexTarget, let fallback = exactPendingReceiptState(
                     rawText: rawText,
                     selection: selection,
                     evidence: evidence
                 ) {
                     return fallback
                 }
-                if let fallback = structuralPendingReceiptState(
+                if isCodexTarget, let fallback = structuralPendingReceiptState(
                     rawText: rawText,
                     selection: selection,
                     evidence: evidence
@@ -4315,7 +4362,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 default:
                     false
                 }
-                if pendingReceiptFallbackAllowed,
+                if isCodexTarget, pendingReceiptFallbackAllowed,
                    let fallback = exactPendingReceiptState(
                        rawText: rawText,
                        selection: selection,
@@ -4323,7 +4370,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                    ) {
                     return fallback
                 }
-                if pendingReceiptFallbackAllowed,
+                if isCodexTarget, pendingReceiptFallbackAllowed,
                    let fallback = structuralPendingReceiptState(
                        rawText: rawText,
                        selection: selection,
@@ -4331,7 +4378,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                    ) {
                     return fallback
                 }
-                if error == .coordinateReadUnavailable,
+                if isCodexTarget, error == .coordinateReadUnavailable,
                    let previous = lastResolvedCodexDocument,
                    let document = try? AXTextDocumentResolver.resolveUsingValidatedAXValueAfterPlaceholder(
                        rawText: rawText,
@@ -4573,7 +4620,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         guard let targetElement else { return }
         let currentElement = try focusedElement()
         if !CFEqual(currentElement, targetElement) {
-            if isSafariWebEditor || isCodexTarget {
+            if isSafariWebEditor || usesMappedWebText {
                 try acceptKeyboardTargetRebuild(currentElement, phase: "identity_check")
             } else {
                 recordDiagnostic("keyboard_focus_changed")
@@ -4899,7 +4946,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             access.setContinuityScanObjectGeneration(nil)
             access.setContinuityScanBudgetNanoseconds(nil)
         }
-        guard isSafariWebEditor || isCodexTarget else {
+        guard isSafariWebEditor || usesMappedWebText else {
             return .rejected(reason: "old_handle_or_process_not_verified")
         }
         guard let currentApplication = access.currentApplication() else {
@@ -5170,12 +5217,18 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
             || (capturedTextAreaProof && context?.isReadOnly == nil)
         let nonSecure = context?.isSecure == false
             || (capturedTextAreaProof && context?.isSecure == nil)
-        guard isCodexTarget,
-              application?.bundleIdentifier == "com.openai.codex",
-              hasConfirmedWebArea || hasCapturedAnchorProof,
+        guard hasConfirmedWebArea || hasCapturedAnchorProof,
               ["AXTextArea", "AXTextField"].contains(context?.role ?? ""),
               writable,
               nonSecure else {
+            return false
+        }
+        if usesMappedWebText {
+            return true
+        }
+        guard isCodexTarget,
+              application?.bundleIdentifier == "com.openai.codex",
+              application?.processIdentifier == targetApplicationProcessID else {
             return false
         }
         return true
@@ -5285,7 +5338,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
     }
 
     func reconcileKeyboardStateForUserEdit() throws -> KeyboardReconciliation {
-        guard requiresKeyboardAcknowledgement, isCodexTarget else { return .matched }
+        guard requiresKeyboardAcknowledgement, usesMappedWebText else { return .matched }
         guard targetElement != nil else { return .matched }
         guard pendingKeyboardWrite == nil, pendingKeyboardReplacement == nil else {
             recordDiagnostic("own_write_in_flight", [
@@ -5329,6 +5382,20 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
                 "productionClassification": "external_edit_inference_not_user_action_proof"
             ], textEvidence: documentEvidence(currentState, requested: requestedAt,
                                                started: requestedAt, monotonic: monotonic))
+        }
+        if comparison == .selectionMismatch,
+           keyboardStateDiffersOnlyBySelection(currentState, from: expectedState) {
+            // A selection-only snapshot can lag while a web editor is settling.
+            // Keep the captured state and let the write's bounded preflight
+            // confirm the caret before dispatch; rebasing here could turn a
+            // transient read into an insertion at the wrong position.
+            recordDiagnostic("keyboard_selection_observation_unsettled", [
+                "phase": "reconciliation",
+                "expectedSelectionLocation": String(expectedState.selection.location),
+                "actualSelectionLocation": String(currentState.selection.location),
+                "confirmationResult": "not_confirmed"
+            ])
+            return .matched
         }
         guard comparison != .rawMappingUnavailable else {
             invalidateKeyboardRawInsertionRegion()
@@ -5467,7 +5534,8 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         KeyboardWriteConfirmation.compareStableState(
             expected: expected,
             observed: current,
-            isCodexTarget: isCodexTarget
+            isCodexTarget: isCodexTarget,
+            usesCoordinateMapping: usesMappedWebText
         )
     }
 
@@ -5621,7 +5689,7 @@ final class AXTextTarget: KeyboardAcknowledgingTarget, AXAcknowledgingTarget, Ke
         }
     }
 
-    private func readCodexTextDocument(
+    private func readMappedTextDocument(
         rawText: String,
         selection: TextRange,
         evidence: AXPlaceholderEvidence,

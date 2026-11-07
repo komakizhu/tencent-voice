@@ -548,6 +548,38 @@ enum KeyboardDiagnosticDiffCalculator {
         return addedSeparator
     }
 
+    /// A verified web editor may expose structural paragraph markers outside
+    /// the edit range in AXValue. Accept that representation only when the
+    /// complete coordinate document, caret, and valid raw-to-coordinate map
+    /// are unchanged except for structural separators.
+    static func allowsMappedDocumentRepresentationTransition(
+        expected: KeyboardDocumentState,
+        observed: KeyboardDocumentState,
+        operation: KeyboardDiagnosticDiffOperation?,
+        mappingValid: Bool
+    ) -> Bool {
+        guard let operation,
+              expected.text == observed.text,
+              expected.selection == observed.selection,
+              expected.rawText != observed.rawText,
+              mappingValid else {
+            return false
+        }
+        if let inputText = operation.inputText,
+           AXTextStructural.containsStructuralSeparator(in: inputText) {
+            return false
+        }
+        let summary = compare(
+            expected: expected,
+            observed: observed,
+            operation: operation,
+            mappingValid: true
+        )
+        return summary.classification == .structuralOutside
+            && summary.separatorDifferenceUnitCount > 0
+            && summary.mappingValid
+    }
+
     private static func isCompleteStructuralSeparatorRun(
         _ kinds: [SeparatorKind]
     ) -> Int? {

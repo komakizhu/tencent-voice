@@ -27,7 +27,7 @@ struct KeyboardWriteCandidateConfirmation: Equatable {
     }
 }
 
-/// The single receipt predicate used by Codex writes and deterministic replay.
+/// The single receipt predicate used by mapped web writes and deterministic replay.
 /// It deliberately separates a valid coordinate mapping from a matching
 /// document: a caret or a local structural difference is not a receipt unless
 /// the complete observation still explains the intended edit.
@@ -39,13 +39,16 @@ enum KeyboardWriteConfirmation {
     static func compareStableState(
         expected: KeyboardDocumentState,
         observed: KeyboardDocumentState,
-        isCodexTarget: Bool
+        isCodexTarget: Bool,
+        usesCoordinateMapping: Bool? = nil
     ) -> KeyboardDocumentComparison {
+        let requiresCoordinateMapping = usesCoordinateMapping ?? isCodexTarget
         let result = evaluate(
             expected: expected,
             observed: observed,
             operation: nil,
-            isCodexTarget: isCodexTarget
+            isCodexTarget: isCodexTarget,
+            usesCoordinateMapping: requiresCoordinateMapping
         )
         return result.matched ? .matched : result.comparison
     }
@@ -56,11 +59,13 @@ enum KeyboardWriteConfirmation {
         operation: KeyboardDiagnosticDiffOperation?,
         isCodexTarget: Bool,
         allowNewStructuralBoundary: Bool = false,
-        allowStructuralAugmentation: Bool = true
+        allowStructuralAugmentation: Bool = true,
+        usesCoordinateMapping: Bool? = nil
     ) -> KeyboardWriteConfirmationResult {
+        let requiresCoordinateMapping = usesCoordinateMapping ?? isCodexTarget
         let comparison = observed.compare(
             to: expected,
-            allowingStructuralRawDifference: isCodexTarget
+            allowingStructuralRawDifference: requiresCoordinateMapping
         )
 
         guard observed.selection == expected.selection else {
@@ -76,22 +81,32 @@ enum KeyboardWriteConfirmation {
         }
 
         if allowStructuralAugmentation,
-           isCodexTarget,
-           mappingIsValid(observed, isCodexTarget: true),
-           KeyboardDiagnosticDiffCalculator.allowsLocalStructuralAugmentation(
-               expected: expected,
-               observed: observed,
-               operation: operation,
-               mappingValid: true,
-               allowNewStructuralBoundary: allowNewStructuralBoundary
-           ) {
-            return .confirmed()
+           requiresCoordinateMapping,
+           mappingIsValid(observed, requiresCoordinateMapping: true) {
+            let mappedTransitionAllowed: Bool
+            if isCodexTarget {
+                mappedTransitionAllowed = KeyboardDiagnosticDiffCalculator.allowsLocalStructuralAugmentation(
+                    expected: expected,
+                    observed: observed,
+                    operation: operation,
+                    mappingValid: true,
+                    allowNewStructuralBoundary: allowNewStructuralBoundary
+                )
+            } else {
+                mappedTransitionAllowed = KeyboardDiagnosticDiffCalculator.allowsMappedDocumentRepresentationTransition(
+                    expected: expected,
+                    observed: observed,
+                    operation: operation,
+                    mappingValid: true
+                )
+            }
+            if mappedTransitionAllowed { return .confirmed() }
         }
 
-        if isCodexTarget {
+        if requiresCoordinateMapping {
             guard let expectedRawText = expected.rawText,
                   observed.rawText == expectedRawText,
-                  mappingIsValid(observed, isCodexTarget: true),
+                  mappingIsValid(observed, requiresCoordinateMapping: requiresCoordinateMapping),
                   observed.matchesExpectedMapping(of: expected) else {
                 let failure: KeyboardDocumentComparison = observed.rawText == expected.rawText
                     ? .rawMappingUnavailable
@@ -116,8 +131,10 @@ enum KeyboardWriteConfirmation {
         observed: KeyboardDocumentState,
         operation: KeyboardDiagnosticDiffOperation?,
         isCodexTarget: Bool,
-        allowNewStructuralBoundary: Bool = false
+        allowNewStructuralBoundary: Bool = false,
+        usesCoordinateMapping: Bool? = nil
     ) -> KeyboardWriteCandidateConfirmation {
+        let requiresCoordinateMapping = usesCoordinateMapping ?? isCodexTarget
         // A complete raw/coordinate/mapping match is stronger evidence than
         // a structural fallback. Evaluate that tier first so a fallback-only
         // explanation cannot make an otherwise exact receipt look ambiguous.
@@ -128,7 +145,8 @@ enum KeyboardWriteConfirmation {
                 operation: operation,
                 isCodexTarget: isCodexTarget,
                 allowNewStructuralBoundary: allowNewStructuralBoundary,
-                allowStructuralAugmentation: false
+                allowStructuralAugmentation: false,
+                usesCoordinateMapping: requiresCoordinateMapping
             )
         }
         let strictMatches = strictResults.indices.filter { strictResults[$0].matched }
@@ -146,7 +164,8 @@ enum KeyboardWriteConfirmation {
                 operation: operation,
                 isCodexTarget: isCodexTarget,
                 allowNewStructuralBoundary: allowNewStructuralBoundary,
-                allowStructuralAugmentation: true
+                allowStructuralAugmentation: true,
+                usesCoordinateMapping: requiresCoordinateMapping
             )
         }
         let matchedIndexes = results.indices.filter { results[$0].matched }
@@ -179,9 +198,9 @@ enum KeyboardWriteConfirmation {
 
     static func mappingIsValid(
         _ state: KeyboardDocumentState,
-        isCodexTarget: Bool
+        requiresCoordinateMapping: Bool
     ) -> Bool {
-        guard isCodexTarget else { return true }
+        guard requiresCoordinateMapping else { return true }
         guard let rawText = state.rawText,
               let mapping = state.mapping else {
             return false

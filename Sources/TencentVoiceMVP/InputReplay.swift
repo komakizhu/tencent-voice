@@ -9,6 +9,71 @@ enum InputReplay {
         case missingTargetBundle
     }
 
+    enum QuoteFixtureError: Error, Equatable {
+        case requiresExplicitTestInput
+        case incompatibleReplayMode
+        case wrongBundle
+        case wrongRole
+        case unexpectedInitialValue
+        case unexpectedInitialSelection
+        case initialRangeMismatch
+    }
+
+    static let quoteFixtureBundleIdentifier = "com.kangfenmao.CherryStudio"
+    static let quoteFixtureInitialText = "引用 "
+
+    static func validateQuoteTestFixture(
+        args: [String],
+        targetBundle: String?,
+        role: String?,
+        rawValue: String?,
+        selection: TextRange?,
+        fullRangeText: String?
+    ) throws {
+        try validateQuoteTestFixtureIdentity(
+            args: args,
+            targetBundle: targetBundle,
+            role: role,
+            rawValue: rawValue,
+            selection: selection
+        )
+        try validateQuoteTestFixtureRangeText(fullRangeText)
+    }
+
+    static func validateQuoteTestFixtureIdentity(
+        args: [String],
+        targetBundle: String?,
+        role: String?,
+        rawValue: String?,
+        selection: TextRange?
+    ) throws {
+        guard args.contains("--quote-test-fixture"), args.contains("--allow-test-input") else {
+            throw QuoteFixtureError.requiresExplicitTestInput
+        }
+        guard !["--inspect-target", "--probe-selection", "--resume-test-fixture"]
+            .contains(where: args.contains) else {
+            throw QuoteFixtureError.incompatibleReplayMode
+        }
+        guard targetBundle == quoteFixtureBundleIdentifier else {
+            throw QuoteFixtureError.wrongBundle
+        }
+        guard role == "AXTextArea" else {
+            throw QuoteFixtureError.wrongRole
+        }
+        guard rawValue == quoteFixtureInitialText else {
+            throw QuoteFixtureError.unexpectedInitialValue
+        }
+        guard selection == TextRange(location: quoteFixtureInitialText.utf16.count, length: 0) else {
+            throw QuoteFixtureError.unexpectedInitialSelection
+        }
+    }
+
+    static func validateQuoteTestFixtureRangeText(_ fullRangeText: String?) throws {
+        guard fullRangeText == quoteFixtureInitialText else {
+            throw QuoteFixtureError.initialRangeMismatch
+        }
+    }
+
     static func targetBundleArgument(from args: [String]) throws -> String? {
         guard let bundleIndex = args.firstIndex(of: "--target-bundle") else { return nil }
         guard bundleIndex + 1 < args.count,
@@ -89,6 +154,40 @@ enum InputReplay {
         guard ["AXTextArea", "AXTextField"].contains(recorder.stringAttribute(kAXRoleAttribute) ?? "") else {
             recorder.observe("refused_nontext_control")
             return 2
+        }
+        if args.contains("--quote-test-fixture") {
+            let access = SystemAXTextTargetAccess()
+            let context = access.textInputContext(for: element)
+            do {
+                try validateQuoteTestFixtureIdentity(
+                    args: args,
+                    targetBundle: expectedBundle,
+                    role: recorder.stringAttribute(kAXRoleAttribute),
+                    rawValue: recorder.stringAttribute(kAXValueAttribute),
+                    selection: recorder.selection()
+                )
+                try validateQuoteTestFixtureRangeText(
+                    recorder.fullRangeDocument(
+                        expectedCharacterCount: quoteFixtureInitialText.utf16.count
+                    ).text
+                )
+            } catch {
+                recorder.observe("quote_fixture_refused_\(String(describing: error))")
+                print("Replay refused: quote test draft, caret, bundle, or full-range text did not match the fixed fixture.")
+                return 2
+            }
+            guard context?.role == "AXTextArea",
+                  context?.hasWebAreaAncestor == true,
+                  context?.ancestorScanStatus == .webArea,
+                  context?.isReadOnly == false,
+                  context?.isSecure == false,
+                  access.processIdentifier(of: element) == pid_t(pid) else {
+                recorder.observe("quote_fixture_refused_unverified_editable_web_target")
+                print("Replay refused: target editability, web ancestry, or process identity could not be verified.")
+                return 2
+            }
+            recorder.recordsFixedFixtureText = true
+            return await runQuoteTestFixture(recorder: recorder, pid: pid)
         }
         let tailCount = tailIndex.flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } ?? 104
         guard (4...1000).contains(tailCount) else { return 2 }
@@ -206,6 +305,77 @@ enum InputReplay {
             return 1
         }
     }
+
+    private static func runQuoteTestFixture(recorder: InputReplayRecorder, pid: Int32) async -> Int32 {
+        let revisions = ["那", "那个人", "那个"]
+        let target = AXTextTarget(operationObserver: { recorder.observe($0) })
+        let injector = TextInjector(target: target, keyboardSmoothing: .live, alwaysSaveVoiceContent: false)
+        defer { injector.cancel() }
+
+        do {
+            try injector.begin()
+            guard injector.modeDescription == "keyboard_live_tail", injector.errorCount == 0 else {
+                recorder.observe("quote_fixture_refused_input_strategy")
+                print("Replay refused: the production input strategy did not approve this target.")
+                return 2
+            }
+
+            recorder.expectedCoordinateDocument = quoteFixtureInitialText
+            recorder.observe("quote_fixture_captured")
+            for (index, candidate) in revisions.enumerated() {
+                guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+                      recorder.matchesExpected() else {
+                    recorder.observe("quote_fixture_stopped_before_revision")
+                    return 1
+                }
+                recorder.operation = index + 1
+                recorder.expectedCoordinateDocument = quoteFixtureInitialText + candidate
+                recorder.observe("quote_candidate_begin")
+                injector.apply(projection: ASRProjection(
+                    committedText: "",
+                    activeSegmentText: candidate,
+                    activeSegmentID: 1,
+                    activeIsFinal: index == revisions.count - 1,
+                    revision: UInt64(index + 1),
+                    changed: true,
+                    isFinal: index == revisions.count - 1
+                ))
+                recorder.observe("quote_candidate_return")
+                for delay in [50, 100, 200, 650] {
+                    try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000)
+                    recorder.observe("quote_candidate_settling")
+                }
+                for diagnostic in injector.drainDiagnostics() {
+                    recorder.emit(["event": diagnostic.event, "fields": diagnostic.fields])
+                }
+                recorder.emit(["event": "quote_candidate_end", "mode": injector.modeDescription,
+                               "writes": injector.writeCount, "errorCount": injector.errorCount])
+                guard injector.errorCount == 0,
+                      injector.modeDescription == "keyboard_live_tail",
+                      recorder.matchesExpected() else {
+                    recorder.observe("quote_fixture_failed")
+                    return 1
+                }
+            }
+
+            try await injector.finish(finalText: revisions.last ?? "")
+            for diagnostic in injector.drainDiagnostics() {
+                recorder.emit(["event": diagnostic.event, "fields": diagnostic.fields])
+            }
+            recorder.observe("quote_fixture_finished")
+            guard injector.errorCount == 0,
+                  injector.finalTextWriteConfirmed,
+                  recorder.matchesExpected() else {
+                recorder.observe("quote_fixture_final_receipt_failed")
+                return 1
+            }
+            recorder.observe("quote_fixture_passed")
+            return 0
+        } catch {
+            recorder.emit(["event": "quote_fixture_error", "code": DiagnosticErrorFormatter.code(for: error)])
+            return 1
+        }
+    }
 }
 
 // Called only from the main actor or a synchronous keyboard queue operation.
@@ -216,6 +386,8 @@ private final class InputReplayRecorder {
     let start = ProcessInfo.processInfo.systemUptime
     var operation = 0
     var expected = ""
+    var expectedCoordinateDocument: String?
+    var recordsFixedFixtureText = false
     private let allowsSafariEditorReacquisition: Bool
     private let initialRole: String?
     private let initialDescription: String?
@@ -312,6 +484,38 @@ private final class InputReplayRecorder {
         return value as? String
     }
 
+    func fullRangeDocument(
+        expectedCharacterCount: Int? = nil
+    ) -> (characterCount: Int?, text: String?) {
+        guard refreshFocusedEditorIfNeeded() else { return (nil, nil) }
+        var countValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXNumberOfCharactersAttribute as CFString,
+            &countValue
+        ) == .success,
+        let count = (countValue as? NSNumber)?.intValue,
+        count >= 0,
+        count <= KeyboardDiagnosticDiffSummary.maximumUTF16Length,
+        expectedCharacterCount.map({ count == $0 }) ?? true else {
+            return (nil, nil)
+        }
+        var range = CFRange(location: 0, length: count)
+        guard let rangeValue = AXValueCreate(.cfRange, &range) else { return (count, nil) }
+        var textValue: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element,
+            kAXStringForRangeParameterizedAttribute as CFString,
+            rangeValue,
+            &textValue
+        ) == .success else {
+            return (count, nil)
+        }
+        if let text = textValue as? String { return (count, text) }
+        if let attributedText = textValue as? NSAttributedString { return (count, attributedText.string) }
+        return (count, nil)
+    }
+
     func selection() -> TextRange? {
         guard refreshFocusedEditorIfNeeded() else { return nil }
         var value: CFTypeRef?
@@ -335,6 +539,12 @@ private final class InputReplayRecorder {
     }
 
     func matchesExpected() -> Bool {
+        if let expectedCoordinateDocument {
+            let evidence = fullRangeDocument(expectedCharacterCount: expectedCoordinateDocument.utf16.count)
+            return evidence.characterCount == expectedCoordinateDocument.utf16.count
+                && evidence.text == expectedCoordinateDocument
+                && selection() == TextRange(location: expectedCoordinateDocument.utf16.count, length: 0)
+        }
         guard let actual = stringAttribute(kAXValueAttribute) else { return false }
         return actual == expected
             || (!safariKnownTrailingAXMarker.isEmpty && actual == expected + safariKnownTrailingAXMarker)
@@ -342,14 +552,34 @@ private final class InputReplayRecorder {
 
     func observe(_ event: String) {
         let range = selection()
+        let rawText = stringAttribute(kAXValueAttribute)
+        let fullRange = expectedCoordinateDocument.map {
+            fullRangeDocument(expectedCharacterCount: $0.utf16.count)
+        }
         var current: CFTypeRef?
         let focusStatus = AXUIElementCopyAttributeValue(AXUIElementCreateSystemWide(), kAXFocusedUIElementAttribute as CFString,
                                                         &current)
-        emit(["event": event, "actualLocation": range?.location ?? -1, "actualLength": range?.length ?? -1,
-              "documentLength": stringAttribute(kAXValueAttribute)?.utf16.count ?? -1,
-              "expectedDocumentLength": expected.utf16.count, "documentMatches": matchesExpected(),
-              "sameElement": current.map { CFEqual($0, element) } ?? false,
-              "focusStatus": focusStatus.rawValue])
+        var fields: [String: Any] = [
+            "event": event,
+            "actualLocation": range?.location ?? -1,
+            "actualLength": range?.length ?? -1,
+            "documentLength": rawText?.utf16.count ?? -1,
+            "expectedDocumentLength": (expectedCoordinateDocument ?? expected).utf16.count,
+            "documentMatches": matchesExpected(),
+            "sameElement": current.map { CFEqual($0, element) } ?? false,
+            "focusStatus": focusStatus.rawValue
+        ]
+        if let fullRange {
+            fields["fullRangeCharacterCountUTF16"] = fullRange.characterCount ?? -1
+            fields["fullRangeRead"] = fullRange.text == nil ? "unavailable" : "observed"
+            fields["fullRangeLengthUTF16"] = fullRange.text?.utf16.count ?? -1
+            fields["fullRangeMatchesExpected"] = fullRange.text == expectedCoordinateDocument
+        }
+        if recordsFixedFixtureText {
+            fields["axValueText"] = rawText ?? "<unavailable>"
+            fields["axStringForRangeText"] = fullRange?.text ?? "<unavailable>"
+        }
+        emit(fields)
     }
 
     func emit(_ fields: [String: Any]) {

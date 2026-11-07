@@ -452,7 +452,7 @@ final class AXCoordinateUniverseTests: XCTestCase {
                         : generatedExternalObservation(after)
                     let mappingValid = KeyboardWriteConfirmation.mappingIsValid(
                         observed,
-                        isCodexTarget: true
+                        requiresCoordinateMapping: true
                     )
                     let summary = KeyboardDiagnosticDiffCalculator.compare(
                         expected: expected,

@@ -4664,6 +4664,454 @@ final class AXTextTargetReplayTests: XCTestCase {
         XCTAssertFalse(diagnostics.contains { $0.event == "keyboard_write_unconfirmed" })
     }
 
+    func testMappedWebQuoteMarkerDoesNotBlockFirstCharacterReceipt() async throws {
+        for application in [
+            TextTargetApplication(name: "Cherry Studio", bundleIdentifier: "com.kangfenmao.CherryStudio", processIdentifier: 9001),
+            TextTargetApplication(name: "Web Editor", bundleIdentifier: "com.example.web-editor", processIdentifier: 9001),
+            TextTargetApplication(name: "Unidentified Web App", bundleIdentifier: nil, processIdentifier: 9001)
+        ] {
+            let access = ReplayAXTextTargetAccess(
+                text: "引用 ",
+                selection: .init(location: 3, length: 0),
+                application: application
+            )
+            access.configureWebAncestorChain(depth: 5)
+            let sender = ReplayKeyboardEventSender(access: access)
+            sender.appendOverride = { text in
+                XCTAssertEqual(text, "那")
+                // AXValue adds a paragraph marker while the editor's full
+                // range reports the unchanged logical quote plus the payload.
+                access.rawText = "引用\n 那"
+                access.coordinateOverride = "引用 那"
+                access.selection = .init(location: 4, length: 0)
+                access.editorSelection = access.selection
+            }
+            let clock = ManualKeyboardPacingClock()
+            let target = AXTextTarget(
+                access: access,
+                keyboardEventSender: sender,
+                writeTiming: .init(now: { clock.nowNanoseconds }, sleep: { clock.advance(by: $0) }),
+                acknowledgementTimeoutNanoseconds: 20_000_000
+            )
+
+            _ = try target.capture()
+            try target.paste("那")
+            do {
+                try await target.acknowledgeKeyboardWrite()
+            } catch {
+                let comparison = target.drainDiagnostics().first { $0.event == "keyboard_write_unconfirmed" }?.fields["comparison"] ?? "unknown"
+                XCTFail("Application \(application.bundleIdentifier ?? "unknown") rejected the mapped quote receipt: \(comparison)")
+                throw error
+            }
+
+            XCTAssertEqual(access.coordinateText, "引用 那")
+            XCTAssertEqual(access.selection, .init(location: 4, length: 0))
+            XCTAssertEqual(sender.totalPosts, 1)
+            XCTAssertFalse(target.drainDiagnostics().contains { $0.event == "keyboard_write_unconfirmed" })
+        }
+    }
+
+    func testTextInjectorProductionPathContinuesMappedWebQuoteAndRevision() async throws {
+        for application in [
+            TextTargetApplication(name: "Cherry Studio", bundleIdentifier: "com.kangfenmao.CherryStudio", processIdentifier: 9001),
+            TextTargetApplication(name: "Web Editor", bundleIdentifier: "com.example.web-editor", processIdentifier: 9001)
+        ] {
+            let access = ReplayAXTextTargetAccess(
+                text: "引用 ",
+                selection: .init(location: 3, length: 0),
+                application: application
+            )
+            access.configureWebAncestorChain(depth: 5)
+            let sender = ReplayKeyboardEventSender(access: access)
+            var appendCount = 0
+            sender.appendOverride = { text in
+                if appendCount == 0 {
+                    XCTAssertEqual(text, "那")
+                    access.rawText = "引用\n 那"
+                    access.coordinateOverride = "引用 那"
+                    access.selection = .init(location: 4, length: 0)
+                    access.editorSelection = access.selection
+                } else {
+                    let priorCoordinate = access.coordinateText
+                    access.applyAppend(text)
+                    access.coordinateOverride = priorCoordinate + text
+                }
+                appendCount += 1
+            }
+            let clock = ManualKeyboardPacingClock()
+            access.replayTime = { clock.nowNanoseconds }
+            let target = AXTextTarget(
+                access: access,
+                keyboardEventSender: sender,
+                writeTiming: .init(
+                    now: { clock.nowNanoseconds },
+                    sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+                ),
+                acknowledgementTimeoutNanoseconds: 20_000_000
+            )
+            let injector = TextInjector(
+                target: target,
+                keyboardSmoothing: .immediate,
+                pacingClock: clock,
+                alwaysSaveVoiceContent: false
+            )
+
+            func settleWrite(_ count: Int) async {
+                for _ in 0..<100 {
+                    await Task.yield()
+                    clock.advance(by: 10_000_000)
+                    if injector.writeCount >= count || injector.errorCount > 0 { break }
+                }
+            }
+
+            try injector.begin()
+            injector.apply(projection: projection("那", revision: 1))
+            await settleWrite(1)
+            XCTAssertEqual(injector.errorCount, 0, "first character: \(application.bundleIdentifier ?? "unknown")")
+            XCTAssertEqual(access.coordinateText, "引用 那")
+            XCTAssertEqual(access.rawText, "引用\n 那")
+
+            injector.apply(projection: projection("那个人", revision: 2))
+            await settleWrite(2)
+            XCTAssertEqual(injector.errorCount, 0, "continuation: \(application.bundleIdentifier ?? "unknown")")
+            XCTAssertEqual(access.coordinateText, "引用 那个人")
+
+            sender.onReplacement = {
+                access.coordinateOverride = "引用 那个"
+                access.numberOfCharactersOverride = "引用 那个".utf16.count
+            }
+            injector.apply(projection: projection("那个", revision: 3))
+            await settleWrite(3)
+            XCTAssertEqual(injector.errorCount, 0, "revision: \(application.bundleIdentifier ?? "unknown")")
+            await finish(injector, finalText: "那个", advancing: clock)
+
+            XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+            XCTAssertEqual(injector.errorCount, 0)
+            XCTAssertEqual(injector.writeCount, 3)
+            XCTAssertEqual(sender.appendPosts, 2)
+            XCTAssertEqual(sender.replacementPosts, 1)
+            XCTAssertEqual(access.rawText, "引用\n 那个")
+            XCTAssertEqual(access.coordinateText, "引用 那个")
+            XCTAssertEqual(access.selection, .init(location: "引用 那个".utf16.count, length: 0))
+            let diagnostics = target.drainDiagnostics()
+            let capture = try XCTUnwrap(diagnostics.first { $0.event == "input_target_captured" })
+            XCTAssertEqual(capture.fields["coordinateEvidencePolicy"], "verified_web_coordinate_document")
+            XCTAssertEqual(diagnostics.filter { $0.event == "keyboard_write_acknowledged" }.count, 3)
+        }
+    }
+
+    func testTextInjectorProductionPathPreservesExistingListAndCodeBlockDraft() async throws {
+        let draft = "已有草稿\n- 列表项\n```swift\nlet answer = 42\n```"
+        let access = ReplayAXTextTargetAccess(
+            text: draft,
+            selection: .init(location: draft.utf16.count, length: 0),
+            application: .init(name: "Web Editor", bundleIdentifier: "com.example.web-editor", processIdentifier: 9001)
+        )
+        access.configureWebAncestorChain(depth: 5)
+        access.coordinateIncludesStructuralSeparators = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let clock = ManualKeyboardPacingClock()
+        access.replayTime = { clock.nowNanoseconds }
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(
+            target: target,
+            keyboardSmoothing: .immediate,
+            pacingClock: clock,
+            alwaysSaveVoiceContent: false
+        )
+
+        try injector.begin()
+        injector.apply(projection: projection("。", revision: 1))
+        for _ in 0..<100 {
+            await Task.yield()
+            clock.advance(by: 10_000_000)
+            if injector.writeCount >= 1 || injector.errorCount > 0 { break }
+        }
+        await finish(injector, finalText: "。", advancing: clock)
+
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.writeCount, 1)
+        XCTAssertEqual(sender.appendPosts, 1)
+        XCTAssertEqual(access.rawText, draft + "。")
+        let diagnostics = target.drainDiagnostics()
+        let capture = try XCTUnwrap(diagnostics.first { $0.event == "input_target_captured" })
+        XCTAssertEqual(capture.fields["coordinateEvidencePolicy"], "verified_web_coordinate_document")
+        XCTAssertEqual(diagnostics.filter { $0.event == "keyboard_write_acknowledged" }.count, 1)
+    }
+
+    func testMappedWebRebuildUsesVerifiedContinuityOutsideSafari() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "引用 ",
+            selection: .init(location: 3, length: 0),
+            application: .init(name: "Web Editor", bundleIdentifier: "com.example.web-editor", processIdentifier: 9001)
+        )
+        access.configureWebAncestorChain(depth: 5)
+        access.simulateSafariEditorLayoutRebuild = true
+        let sender = ReplayKeyboardEventSender(access: access)
+        let clock = ManualKeyboardPacingClock()
+        access.replayTime = { clock.nowNanoseconds }
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(
+            target: target,
+            keyboardSmoothing: .immediate,
+            pacingClock: clock,
+            alwaysSaveVoiceContent: false
+        )
+
+        func settleWrite(_ count: Int) async {
+            for _ in 0..<100 {
+                await Task.yield()
+                clock.advance(by: 10_000_000)
+                if injector.writeCount >= count || injector.errorCount > 0 { break }
+            }
+        }
+
+        try injector.begin()
+        injector.apply(projection: projection("那", revision: 1))
+        await settleWrite(1)
+        XCTAssertEqual(injector.errorCount, 0)
+
+        access.focusedElementRebuildsBeforeNextWrite = 1
+        injector.apply(projection: projection("那个人", revision: 2))
+        await settleWrite(2)
+        await finish(injector, finalText: "那个人", advancing: clock)
+
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.writeCount, 2)
+        XCTAssertEqual(sender.appendPosts, 2, "the acknowledged first write must not be sent again after reacquiring the editor")
+        XCTAssertEqual(access.rawText, "引用 那个人")
+        let diagnostics = target.drainDiagnostics()
+        XCTAssertTrue(diagnostics.contains {
+            $0.event == "keyboard_target_reacquired"
+                && $0.fields["editableEditorCount"] == "1"
+        }, "\(diagnostics.map { ($0.event, $0.fields) })")
+        XCTAssertEqual(
+            diagnostics.filter { $0.event == "keyboard_write_acknowledged" }.count,
+            2
+        )
+    }
+
+    func testCodexStructuralLagStillRunsThroughTextInjectorProductionEntry() async throws {
+        let initialRaw = "Task\nRouter"
+        let initialCoordinate = initialRaw.filter { $0 != "\n" }
+        let access = ReplayAXTextTargetAccess(
+            text: initialRaw,
+            selection: .init(location: initialCoordinate.utf16.count, length: 0),
+            application: .init(name: "Codex", bundleIdentifier: "com.openai.codex", processIdentifier: 9001)
+        )
+        let clock = ManualKeyboardPacingClock()
+        access.replayTime = { clock.nowNanoseconds }
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 50_000_000
+        )
+        let injector = TextInjector(
+            target: target,
+            keyboardSmoothing: .immediate,
+            pacingClock: clock,
+            alwaysSaveVoiceContent: false
+        )
+
+        try injector.begin()
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+        let oldRaw = access.rawText
+        let oldCoordinate = access.coordinateText
+        let oldSelection = access.selection
+        let advancedSelection = ReplayTextRange(location: oldCoordinate.utf16.count + 1, length: 0)
+        let newRaw = oldRaw + ","
+        let newCoordinate = oldCoordinate + ","
+        access.readSnapshotsAfterNextWrite = [
+            .init(rawText: oldRaw, coordinateText: oldCoordinate, selection: oldSelection),
+            .init(rawText: oldRaw, coordinateText: oldCoordinate, selection: advancedSelection),
+            .init(rawText: newRaw, coordinateText: newCoordinate, selection: advancedSelection)
+        ]
+
+        injector.apply(projection: projection(",", revision: 1))
+        for _ in 0..<100 {
+            await Task.yield()
+            clock.advance(by: 10_000_000)
+            if injector.writeCount >= 1 || injector.errorCount > 0 { break }
+        }
+        await finish(injector, finalText: ",", advancing: clock)
+
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
+        XCTAssertEqual(injector.errorCount, 0)
+        XCTAssertEqual(injector.writeCount, 1)
+        XCTAssertEqual(sender.appendPosts, 1)
+        XCTAssertEqual(access.rawText, newRaw)
+        XCTAssertEqual(access.coordinateText, newCoordinate)
+        XCTAssertEqual(access.selection, advancedSelection)
+        XCTAssertTrue(access.queuedTextReadSnapshots.isEmpty)
+        let capture = try XCTUnwrap(target.drainDiagnostics().first { $0.event == "input_target_captured" })
+        XCTAssertEqual(capture.fields["coordinateEvidencePolicy"], "codex_coordinate_document")
+    }
+
+    func testMappedWebCaptureStopsBeforeInputWhenCoordinateEvidenceDoesNotMatch() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "引用 ",
+            selection: .init(location: 3, length: 0),
+            application: .init(name: "Cherry Studio", bundleIdentifier: "com.kangfenmao.CherryStudio", processIdentifier: 9001)
+        )
+        access.configureWebAncestorChain(depth: 5)
+        access.coordinateOverride = "引用x"
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(access: access, keyboardEventSender: sender)
+        let injector = TextInjector(target: target, keyboardSmoothing: .immediate)
+
+        try injector.begin()
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
+        injector.apply(projection: projection("那", revision: 1))
+        try await injector.finish(finalText: "那")
+
+        XCTAssertEqual(sender.totalPosts, 0)
+        XCTAssertEqual(access.rawText, "引用 ")
+        XCTAssertEqual(injector.errorCount, 1)
+        XCTAssertTrue(target.drainDiagnostics().contains {
+            $0.event == "ax_coordinate_mapping_failed"
+                && $0.fields["reason"] == "coordinate_text_mismatch"
+        })
+    }
+
+    func testMappedWebQuoteMarkerStillRejectsRealTextChange() async throws {
+        for scenario in ["body_change", "real_paragraph_break"] {
+            let access = ReplayAXTextTargetAccess(
+                text: "引用 ",
+                selection: .init(location: 3, length: 0),
+                application: .init(name: "Cherry Studio", bundleIdentifier: "com.kangfenmao.CherryStudio", processIdentifier: 9001)
+            )
+            access.configureWebAncestorChain(depth: 5)
+            let sender = ReplayKeyboardEventSender(access: access)
+            sender.appendOverride = { _ in
+                if scenario == "body_change" {
+                    access.rawText = "引用\n！那"
+                    access.coordinateOverride = "引用！那"
+                    access.selection = .init(location: 4, length: 0)
+                } else {
+                    // The full range keeps the newline as real paragraph text.
+                    // Only the other scenario is eligible for AX-only mapping.
+                    access.rawText = "引用\n 那"
+                    access.coordinateOverride = "引用\n 那"
+                    access.selection = .init(location: 5, length: 0)
+                }
+                access.editorSelection = access.selection
+            }
+            let clock = ManualKeyboardPacingClock()
+            let target = AXTextTarget(
+                access: access,
+                keyboardEventSender: sender,
+                writeTiming: .init(now: { clock.nowNanoseconds }, sleep: { clock.advance(by: $0) }),
+                acknowledgementTimeoutNanoseconds: 20_000_000
+            )
+
+            _ = try target.capture()
+            try target.paste("那")
+            do {
+                try await target.acknowledgeKeyboardWrite()
+                XCTFail("A real (scenario) change must remain unconfirmed")
+            } catch { }
+            XCTAssertEqual(sender.totalPosts, 1, "scenario=\(scenario): a rejected receipt must never resend")
+            XCTAssertTrue(
+                target.drainDiagnostics().contains { $0.event == "keyboard_write_unconfirmed" },
+                "scenario=\(scenario)"
+            )
+        }
+    }
+
+    func testMappedWebAmbiguousRawBoundaryRemainsUnconfirmed() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "甲\n乙",
+            selection: .init(location: 1, length: 0),
+            application: .init(name: "Cherry Studio", bundleIdentifier: "com.kangfenmao.CherryStudio", processIdentifier: 9001)
+        )
+        access.configureWebAncestorChain(depth: 5)
+        access.coordinateOverride = "甲乙"
+        let sender = ReplayKeyboardEventSender(access: access)
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+
+        _ = try target.capture()
+        try target.paste("")
+        do {
+            try await target.acknowledgeKeyboardWrite()
+            XCTFail("Different raw caret boundaries must not be collapsed into a unique receipt")
+        } catch { }
+
+        let failure = try XCTUnwrap(
+            target.drainDiagnostics().last { $0.event == "keyboard_write_unconfirmed" }
+        )
+        XCTAssertEqual(failure.fields["comparison"], "ambiguousReceipt")
+        XCTAssertEqual(failure.fields["ackCandidateCount"], "2")
+        XCTAssertEqual(sender.totalPosts, 1)
+    }
+
+    func testMappedWebFocusSwitchAfterDispatchDoesNotRetryText() async throws {
+        let access = ReplayAXTextTargetAccess(
+            text: "引用 ",
+            selection: .init(location: 3, length: 0),
+            application: .init(name: "Cherry Studio", bundleIdentifier: "com.kangfenmao.CherryStudio", processIdentifier: 9001)
+        )
+        access.configureWebAncestorChain(depth: 5)
+        let sender = ReplayKeyboardEventSender(access: access)
+        sender.appendOverride = { text in
+            access.rawText = "引用 " + text
+            access.coordinateOverride = "引用 " + text
+            access.selection = .init(location: 3 + text.utf16.count, length: 0)
+            access.editorSelection = access.selection
+            access.focusChanged = true
+        }
+        let clock = ManualKeyboardPacingClock()
+        let target = AXTextTarget(
+            access: access,
+            keyboardEventSender: sender,
+            writeTiming: .init(
+                now: { clock.nowNanoseconds },
+                sleep: { nanoseconds in try await clock.sleep(nanoseconds: nanoseconds) }
+            ),
+            acknowledgementTimeoutNanoseconds: 20_000_000
+        )
+        let injector = TextInjector(target: target, keyboardSmoothing: .immediate, pacingClock: clock)
+
+        try injector.begin()
+        injector.apply(projection: projection("那", revision: 1))
+        for _ in 0..<100 {
+            await Task.yield()
+            clock.advance(by: 10_000_000)
+            if injector.errorCount > 0 { break }
+        }
+        injector.apply(projection: projection("那位", revision: 2))
+        await finish(injector, finalText: "那位", advancing: clock)
+
+        XCTAssertEqual(sender.totalPosts, 1)
+        XCTAssertEqual(access.rawText, "引用 那")
+        XCTAssertEqual(injector.modeDescription, "safe_copy")
+        XCTAssertEqual(injector.errorCount, 1)
+    }
+
     func testMarkedWebPlaceholderRangeConfirmsFirstAndLaterCandidates() async throws {
         let prompt = "输入消息，输入 / 选择工具或操作，输入 @ 引用话题"
         let rawPrompt = prompt + "\n"
@@ -5107,6 +5555,13 @@ final class AXTextTargetReplayTests: XCTestCase {
         let clock = ManualKeyboardPacingClock()
         access.replayTime = { clock.nowNanoseconds }
         let sender = ReplayKeyboardEventSender(access: access)
+        sender.appendOverride = { text in
+            access.applyAppend(text)
+            access.coordinateOverride = access.rawText
+            access.numberOfCharactersOverride = access.rawText.utf16.count
+            access.recordTimingEvent("text_sent")
+            access.armPostWriteReplay()
+        }
         let target = AXTextTarget(
             access: access,
             keyboardEventSender: sender,
@@ -5126,13 +5581,15 @@ final class AXTextTargetReplayTests: XCTestCase {
         injector.apply(projection: projection("新", revision: 1))
         await finish(injector, finalText: "新", advancing: clock)
 
+        let diagnostics = injector.drainDiagnostics()
         XCTAssertEqual(access.rawText, "草稿新")
         XCTAssertEqual(access.selection, .init(location: 3, length: 0))
         XCTAssertEqual(sender.totalPosts, 1)
-        XCTAssertEqual(injector.errorCount, 0)
-        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail")
-        XCTAssertTrue(injector.drainDiagnostics().contains {
-            $0.event == "keyboard_selection_observation_unsettled" && $0.fields["phase"] == "preflight"
+        XCTAssertEqual(injector.errorCount, 0, "\(diagnostics.map(\.event))")
+        XCTAssertEqual(injector.modeDescription, "keyboard_live_tail", "\(diagnostics.map(\.event))")
+        XCTAssertTrue(diagnostics.contains {
+            $0.event == "keyboard_selection_observation_unsettled"
+                && ["reconciliation", "preflight"].contains($0.fields["phase"] ?? "")
         })
     }
 
